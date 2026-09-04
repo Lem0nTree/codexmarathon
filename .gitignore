@@ -1,0 +1,18 @@
+# Read-only donor checkouts are local reference material, not product source.
+donor/
+
+# Local controller state and credentials.
+.codexmarathon/
+.codexmarathon-dev/
+.state/
+
+# Build outputs.
+codexmarathon.exe
+controller/codexmarathon
+runtime/codexmarathon-adapter/target/
+
+# Editor and OS metadata.
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
