@@ -1,6 +1,8 @@
 package reset
 
 import (
+	"context"
+	"errors"
 	"sort"
 	"sync"
 	"time"
@@ -16,14 +18,34 @@ type resetCandidate struct {
 	duration   int
 }
 
+const (
+	defaultDataBackoff    = 5 * time.Second
+	defaultMaxDataBackoff = 2 * time.Minute
+	defaultWaitSlice      = 30 * time.Second
+)
+
+// SchedulerConfig controls waiting when the pool has no trustworthy future
+// reset. Reset timestamps themselves remain authoritative and are never
+// shortened; the data backoff is only a bounded retry hint for missing or
+// stale observations.
+type SchedulerConfig struct {
+	DataBackoff    time.Duration
+	MaxDataBackoff time.Duration
+	WaitSlice      time.Duration
+}
+
 // Scheduler chooses the earliest trustworthy future reset and records when
 // the controller should re-observe the pool.  It is safe for a policy loop and
 // timer loop to call its methods concurrently.
 type Scheduler struct {
 	mu      sync.Mutex
 	now     func() time.Time
+	config  SchedulerConfig
 	next    time.Time
 	hasNext bool
+	dataNext    time.Time
+	hasDataNext bool
+	dataBackoff time.Duration
 	wait    ResetWaitState
 	state   ResetState
 }
@@ -31,11 +53,34 @@ type Scheduler struct {
 // NewScheduler creates a reset scheduler.  An optional clock is used by
 // Evaluate when its now argument is zero and by wait-state entry timestamps.
 func NewScheduler(clock ...func() time.Time) *Scheduler {
-	return &Scheduler{now: selectClock(clock...), state: ResetReady}
+	return NewSchedulerWithConfig(SchedulerConfig{}, clock...)
 }
 
 // NewResetScheduler is a descriptive alias for NewScheduler.
 func NewResetScheduler(clock ...func() time.Time) *Scheduler { return NewScheduler(clock...) }
+
+// NewSchedulerWithConfig constructs a scheduler with explicit bounded data
+// retry settings. A zero value selects conservative defaults.
+func NewSchedulerWithConfig(config SchedulerConfig, clock ...func() time.Time) *Scheduler {
+	if config.DataBackoff <= 0 {
+		config.DataBackoff = defaultDataBackoff
+	}
+	if config.MaxDataBackoff <= 0 {
+		config.MaxDataBackoff = defaultMaxDataBackoff
+	}
+	if config.MaxDataBackoff < config.DataBackoff {
+		config.MaxDataBackoff = config.DataBackoff
+	}
+	if config.WaitSlice <= 0 {
+		config.WaitSlice = defaultWaitSlice
+	}
+	return &Scheduler{
+		now:         selectClock(clock...),
+		config:      config,
+		dataBackoff: config.DataBackoff,
+		state:       ResetReady,
+	}
+}
 
 // Evaluate inspects all currently observed accounts.  It never treats an
 // elapsed reset timestamp as proof of availability: such windows are marked
@@ -148,12 +193,19 @@ func (s *Scheduler) Evaluate(accounts []telemetry.AccountTelemetry, now time.Tim
 			ExpectedResetAt:    candidate.resetAt,
 			EnteredAt:          now,
 		}
-		s.mu.Lock()
+		 s.mu.Lock()
 		s.state = ResetWaitForReset
 		s.wait = wait
 		s.next = candidate.resetAt
 		s.hasNext = true
+		s.dataNext = time.Time{}
+		s.hasDataNext = false
+		s.dataBackoff = s.config.DataBackoff
 		s.mu.Unlock()
+		// The account whose boundary selected this wake-up is always included
+		// in post-reset revalidation. Other stale accounts are included below.
+		refreshAccountIDs = appendUnique(refreshAccountIDs, candidate.accountID)
+		sort.Strings(refreshAccountIDs)
 		return ResetDecision{
 			State:              ResetWaitForReset,
 			PoolExhausted:      true,
@@ -169,7 +221,7 @@ func (s *Scheduler) Evaluate(accounts []telemetry.AccountTelemetry, now time.Tim
 
 	// No future reset can be trusted.  This includes expired reset metadata and
 	// accounts for which the provider did not supply a timestamp.
-	s.clearWithState(ResetWaitForData)
+	s.scheduleDataWake(now)
 	return ResetDecision{
 		State:             ResetWaitForData,
 		PoolExhausted:     true,
@@ -188,6 +240,76 @@ func (s *Scheduler) NextRecheck() (time.Time, bool) {
 	next, ok := s.next, s.hasNext
 	s.mu.Unlock()
 	return next, ok
+}
+
+// NextDataRecheck returns the bounded wake-up used when telemetry is missing,
+// stale, or ambiguous and no authoritative future reset is available. It is
+// intentionally separate from NextRecheck so existing callers that interpret
+// NextRecheck as a server reset remain correct.
+func (s *Scheduler) NextDataRecheck() (time.Time, bool) {
+	if s == nil {
+		return time.Time{}, false
+	}
+	s.mu.Lock()
+	next, ok := s.dataNext, s.hasDataNext
+	s.mu.Unlock()
+	return next, ok
+}
+
+// NextWake returns the earliest reset or data-refresh wake-up. It is a timer
+// hint only; callers must revalidate telemetry before selecting an account.
+func (s *Scheduler) NextWake() (time.Time, bool) {
+	if s == nil {
+		return time.Time{}, false
+	}
+	s.mu.Lock()
+	var next time.Time
+	var ok bool
+	if s.hasNext {
+		next, ok = s.next, true
+	}
+	if s.hasDataNext && (!ok || s.dataNext.Before(next)) {
+		next, ok = s.dataNext, true
+	}
+	s.mu.Unlock()
+	return next, ok
+}
+
+// Wait sleeps until the next bounded wake-up. It is cancellation-aware and
+// uses WaitSlice for long server reset durations, which keeps shutdown and
+// reconnect responsive without busy polling. The caller should reevaluate
+// after every return, including a WaitSlice return that precedes a reset.
+func (s *Scheduler) Wait(ctx context.Context) error {
+	if s == nil {
+		return errors.New("nil reset scheduler")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	next, ok := s.NextWake()
+	if !ok {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(s.waitSlice()):
+			return nil
+		}
+	}
+	delay := time.Until(next)
+	if delay < 0 {
+		delay = 0
+	}
+	if slice := s.waitSlice(); delay > slice {
+		delay = slice
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 // Due reports whether a scheduled boundary has been reached.
@@ -261,8 +383,57 @@ func (s *Scheduler) clearWithState(state ResetState) {
 	s.state = state
 	s.next = time.Time{}
 	s.hasNext = false
+	s.dataNext = time.Time{}
+	s.hasDataNext = false
+	s.dataBackoff = s.config.DataBackoff
 	s.wait = ResetWaitState{}
 	s.mu.Unlock()
+}
+
+func (s *Scheduler) scheduleDataWake(now time.Time) {
+	s.mu.Lock()
+	backoff := s.dataBackoff
+	if backoff <= 0 {
+		backoff = s.config.DataBackoff
+	}
+	if backoff <= 0 {
+		backoff = defaultDataBackoff
+	}
+	maxBackoff := s.config.MaxDataBackoff
+	if maxBackoff <= 0 {
+		maxBackoff = defaultMaxDataBackoff
+	}
+	s.state = ResetWaitForData
+	s.next = time.Time{}
+	s.hasNext = false
+	s.dataNext = now.Add(backoff)
+	s.hasDataNext = true
+	nextBackoff := backoff * 2
+	if nextBackoff < backoff || nextBackoff > maxBackoff {
+		nextBackoff = maxBackoff
+	}
+	s.dataBackoff = nextBackoff
+	s.wait = ResetWaitState{}
+	s.mu.Unlock()
+}
+
+func (s *Scheduler) waitSlice() time.Duration {
+	if s == nil || s.config.WaitSlice <= 0 {
+		return defaultWaitSlice
+	}
+	return s.config.WaitSlice
+}
+
+func appendUnique(values []string, value string) []string {
+	if value == "" {
+		return values
+	}
+	for _, existing := range values {
+		if existing == value {
+			return values
+		}
+	}
+	return append(values, value)
 }
 
 func safeDuration(value int64) int {

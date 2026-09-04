@@ -93,6 +93,14 @@ type SnapshotReader interface {
 	Load(accountID string) ([]byte, error)
 }
 
+// SnapshotWriter is the narrow sink used when a live runtime synchronizes
+// the active account's refreshed opaque auth snapshot before a switch. It is
+// intentionally separate from Vault so transition code cannot enumerate or
+// delete credentials as part of that synchronization step.
+type SnapshotWriter interface {
+	Save(accountID string, raw []byte) error
+}
+
 // FileVault is the MVP credential vault. Each account is stored as an opaque
 // JSON document in <dir>/<accountID>.json. The directory is created with
 // owner-only permissions and files are written with owner read/write

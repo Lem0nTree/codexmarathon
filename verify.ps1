@@ -73,12 +73,36 @@ foreach ($required in @(
     'controller/app/app.go',
     'controller/cmd/codexmarathon/main.go',
     'integration/go.mod',
-    'runtime/codexmarathon-adapter/Cargo.toml'
+    'runtime/PROVENANCE.md',
+    'runtime/codex-rs/Cargo.toml',
+    'runtime/codex-rs/Cargo.lock',
+    'runtime/codex-rs/LICENSE',
+    'runtime/codex-rs/NOTICE',
+    'runtime/codex-rs/cli/Cargo.toml',
+    'runtime/codex-rs/codexmarathon-runtime/Cargo.toml',
+    'runtime/codexmarathon-adapter/Cargo.toml',
+    'packaging/release-manifest.json',
+    'packaging/README.md',
+    'scripts/verify_provenance.py',
+    'scripts/verify_package.py',
+    'scripts/verify_protocol.py',
+    'scripts/package_release.py',
+    'scripts/live_smoke.py',
+    'docs/release.md'
 )) {
     [void](Require-File $required)
 }
 
-foreach ($schema in @('protocol/protocol.json', 'protocol/commands.json', 'protocol/events.json')) {
+$embeddedManifest = Join-Path $repo 'runtime/codex-rs/Cargo.toml'
+if (Test-Path -LiteralPath $embeddedManifest -PathType Leaf) {
+    if ((Get-Content -LiteralPath $embeddedManifest -Raw) -match 'donor[\\/]') {
+        Fail 'embedded workspace isolation' 'runtime/codex-rs/Cargo.toml references donor/'
+    } else {
+        Pass 'embedded workspace isolation' 'Cargo manifest has no donor dependency'
+    }
+}
+
+foreach ($schema in @('protocol/protocol.json', 'protocol/commands.json', 'protocol/events.json', 'packaging/release-manifest.json')) {
     $schemaPath = Join-Path $repo $schema
     if (-not (Test-Path -LiteralPath $schemaPath -PathType Leaf)) {
         continue
@@ -116,10 +140,13 @@ if (-not $SkipGo) {
 
 if (-not $SkipRust) {
     $runtimeDir = Join-Path $repo 'runtime/codexmarathon-adapter'
+    $embeddedRuntimeDir = Join-Path $repo 'runtime/codex-rs'
     if (Get-Command cargo -ErrorAction SilentlyContinue) {
         [void](Invoke-Tool 'Rust adapter tests' 'cargo' $runtimeDir @('test'))
+        [void](Invoke-Tool 'embedded runtime bridge tests' 'cargo' $embeddedRuntimeDir @('test', '-p', 'codexmarathon-runtime'))
+        [void](Invoke-Tool 'embedded Codex CLI build' 'cargo' $embeddedRuntimeDir @('build', '-p', 'codex-cli'))
     } else {
-        Blocked 'Rust adapter tests' 'cargo.exe not found; install Rust/Cargo'
+        Blocked 'Rust runtime checks' 'cargo.exe not found; install Rust/Cargo'
     }
 } else {
     Write-Host 'SKIP: Rust tests requested by -SkipRust' -ForegroundColor Gray

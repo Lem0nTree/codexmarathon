@@ -1,6 +1,7 @@
 package telemetry
 
 import (
+	"fmt"
 	"sort"
 	"time"
 )
@@ -51,6 +52,24 @@ type WindowTelemetry struct {
 	ResetsAt           *time.Time
 	ObservedAt         time.Time
 	Freshness          WindowFreshness
+}
+
+// IsFreshAt applies both freshness guards that policy decisions need: the
+// explicit reset-boundary marker and an optional age bound. A zero maxAge
+// disables the age bound, but an elapsed reset is always stale. The method is
+// intentionally side-effect free so callers can evaluate a cache snapshot at
+// different times without mutating the stored copy.
+func (w WindowTelemetry) IsFreshAt(now time.Time, maxAge time.Duration) bool {
+	if w.IsStaleAt(now) {
+		return false
+	}
+	if maxAge <= 0 {
+		return true
+	}
+	if w.ObservedAt.IsZero() || w.ObservedAt.After(now) {
+		return false
+	}
+	return now.Sub(w.ObservedAt) < maxAge
 }
 
 // Clone returns a fully independent copy, including the reset timestamp.
@@ -280,17 +299,111 @@ func (a AccountTelemetry) WindowList() []WindowTelemetry {
 // the exhaustion threshold.  It deliberately returns false for an account
 // with no windows or unusable telemetry.
 func (a AccountTelemetry) HasFreshCapacity(now time.Time) bool {
+	eligible, _ := a.IsCompleteFreshCapacity(now, 0)
+	return eligible
+}
+
+// IsCompleteFreshCapacity is the strict eligibility predicate used by the
+// policy engine. It rejects incomplete multi-bucket snapshots, missing
+// per-window observations, future timestamps, reset-stale windows, and
+// exhausted windows. A false result is accompanied by a stable diagnostic
+// reason suitable for operator output and tests; callers must not turn that
+// reason into a credential or account selector.
+func (a AccountTelemetry) IsCompleteFreshCapacity(now time.Time, maxAge time.Duration) (bool, string) {
 	if !a.IsUsable {
-		return false
+		return false, "account telemetry is unusable"
 	}
-	windows := a.WindowList()
-	if len(windows) == 0 {
-		return false
+	if a.AccountID == "" {
+		return false, "account telemetry has no account id"
 	}
-	for _, window := range windows {
-		if window.IsStaleAt(now) || window.IsExhausted() {
-			return false
+	if len(a.Limits) == 0 && a.Aggregate == nil {
+		return false, "account telemetry has no rate-limit buckets"
+	}
+	limits := a.LimitList()
+	if len(limits) == 0 {
+		return false, "account telemetry has no rate-limit buckets"
+	}
+	if maxAge > 0 {
+		if a.ObservedAt.IsZero() {
+			return false, "account telemetry has no observation timestamp"
+		}
+		if a.ObservedAt.After(now) {
+			return false, "account telemetry timestamp is in the future"
+		}
+		if now.Sub(a.ObservedAt) >= maxAge {
+			return false, "account telemetry is older than the freshness bound"
 		}
 	}
-	return true
+	seenLimitIDs := make(map[string]struct{}, len(limits))
+	for _, limit := range limits {
+		if limit.LimitID != "" {
+			if _, duplicate := seenLimitIDs[limit.LimitID]; duplicate {
+				return false, fmt.Sprintf("duplicate rate-limit bucket %q", limit.LimitID)
+			}
+			seenLimitIDs[limit.LimitID] = struct{}{}
+		}
+		windows := limit.WindowList()
+		if len(windows) == 0 {
+			return false, "rate-limit bucket has no complete windows"
+		}
+		seenKinds := make(map[WindowKind]struct{}, len(windows))
+		for _, window := range windows {
+			if window.Kind != PrimaryWindow && window.Kind != SecondaryWindow {
+				return false, "rate-limit bucket contains an unknown window kind"
+			}
+			if _, duplicate := seenKinds[window.Kind]; duplicate {
+				return false, "rate-limit bucket contains duplicate windows"
+			}
+			seenKinds[window.Kind] = struct{}{}
+			if !window.IsFreshAt(now, maxAge) {
+				return false, "rate-limit window is stale or outside the freshness bound"
+			}
+			if window.IsExhausted() {
+				return false, "rate-limit window is exhausted"
+			}
+		}
+	}
+	return true, ""
+}
+
+// HasFreshCapacityWithin is the age-aware counterpart to
+// HasFreshCapacity. The age bound is important for inactive-profile cache
+// reads, where reset timestamps alone cannot prove the server state is still
+// current.
+func (a AccountTelemetry) HasFreshCapacityWithin(now time.Time, maxAge time.Duration) bool {
+	eligible, _ := a.IsCompleteFreshCapacity(now, maxAge)
+	return eligible
+}
+
+// MaxUsedPercent returns the greatest usage across all normalized buckets and
+// windows. It is a stable, multi-bucket pressure metric for candidate
+// ranking; a missing window is not converted into zero because callers should
+// first require IsCompleteFreshCapacity.
+func (a AccountTelemetry) MaxUsedPercent() float64 {
+	var max float64
+	for _, window := range a.WindowList() {
+		if window.UsedPercent > max {
+			max = window.UsedPercent
+		}
+	}
+	return max
+}
+
+// UsedPercentByKind returns the greatest observed usage for one conventional
+// window kind. The boolean distinguishes an absent kind from a real 0%%
+// observation, which matters when ranking accounts with different bucket
+// shapes.
+func (a AccountTelemetry) UsedPercentByKind(kind WindowKind) (float64, bool) {
+	var max float64
+	found := false
+	for _, window := range a.WindowList() {
+		if window.Kind != kind {
+			continue
+		}
+		if !found || window.UsedPercent > max {
+			max = window.UsedPercent
+		}
+		found = true
+	}
+	return max, found
 }

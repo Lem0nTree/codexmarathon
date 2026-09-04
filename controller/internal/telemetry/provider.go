@@ -56,6 +56,130 @@ func (f ProviderFunc) Snapshot(ctx context.Context, accountID string) (SnapshotR
 	return f(ctx, accountID)
 }
 
+// AccountObservation is the result of observing one configured account. It
+// intentionally carries an unusable snapshot alongside Err so a batch can
+// continue checking other accounts when one inactive profile is expired,
+// revoked, or temporarily unreachable. An error is never converted into a
+// zero-usage observation.
+type AccountObservation struct {
+	AccountID string
+	Telemetry AccountTelemetry
+	Err       error
+	FromCache bool
+	Refreshed bool
+}
+
+// ObserveOptions controls a bounded observation pass. MaxAge is evaluated by
+// the caller/policy as well as by this helper; Force bypasses the cache on the
+// first request. A stale cached result is refreshed once when a provider is
+// registered, never retried in an unbounded loop.
+type ObserveOptions struct {
+	Force  bool
+	MaxAge time.Duration
+	Now    time.Time
+}
+
+// Observe reads account snapshots in deterministic account-ID order. It is a
+// batch boundary for active runtime state and inactive stored-profile
+// providers: both use the same cache/state-store semantics, while an
+// individual provider failure remains attached to that account.
+func (r *MultiAccountUsageRouter) Observe(ctx context.Context, accountIDs []string, options ObserveOptions) ([]AccountObservation, error) {
+	if r == nil {
+		return nil, errors.New("usage router is nil")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ids := uniqueSortedIDs(accountIDs)
+	now := options.Now
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	observations := make([]AccountObservation, 0, len(ids))
+	for _, accountID := range ids {
+		if err := ctx.Err(); err != nil {
+			return observations, err
+		}
+		observation := AccountObservation{AccountID: accountID}
+		cachedBefore := false
+		if !options.Force && r.cache != nil {
+			_, cachedBefore = r.cache.Get(accountID)
+		}
+		result, err := r.snapshot(ctx, accountID, options.Force)
+		if err == nil && result.IsUsable {
+			telemetry := result.Telemetry
+			if telemetry.AccountID == "" {
+				telemetry = result.Snapshot
+			}
+			observation.Telemetry = telemetry.Clone()
+			observation.FromCache = cachedBefore
+			// A cache hit can be structurally valid but too old or reset-stale.
+			// Refresh once, provided the account has a provider. This keeps
+			// threshold decisions from authorizing a switch from stale data.
+			if !telemetry.HasFreshCapacityWithin(now, options.MaxAge) && r.hasProvider(accountID) {
+				fresh, refreshErr := r.snapshot(ctx, accountID, true)
+				observation.Refreshed = true
+				observation.FromCache = false
+				if refreshErr != nil || !fresh.IsUsable {
+					observation.Err = refreshErr
+					if observation.Err == nil {
+						observation.Err = fresh.Err
+					}
+					observation.Telemetry = AccountTelemetry{AccountID: accountID, IsUsable: false, Source: "refresh_failed"}
+				} else {
+					observation.Telemetry = fresh.Telemetry.Clone()
+					if observation.Telemetry.AccountID == "" {
+						observation.Telemetry = fresh.Snapshot.Clone()
+					}
+				}
+			}
+		} else {
+			observation.Err = err
+			if observation.Err == nil {
+				observation.Err = result.Err
+			}
+			observation.Telemetry = AccountTelemetry{AccountID: accountID, IsUsable: false, Source: "unavailable"}
+		}
+		if observation.Telemetry.AccountID == "" {
+			observation.Telemetry.AccountID = accountID
+		}
+		observations = append(observations, observation)
+	}
+	return observations, nil
+}
+
+// ObserveAccounts is an alias with a more explicit call-site spelling.
+func (r *MultiAccountUsageRouter) ObserveAccounts(ctx context.Context, accountIDs []string, options ObserveOptions) ([]AccountObservation, error) {
+	return r.Observe(ctx, accountIDs, options)
+}
+
+// hasProvider reports whether a refresh can be attempted without exposing
+// provider implementation details.
+func (r *MultiAccountUsageRouter) hasProvider(accountID string) bool {
+	if r == nil {
+		return false
+	}
+	r.mu.RLock()
+	provider := r.providers[accountID]
+	r.mu.RUnlock()
+	return provider != nil
+}
+
+func uniqueSortedIDs(accountIDs []string) []string {
+	seen := make(map[string]struct{}, len(accountIDs))
+	for _, accountID := range accountIDs {
+		if accountID != "" {
+			seen[accountID] = struct{}{}
+		}
+	}
+	ids := make([]string, 0, len(seen))
+	for accountID := range seen {
+		ids = append(ids, accountID)
+	}
+	sort.Strings(ids)
+	return ids
+}
+
 // MultiAccountUsageRouter chooses the provider for an account and centralizes
 // cache/state-store ingestion.  Active runtime telemetry and inactive-profile
 // providers can therefore share one controller-facing abstraction without

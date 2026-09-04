@@ -1,0 +1,60 @@
+{
+  "schema_version": 1,
+  "product": "codexmarathon",
+  "artifact_root": "codexmarathon-{version}-{platform}",
+  "entrypoints": {
+    "controller": "codexmarathon",
+    "runtime": "codexmarathon-runtime"
+  },
+  "include": [
+    "README.md",
+    "docs/release.md",
+    "protocol/VERSION",
+    "protocol/protocol.json",
+    "protocol/commands.json",
+    "protocol/events.json",
+    "protocol/README.md",
+    "runtime/PROVENANCE.md",
+    "runtime/PATCH_LEDGER.md",
+    "runtime/codex-rs/LICENSE",
+    "runtime/codex-rs/NOTICE"
+  ],
+  "forbidden_path_segments": [
+    ".git",
+    ".codexmarathon",
+    ".codexmarathon-dev",
+    ".state",
+    ".venv",
+    "__pycache__",
+    "donor",
+    "node_modules",
+    "target"
+  ],
+  "forbidden_file_names": [
+    ".env",
+    ".env.local",
+    "auth.json",
+    "accounts.json",
+    "events.jsonl",
+    "diagnostics.json"
+  ],
+  "provenance": {
+    "codext": {
+      "repository": "https://github.com/Loongphy/codext",
+      "commit": "10c0989f282050b8617103d904788d994de8c971",
+      "license": "Apache-2.0",
+      "license_files": [
+        "runtime/codex-rs/LICENSE",
+        "runtime/codex-rs/NOTICE"
+      ],
+      "distributed_source": true
+    },
+    "codex_switch": {
+      "repository": "https://github.com/humeo/codex-switch",
+      "commit": "ca5c7dd454780272ed429f6fb1dceebda44397ae",
+      "license": "not established in pinned checkout",
+      "distributed_source": false,
+      "clearance": "required before distributing copied codex-switch source"
+    }
+  }
+}

@@ -1,0 +1,22 @@
+---
+source: tui/src/keymap_setup.rs
+expression: "render_picker(params, 120)"
+---
+
+  Keymap
+  All configurable shortcuts.
+  135 actions, 1 customized, 4 unbound.
+
+  [All]  Common  Customized (1)  Unbound (4)  App  Composer  Editor  Vim  Navigation  Agents  Approval  Debug
+
+  Type to search shortcuts
+› Global         Open Agents                alt-a
+  Global       * Open Transcript            ctrl-t, ctrl-x ctrl-t
+  Global         Open External Editor       ctrl-g
+  Global         Copy                       ctrl-o
+  Global         Clear Terminal             ctrl-l
+  Global       - Toggle Vim Mode            unbound
+  Global         Toggle Raw Output          alt-r
+  Global         Toggle Side Conversation   ctrl-/
+
+  left/right group · enter edit shortcut · * custom · - unbound · esc close

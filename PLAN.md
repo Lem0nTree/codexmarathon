@@ -1,61 +1,215 @@
-# CodexMarathon implementation plan
+# CodexMarathon product completion plan
 
-## Ground truth
+## Non-negotiable product outcome
 
-- Architecture sources: `CodexMarathon_v_0.0.2.md` and `CodexMarathon_v_0.0.2-parat2.md`.
-- Donors are reference-only checkouts under `donor/`:
-  - `humeo/codex-switch` for controller-side account, credential, and atomic deployment patterns.
-  - `Loongphy/codext` for runtime-side turn safety, auth reload, transport invalidation, telemetry, and recovery.
-- Product code lives outside `donor/`. No donor mechanism is copied blindly.
-- MVP language split: Go controller, Rust Codext runtime adapter, versioned JSON-RPC/IPC contract.
+CodexMarathon is a self-contained Codex distribution. Users install and run
+`codexmarathon`; they do not install, configure, or launch codex-switch or
+Codext separately. Those repositories are not operational dependencies; their
+open-source implementation is pinned, imported, and adapted in the tracked
+CodexMarathon product tree with provenance and required notices preserved.
 
-## Delivery gates
+The shipped product must provide:
 
-### Gate 1 — Contract and foundations
+1. Native OAuth login for multiple Codex accounts.
+2. Secure account/profile storage and quota observation.
+3. Automatic switching when a configured threshold is reached or a request
+   returns `UsageLimitExceeded`.
+4. Pool-exhaustion handling using authoritative reset timestamps, followed by
+   mandatory telemetry revalidation.
+5. Safe-boundary credential deployment, native AuthManager reload, and
+   invalidation of account-bound model transports.
+6. Verified runtime identity change before continuation.
+7. Exactly-once continuation of the interrupted task in the same conversation.
 
-1. Define protocol v1 commands, events, shared identity fields, version negotiation, and JSON schemas.
-2. Bootstrap the Go controller module and runtime client types generated or validated against the protocol.
-3. Specify the narrow Rust adapter seam against current Codext code, with a patch ledger.
+The only unavoidable external services are the official authentication and
+model endpoints used by Codex itself.
 
-Exit: schemas validate, Go protocol tests pass, and the adapter design maps every operation to observed Codext code.
+## Product architecture
 
-### Gate 2 — Controller state domains
+```text
+codexmarathon (single user-facing command and installer)
+|
++-- integrated Codex-derived runtime
+|   +-- normal Codex CLI/TUI and conversation state
+|   +-- native Codex OAuth/login implementation
+|   +-- authoritative running-turn state
+|   +-- AuthManager reload and transport invalidation
+|   `-- parked, exactly-once recovery turn
+|
++-- account manager
+|   +-- add/login/list/remove/rename accounts
+|   +-- encrypted or OS-protected credential vault
+|   `-- token-refresh write-back
+|
+`-- marathon coordinator
+    +-- active/inactive account telemetry
+    +-- threshold and exhaustion policy
+    +-- reset scheduler and revalidation
+    +-- TransitionID and AuthGeneration
+    +-- durable transaction journal and reconciliation
+    `-- automatic recovery orchestration
+```
 
-4. Implement normalized multi-bucket telemetry, per-window freshness, sparse-update reconciliation, and immutable cache.
-5. Implement policy decisions plus pool exhaustion/reset scheduling; elapsed reset times require re-observation.
-6. Implement account registry, credential vault abstraction, atomic deployment, token write-back contract, and journal.
+An internal protocol may remain as a testable module boundary, but it must not
+be a user-managed deployment dependency. If implementation uses two bundled
+processes, the launcher owns their startup, authenticated local IPC, version
+compatibility, shutdown, and recovery. A single-process integration is
+preferred when it reduces failure states without duplicating Codex internals.
 
-Exit: deterministic unit tests cover sparse ambiguous updates, cache immutability, stale windows, earliest reset, and no inferred availability.
+## Required donor-code reuse
 
-### Gate 3 — Transition correctness
+CodexMarathon will reuse and adapt implementation code from both donor
+repositories rather than merely reproduce their ideas. Every imported unit
+must record its source repository, pinned commit, original path, local path,
+and subsequent Marathon changes in a provenance manifest.
 
-7. Implement TransitionID/AuthGeneration state, coordinator, runtime/disk identity verification, and uncertain-state reconciliation.
-8. Add a fake runtime and failure injection for lost acknowledgements, stale commands, reload failures, and reconnects.
+### Reuse from `humeo/codex-switch`
 
-Exit: controller integration tests prove safe A-to-B transition, lost-ACK reconciliation, and stale-generation rejection.
+Import the feature cores, their tests, and necessary supporting types from the
+pinned donor checkout:
 
-### Gate 4 — Runtime integration
+- `internal/profile`: profile validation, storage, opaque auth snapshots, and
+  token-preserving updates;
+- `internal/auth`: OAuth refresh and refreshed-token persistence;
+- `internal/quota`: inactive-account quota requests, header parsing,
+  rate-limit handling, and retry behavior;
+- `internal/switcher`: atomic `auth.json` replacement and profile activation;
+- `internal/watcher`: threshold evaluation, candidate ordering, cooldown,
+  event/state persistence, and pool-depletion signals;
+- selected `internal/cli` flows for account capture, list, use, remove, and
+  status, rewritten behind the CodexMarathon command surface.
 
-9. Implement the minimal Codext adapter in a dedicated runtime patch area: status/identity API, safe-boundary events, correlated transition commands/events, generation tracking, and telemetry forwarding.
-10. Preserve Codext ownership of AuthManager reload, transport invalidation, running-turn guard, and exactly-once parked recovery.
+The session-file watcher becomes a fallback only. Native events from the
+integrated runtime are the primary trigger. The donor's shell-out login flow
+must be replaced with direct calls to the integrated Codex login crate.
 
-Exit: targeted Rust build/tests pass and patch ledger shows a small, reviewable delta from the donor commit.
+### Reuse from `Loongphy/codext`
 
-### Gate 5 — End-to-end MVP
+Import the required Codext `codex-rs` runtime code as the product runtime and
+retain its existing implementations for:
 
-11. Connect controller to the runtime adapter over local IPC and add supervised lifecycle behavior.
-12. Run the seven architecture acceptance cases plus full-pool exhaustion, reset revalidation, and recovery-survival cases.
-13. Add operator CLI/status output and concise architecture, telemetry, transitions, recovery, and upstream-sync docs.
+- Codex CLI/TUI, thread/session state, and model request execution;
+- `login` AuthManager, browser/device-code OAuth, auth reload, and refresh;
+- authoritative running-turn guard and deferred authentication changes;
+- account/workspace identity refresh;
+- invalidation of cached account-bound model transports;
+- rate-limit snapshots and update notifications;
+- `UsageLimitExceeded` detection, parked synthetic recovery, and exactly-once
+  continuation in the same conversation.
 
-Exit: one repeatable local command builds and tests the MVP; observed limitations are documented.
+Marathon-specific code must be integrated at those existing seams. It must not
+replace them with parallel AuthManager, turn counter, transport teardown, or
+recovery implementations.
 
-## Agent queue
+### Licensing and provenance gate
 
-- Task A: protocol v1 and Go controller bootstrap.
-- Task B: telemetry, cache, policy, and reset scheduler.
-- Task C: accounts, credentials, atomic deployment, and journal.
-- Task D: transition coordinator, reconciliation, fake runtime, and integration tests.
-- Task E: Codext runtime adapter implementation.
-- Task F: end-to-end wiring, CLI, documentation, and acceptance verification.
+Codext carries Apache-2.0 and its license/notices must be preserved. The
+checked-out codex-switch tree contains no `LICENSE` file. Before distributing
+copied codex-switch code, obtain or locate an explicit license grant from its
+owner and record it in the repository. Public source and an invitation to
+adapt it establish project intent but are not, by themselves, a standard
+redistribution license. This is a release/legal gate, not a reason to redesign
+away from the required technical reuse.
 
-Tasks B and C may proceed after the Go module skeleton exists or within isolated packages. Task D consumes Task A's contract. Task E consumes the reviewed protocol and adapter mapping. Task F begins only after controller and runtime gates pass.
+## Gate 1 — Import a maintainable runtime baseline
+
+- Create a tracked `runtime/codex-rs` product tree from a pinned Codext/OpenAI
+  Codex revision, preserving Apache-2.0 notices and attribution.
+- Exclude unrelated Codext UX changes unless required for continuity.
+- Maintain a small upstream-reapply ledger for every Marathon-specific patch.
+- Rename/package the resulting executable as part of CodexMarathon.
+
+Exit: the in-repository runtime builds and behaves as a normal Codex CLI before
+Marathon behavior is enabled.
+
+## Gate 2 — Native multi-account login and vault
+
+- Reuse the in-tree Codex login crate for browser and device-code OAuth.
+- Add `account login`/`add`, `account list`/`status`, `account use`/`activate`,
+  `account rename`, `account refresh`, and `account remove` commands.
+- Capture each completed login directly into the Marathon vault without asking
+  users to copy `auth.json` or run another tool.
+- Protect credentials with OS facilities where available and restrictive file
+  permissions as a fallback.
+- Preserve provider-specific fields and write refreshed tokens back to the
+  correct stored profile.
+
+Exit: a user can add two accounts, inspect health, refresh, rename, and switch
+manually using only `codexmarathon`, with no token printed or stored in
+metadata/logs.
+
+## Gate 3 — Integrated telemetry and policy loop
+
+- Feed active-account rate limits directly from the runtime.
+- Implement an in-product provider for inactive stored accounts using supported
+  Codex authentication/telemetry behavior; do not shell out to codex-switch.
+- Evaluate both proactive thresholds and `UsageLimitExceeded`.
+- Rank only fresh, eligible accounts and prevent switch loops.
+- When all accounts are unavailable, select the earliest trustworthy reset;
+  if none exists, wait for fresh data with bounded backoff.
+- At a reset boundary, invalidate the old observation and re-query before
+  declaring capacity available.
+
+Exit: deterministic tests cover threshold switching, hard-limit switching,
+multi-bucket limits, stale data, pool exhaustion, reset ordering, and failed
+refreshes.
+
+## Gate 4 — Native safe transition
+
+- Use the runtime's authoritative running-turn state; do not create a second
+  SafeBoundaryManager.
+- Before leaving Account A, persist any legitimate token refresh to A's vault
+  snapshot.
+- Atomically deploy Account B's credential snapshot.
+- Reload the existing runtime AuthManager and invalidate all account-bound
+  model transports and cached account state.
+- Emit and verify `IdentityChanged(B, generation N+1, transition ID)`.
+- Reconcile controller intent, deployed credentials, and runtime identity after
+  any timeout, crash, or lost acknowledgement.
+
+Exit: the next model request is proven to use Account B without restarting or
+replacing the active conversation.
+
+## Gate 5 — Exactly-once task continuation
+
+- On `UsageLimitExceeded`, preserve Codext's existing parked recovery turn.
+- Do not let the account manager or coordinator create a second resume prompt.
+- Release recovery only after the verified identity-changing reload.
+- If the pool is exhausted, keep recovery parked across reset waiting and
+  controller/runtime restarts.
+- Persist enough transition and recovery metadata to avoid duplicate dispatch.
+
+Exit: the interrupted task resumes once, in the same conversation, after a
+verified switch; crash/restart cases do not lose or duplicate continuation.
+
+## Gate 6 — One-install operational product
+
+- Add a single launcher and configuration surface.
+- Bundle or statically link all product-owned components; no separate Codext or
+  codex-switch installation is permitted.
+- If local IPC remains, use authenticated user-scoped Windows named pipes and
+  Unix domain sockets created and managed automatically.
+- Add migration, diagnostics, safe rollback, and upstream-version reporting.
+- Produce signed/reproducible platform artifacts and an installer/uninstaller.
+
+Exit: a clean machine can install CodexMarathon, log into multiple accounts,
+start a long task, switch automatically, and resume without manual file edits
+or auxiliary processes.
+
+## Gate 7 — Release evidence
+
+Required end-to-end cases:
+
+1. Proactive threshold A -> B during a long task.
+2. `UsageLimitExceeded` A -> B with exactly-once recovery.
+3. Active turn prevents mid-turn identity mutation.
+4. Lost commit acknowledgement resolves by reconciliation.
+5. Stale generation is rejected.
+6. Entire pool exhausted -> earliest reset -> refresh -> transition.
+7. No trustworthy reset -> wait for data with bounded backoff.
+8. Controller/runtime restart during each transition phase.
+9. Refreshed token write-back prevents stale credential resurrection.
+10. Packaging test on a machine without donor repositories or developer tools.
+
+Release requires compiled Go/Rust tests, live Codex integration tests, CI on
+supported platforms, and a documented upstream sync/reapply procedure.

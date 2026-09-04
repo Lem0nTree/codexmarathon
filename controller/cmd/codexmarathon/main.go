@@ -1,6 +1,5 @@
-// Command codexmarathon is the decision-first operator CLI for the MVP
-// controller. It intentionally exposes inspection and one-shot transition /
-// reconciliation actions; it is not a dashboard or a background service.
+// Command codexmarathon is the decision-first operator CLI and one-command
+// launcher for the bundled Codex runtime.
 package main
 
 import (
@@ -23,15 +22,25 @@ import (
 const commandUsage = `CodexMarathon controller
 
 Usage:
+  codexmarathon run [options]
+  codexmarathon start [options]
   codexmarathon init [options]
   codexmarathon status [options]
   codexmarathon accounts list [options]
+  codexmarathon accounts login [options]
+  codexmarathon accounts add [options]
+  codexmarathon accounts status [account-id] [options]
+  codexmarathon accounts rename <account-id> --name <alias> [options]
+  codexmarathon accounts activate <account-id> [options]
+  codexmarathon accounts use <account-id> [options]
+  codexmarathon accounts refresh <account-id> --runtime <endpoint> [options]
+  codexmarathon accounts remove <account-id> [options]
   codexmarathon transition <account-id> --runtime <endpoint> [options]
   codexmarathon reconcile [transition-id] --runtime <endpoint> [options]
 
-Options are command-local. Runtime endpoints support tcp://host:port and
-host:port shorthand in the MVP; a host-specific named-pipe connector can use
-app.ConnectRuntime directly.
+Options are command-local. The launcher defaults to a user-scoped Unix socket
+or Windows named pipe and refuses unauthenticated TCP. Runtime endpoints can
+be supplied explicitly only when they remain inside that local IPC policy.
 `
 
 func main() {
@@ -44,15 +53,14 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return 0
 	}
 	switch args[0] {
+	case "run", "start":
+		return runCommand(args[1:], stdout, stderr)
 	case "init":
 		return runInit(args[1:], stdout, stderr)
 	case "status":
 		return runStatus(args[1:], stdout, stderr)
 	case "accounts":
-		if len(args) < 2 || args[1] != "list" {
-			return usageError(stderr, "accounts currently supports only `accounts list`")
-		}
-		return runAccountsList(args[2:], stdout, stderr)
+		return runAccounts(args[1:], stdout, stderr)
 	case "transition":
 		return runTransition(args[1:], stdout, stderr)
 	case "reconcile":

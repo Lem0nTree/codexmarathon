@@ -2,8 +2,8 @@
 //!
 //! The types in this module intentionally model only the small, stable
 //! controller/runtime contract.  They do not mirror Codext's internal
-//! request or authentication types.  In particular, no credential or token
-//! field exists in this module.
+//! request or authentication types.  Account-login snapshots are carried only
+//! as opaque JSON values and are never interpreted by this adapter.
 
 use serde::de::DeserializeOwned;
 use serde::ser::Error as SerdeError;
@@ -22,6 +22,21 @@ pub const METHOD_COMMIT_AUTH_TRANSITION: &str = "auth/transition/commit";
 pub const METHOD_CANCEL_AUTH_TRANSITION: &str = "auth/transition/cancel";
 pub const METHOD_GET_IDENTITY: &str = "runtime/identity/read";
 pub const METHOD_GET_AUTH_GENERATION: &str = "runtime/authGeneration/read";
+/// Start one login flow using Codex's native login implementation.
+///
+/// The response contains an opaque auth snapshot for the controller's
+/// protected vault.  It is intentionally not modelled as token fields here;
+/// provider-specific parsing remains in Codex's login crate.
+pub const METHOD_LOGIN_ACCOUNT: &str = "account/login";
+/// Refresh one account snapshot using Codex's native AuthManager path.
+pub const METHOD_REFRESH_ACCOUNT: &str = "account/refresh";
+/// Read the active opaque auth snapshot so the controller can synchronize
+/// refreshed Account A credentials before deploying Account B.
+pub const METHOD_READ_AUTH_SNAPSHOT: &str = "account/authSnapshot/read";
+/// Authorize Codext's already-parked UsageLimitExceeded recovery turn. The
+/// runtime owns the prompt and thread queue; this method only releases the
+/// native continuation after a verified account transition.
+pub const METHOD_RELEASE_RECOVERY: &str = "recovery/release";
 pub const EVENT_NOTIFICATION_METHOD: &str = "codexmarathon/event";
 
 pub const EVENT_RUNTIME_READY: &str = "runtime_ready";
@@ -233,6 +248,10 @@ pub struct RuntimeState {
     pub identity: RuntimeIdentity,
     pub active_turn_count: u32,
     pub pending_transition: Option<PendingTransition>,
+    /// Runtime-owned parked/released recovery metadata. Older peers may omit
+    /// this field; an empty list remains a valid state snapshot.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recoveries: Vec<RecoveryState>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -314,6 +333,243 @@ pub struct TransitionResult {
 #[serde(deny_unknown_fields)]
 pub struct AuthGenerationResult {
     pub auth_generation: u64,
+}
+
+/// Non-secret intent for a native account login.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeLoginParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alias: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub overwrite: bool,
+}
+
+impl NativeLoginParams {
+    pub fn validate(&self) -> Result<(), String> {
+        if self
+            .account_id
+            .as_deref()
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            return Err("account_id must not be empty when supplied".to_string());
+        }
+        if self
+            .alias
+            .as_deref()
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            return Err("alias must not be empty when supplied".to_string());
+        }
+        Ok(())
+    }
+}
+
+/// In-memory handoff of a native login result.
+///
+/// `auth_json` is opaque by design.  The adapter never logs, journals, or
+/// interprets this value; the controller must put it directly into its
+/// protected credential vault.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeLoginResult {
+    pub account_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alias: Option<String>,
+    pub auth_json: Value,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metadata: BTreeMap<String, String>,
+}
+
+impl NativeLoginResult {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.account_id.trim().is_empty() {
+            return Err("native login returned an empty account_id".to_string());
+        }
+        if !self.auth_json.is_object() {
+            return Err("native login returned a non-object auth_json".to_string());
+        }
+        Ok(())
+    }
+}
+
+/// Opaque active-account snapshot read from Codex's native AuthManager.
+///
+/// This result is an in-memory handoff only. The adapter does not log,
+/// journal, or inspect the `auth_json` value.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeAuthSnapshotResult {
+    pub account_id: String,
+    pub auth_json: Value,
+}
+
+impl NativeAuthSnapshotResult {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.account_id.trim().is_empty() {
+            return Err("native auth snapshot returned an empty account_id".to_string());
+        }
+        if !self.auth_json.is_object() {
+            return Err("native auth snapshot returned a non-object auth_json".to_string());
+        }
+        Ok(())
+    }
+}
+
+/// Opaque account snapshot supplied to the native refresh path.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeRefreshParams {
+    pub account_id: String,
+    pub auth_json: Value,
+}
+
+impl NativeRefreshParams {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.account_id.trim().is_empty() {
+            return Err("account_id is required".to_string());
+        }
+        if !self.auth_json.is_object() {
+            return Err("auth_json must be an object".to_string());
+        }
+        Ok(())
+    }
+}
+
+/// Native refresh output.  It remains provider-neutral and contains only the
+/// fields the controller needs to write back into the opaque snapshot.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeRefreshResult {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub access_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refresh_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
+}
+
+/// Lifecycle phase for Codext's native UsageLimitExceeded recovery queue.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryPhase {
+    Parked,
+    Released,
+    Started,
+    Completed,
+}
+
+/// Secret-free recovery metadata exposed for restart reconciliation. Prompt
+/// text and credential material are intentionally not representable here.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryState {
+    pub recovery_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_account_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transition_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_account_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_generation: Option<u64>,
+    pub phase: RecoveryPhase,
+}
+
+impl RecoveryState {
+    pub fn parked(recovery_id: impl Into<String>) -> Self {
+        Self {
+            recovery_id: recovery_id.into(),
+            thread_id: None,
+            turn_id: None,
+            source_account_id: None,
+            transition_id: None,
+            target_account_id: None,
+            expected_generation: None,
+            phase: RecoveryPhase::Parked,
+        }
+    }
+}
+
+/// Controller authorization for one native parked recovery. The transition
+/// correlation makes stale releases harmless and lets a restarted controller
+/// retry the same release without inventing a second prompt.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryReleaseParams {
+    pub recovery_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
+    pub transition_id: String,
+    pub expected_generation: u64,
+}
+
+impl RecoveryReleaseParams {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.recovery_id.trim().is_empty() {
+            return Err("recovery_id is required".to_string());
+        }
+        if self.transition_id.trim().is_empty() {
+            return Err("transition_id is required".to_string());
+        }
+        if self.expected_generation == 0 {
+            return Err("expected_generation must be greater than zero".to_string());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryReleaseOutcome {
+    Released,
+    AlreadyReleased,
+    Rejected,
+    Uncertain,
+}
+
+/// Secret-free result for one recovery release request.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryReleaseResult {
+    pub recovery_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
+    pub outcome: RecoveryReleaseOutcome,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
+}
+
+impl NativeRefreshResult {
+    pub fn validate_for(&self, requested_account_id: &str) -> Result<(), String> {
+        if requested_account_id.trim().is_empty() {
+            return Err("account_id is required".to_string());
+        }
+        if self.access_token.is_none()
+            && self.id_token.is_none()
+            && self.refresh_token.is_none()
+        {
+            return Err("native refresh returned no token fields".to_string());
+        }
+        if self
+            .account_id
+            .as_deref()
+            .is_some_and(|account_id| account_id != requested_account_id)
+        {
+            return Err("native refresh returned a different account_id".to_string());
+        }
+        Ok(())
+    }
 }
 
 /// The intentionally narrow rate-limit window consumed by the controller.
@@ -417,11 +673,21 @@ pub struct IdentityChangedPayload {
 pub struct RecoveryParkedPayload {
     pub recovery_id: String,
     pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_account_id: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecoveryStartedPayload {
     pub recovery_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -430,6 +696,34 @@ pub struct RecoveryCompletedPayload {
     pub outcome: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+}
+
+/// A lifecycle observation emitted by the native Codext recovery owner.
+///
+/// This is intentionally not a command and carries no prompt data.  The
+/// embedded runtime drains these observations before serving controller
+/// requests, which lets the adapter register a parked recovery before a
+/// release is attempted.  The enum is kept internal to the Rust composition
+/// seam; the wire protocol remains the existing flat event payloads above.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RecoveryLifecycleEvent {
+    Parked(RecoveryParkedPayload),
+    Started(RecoveryStartedPayload),
+    Completed(RecoveryCompletedPayload),
+}
+
+impl RecoveryLifecycleEvent {
+    pub fn recovery_id(&self) -> &str {
+        match self {
+            Self::Parked(payload) => &payload.recovery_id,
+            Self::Started(payload) => &payload.recovery_id,
+            Self::Completed(payload) => &payload.recovery_id,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -593,6 +887,10 @@ pub fn requires_transition_id(event_type: &str) -> bool {
 
 fn empty_object() -> Value {
     Value::Object(Map::new())
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl fmt::Display for TransitionOutcome {

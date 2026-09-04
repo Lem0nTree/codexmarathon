@@ -12,7 +12,7 @@ use crate::protocol::*;
 use crate::telemetry::TelemetryForwarder;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -72,11 +72,79 @@ pub trait CodextBackend {
         ))
     }
 
+    /// Complete the reload boundary, including account-bound transport
+    /// invalidation.  Native backends may override this to hold their shared
+    /// turn/auth lock across both operations; the default preserves the
+    /// existing single-call backend contract.
+    fn reload_auth_and_invalidate(&mut self) -> Result<BackendReload, BackendError> {
+        self.reload_auth_from_storage()
+    }
+
     /// Delegate to Codext's existing account/rateLimits/read implementation.
     fn read_rate_limits(&mut self) -> Result<BackendRateLimits, BackendError> {
         Err(BackendError::new(
             "backend_not_configured",
             "rate-limit read is not wired to Codext",
+        ))
+    }
+
+    /// Delegate account login to Codex's native login/AuthManager path.
+    ///
+    /// The result is an opaque auth snapshot. Implementations must not log or
+    /// persist it outside the controller's protected credential vault.
+    fn login_account(
+        &mut self,
+        _params: NativeLoginParams,
+    ) -> Result<NativeLoginResult, BackendError> {
+        Err(BackendError::new(
+            "backend_not_configured",
+            "account login is not wired to Codex",
+        ))
+    }
+
+    /// Read the active opaque auth snapshot from Codex's existing
+    /// `AuthManager`. This is used to synchronize refreshed Account A
+    /// credentials before the controller deploys Account B.
+    fn read_auth_snapshot(&mut self) -> Result<NativeAuthSnapshotResult, BackendError> {
+        Err(BackendError::new(
+            "backend_not_configured",
+            "auth snapshot read is not wired to Codex",
+        ))
+    }
+
+    /// Delegate account refresh to Codex's native AuthManager path.
+    fn refresh_account(
+        &mut self,
+        _params: NativeRefreshParams,
+    ) -> Result<NativeRefreshResult, BackendError> {
+        Err(BackendError::new(
+            "backend_not_configured",
+            "account refresh is not wired to Codex",
+        ))
+    }
+
+    /// Drain lifecycle observations from the native recovery owner.
+    ///
+    /// Codext owns the pending synthetic turn and emits these observations at
+    /// the point where its own state changes.  The default keeps standalone
+    /// adapter users source-compatible; production backends should return the
+    /// native event stream without interpreting or replaying prompt content.
+    fn drain_recovery_events(&mut self) -> Vec<RecoveryLifecycleEvent> {
+        Vec::new()
+    }
+
+    /// Release one recovery turn already parked by Codext after a
+    /// `UsageLimitExceeded` failure. The native runtime owns the queue,
+    /// configured prompt, and thread; the adapter never constructs or sends
+    /// a continuation itself. Implementations must make this operation
+    /// idempotent by `recovery_id` so a lost response can be reconciled.
+    fn release_recovery(
+        &mut self,
+        _params: RecoveryReleaseParams,
+    ) -> Result<RecoveryReleaseResult, BackendError> {
+        Err(BackendError::new(
+            "backend_not_configured",
+            "recovery release is not wired to Codex",
         ))
     }
 }
@@ -101,7 +169,11 @@ impl Default for AdapterConfig {
                 "auth_transition".to_string(),
                 "safe_boundary".to_string(),
                 "rate_limits".to_string(),
+                "account_login".to_string(),
+                "account_refresh".to_string(),
+                "auth_snapshot_read".to_string(),
                 "recovery_events".to_string(),
+                "recovery_release".to_string(),
             ],
             now: Arc::new(unix_now_seconds),
             max_frame_bytes: crate::framing::DEFAULT_MAX_FRAME_BYTES,
@@ -139,6 +211,8 @@ pub struct RuntimeAdapter<B> {
     last_active_turn_count: u32,
     events: VecDeque<RuntimeEvent>,
     seen_recovery_events: HashSet<(String, String)>,
+    recoveries: BTreeMap<String, RecoveryState>,
+    release_results: BTreeMap<String, RecoveryReleaseResult>,
     telemetry: TelemetryForwarder,
 }
 
@@ -180,6 +254,8 @@ impl<B: CodextBackend> RuntimeAdapter<B> {
             last_active_turn_count: active_turn_count,
             events: VecDeque::new(),
             seen_recovery_events: HashSet::new(),
+            recoveries: BTreeMap::new(),
+            release_results: BTreeMap::new(),
             telemetry: TelemetryForwarder,
         })
     }
@@ -204,6 +280,14 @@ impl<B: CodextBackend> RuntimeAdapter<B> {
         self.negotiated_version.is_some()
     }
 
+    /// Reset only connection-scoped protocol state after an IPC disconnect.
+    /// Runtime identity, auth generation, pending transition intent, and
+    /// queued lifecycle events remain intact so a reconnect can negotiate
+    /// again and reconcile the same in-flight operation.
+    pub fn reset_connection(&mut self) {
+        self.negotiated_version = None;
+    }
+
     pub fn codec(&self) -> JsonLineCodec {
         self.codec
     }
@@ -219,6 +303,7 @@ impl<B: CodextBackend> RuntimeAdapter<B> {
                 target_account_id: state.params.target_account_id.clone(),
                 expected_generation: state.params.expected_generation,
             }),
+            recoveries: self.recoveries.values().cloned().collect(),
         })
     }
 
@@ -246,6 +331,43 @@ impl<B: CodextBackend> RuntimeAdapter<B> {
                     .map_err(|error| AdapterError::Framing(error.to_string()))
             })
             .collect()
+    }
+
+    /// Drain lifecycle observations produced by Codext and forward them into
+    /// the controller-facing event queue.  This must run before a controller
+    /// request is dispatched so a just-parked recovery is present in the
+    /// adapter map before `recovery/release` or `runtime/state/read`.
+    pub fn drain_native_recovery_events(&mut self) -> Result<usize, AdapterError> {
+        let native_events = self.backend.drain_recovery_events();
+        let mut forwarded = 0;
+        for event in native_events {
+            let accepted = match event {
+                RecoveryLifecycleEvent::Parked(payload) => self
+                    .forward_recovery_parked_with_context(
+                        payload.recovery_id,
+                        payload.reason,
+                        payload.thread_id,
+                        payload.turn_id,
+                        payload.source_account_id,
+                    )?,
+                RecoveryLifecycleEvent::Started(payload) => self
+                    .forward_recovery_started_with_context(
+                        payload.recovery_id,
+                        payload.thread_id,
+                        payload.turn_id,
+                    )?,
+                RecoveryLifecycleEvent::Completed(payload) => self
+                    .forward_recovery_completed_with_context(
+                        payload.recovery_id,
+                        payload.outcome,
+                        payload.error_code,
+                        payload.thread_id,
+                        payload.turn_id,
+                    )?,
+            };
+            forwarded += usize::from(accepted);
+        }
+        Ok(forwarded)
     }
 
     /// Handle one decoded controller request and return its JSON-RPC response.
@@ -310,6 +432,22 @@ impl<B: CodextBackend> RuntimeAdapter<B> {
                     auth_generation: self.identity.auth_generation,
                 })?)
             }
+            METHOD_LOGIN_ACCOUNT => {
+                let params: NativeLoginParams = decode_params(params)?;
+                Ok(serde_json::to_value(self.login_account(params)?)?)
+            }
+            METHOD_READ_AUTH_SNAPSHOT => {
+                require_empty_params(&params)?;
+                Ok(serde_json::to_value(self.read_auth_snapshot()?)?)
+            }
+            METHOD_REFRESH_ACCOUNT => {
+                let params: NativeRefreshParams = decode_params(params)?;
+                Ok(serde_json::to_value(self.refresh_account(params)?)?)
+            }
+            METHOD_RELEASE_RECOVERY => {
+                let params: RecoveryReleaseParams = decode_params(params)?;
+                Ok(serde_json::to_value(self.release_recovery(params)?)?)
+            }
             METHOD_PREPARE_AUTH_TRANSITION => {
                 let params: AuthTransitionParams = decode_params(params)?;
                 Ok(serde_json::to_value(self.prepare(params)?)?)
@@ -326,6 +464,39 @@ impl<B: CodextBackend> RuntimeAdapter<B> {
                 "method not found: {method}"
             ))),
         }
+    }
+
+    fn login_account(
+        &mut self,
+        params: NativeLoginParams,
+    ) -> Result<NativeLoginResult, AdapterError> {
+        params
+            .validate()
+            .map_err(AdapterError::InvalidParams)?;
+        let result = self.backend.login_account(params)?;
+        result.validate().map_err(AdapterError::Protocol)?;
+        Ok(result)
+    }
+
+    fn read_auth_snapshot(&mut self) -> Result<NativeAuthSnapshotResult, AdapterError> {
+        let result = self.backend.read_auth_snapshot()?;
+        result.validate().map_err(AdapterError::Protocol)?;
+        Ok(result)
+    }
+
+    fn refresh_account(
+        &mut self,
+        params: NativeRefreshParams,
+    ) -> Result<NativeRefreshResult, AdapterError> {
+        params
+            .validate()
+            .map_err(AdapterError::InvalidParams)?;
+        let requested_account_id = params.account_id.clone();
+        let result = self.backend.refresh_account(params)?;
+        result
+            .validate_for(&requested_account_id)
+            .map_err(AdapterError::Protocol)?;
+        Ok(result)
     }
 
     fn negotiate(&mut self, params: Value) -> Result<Value, AdapterError> {
@@ -483,7 +654,7 @@ impl<B: CodextBackend> RuntimeAdapter<B> {
             },
         )?;
 
-        let reload = match self.backend.reload_auth_from_storage() {
+        let reload = match self.backend.reload_auth_and_invalidate() {
             Ok(reload) => reload,
             Err(error) => {
                 let code = error.code.clone();
@@ -513,6 +684,42 @@ impl<B: CodextBackend> RuntimeAdapter<B> {
         } else {
             old_generation
         };
+
+        // A reload acknowledgement is not a successful transition unless the
+        // native AuthManager now observes the exact account that was prepared.
+        // Do this check before emitting the success event or clearing the
+        // controller's intent.  A changed-but-wrong native identity is left
+        // observable (including its generation) so the controller's
+        // three-way reconciliation can classify the split brain rather than
+        // treating an arbitrary reload as Account B.
+        if reload.identity.account_id.as_deref() != Some(params.target_account_id.as_str()) {
+            let observed_account_id = reload.identity.account_id.clone();
+            self.identity.account_id = observed_account_id.clone();
+            self.identity.auth_generation = new_generation;
+            let message = format!(
+                "native AuthManager observed account {:?}, expected {}",
+                observed_account_id, params.target_account_id
+            );
+            self.emit_event(
+                EventBase::new(
+                    EVENT_AUTH_RELOAD_FAILED,
+                    (self.now)(),
+                    self.identity.runtime_id.clone(),
+                    new_generation,
+                    Some(params.transition_id.clone()),
+                ),
+                &AuthReloadFailedPayload {
+                    error_code: "identity_mismatch".to_string(),
+                    error_message: message.clone(),
+                },
+            )?;
+            self.pending = None;
+            return Ok(self.rejected_result(
+                &params,
+                "identity_mismatch",
+                message,
+            ));
+        }
         self.identity.account_id = reload.identity.account_id.clone();
         self.identity.auth_generation = new_generation;
         self.emit_event(
@@ -550,7 +757,11 @@ impl<B: CodextBackend> RuntimeAdapter<B> {
         Ok(TransitionResult {
             transition_id: params.transition_id,
             runtime_id: self.identity.runtime_id.clone(),
-            expected_generation: Some(old_generation),
+            // `expected_generation` is the target generation (`old + 1`) on
+            // both prepare and commit. Keeping this field correlated with
+            // the controller command lets the Go coordinator validate a
+            // native commit acknowledgement without a second convention.
+            expected_generation: Some(params.expected_generation),
             auth_generation: new_generation,
             outcome: TransitionOutcome::Committed,
             account_id: self.identity.account_id.clone(),
@@ -748,6 +959,20 @@ impl<B: CodextBackend> RuntimeAdapter<B> {
         recovery_id: impl Into<String>,
         reason: impl Into<String>,
     ) -> Result<bool, AdapterError> {
+        self.forward_recovery_parked_with_context(recovery_id, reason, None, None, None)
+    }
+
+    /// Forward a parked recovery together with its native thread/turn
+    /// correlation. Optional context preserves compatibility with older
+    /// Codext event producers while allowing same-thread acceptance tests.
+    pub fn forward_recovery_parked_with_context(
+        &mut self,
+        recovery_id: impl Into<String>,
+        reason: impl Into<String>,
+        thread_id: Option<String>,
+        turn_id: Option<String>,
+        source_account_id: Option<String>,
+    ) -> Result<bool, AdapterError> {
         let recovery_id = recovery_id.into();
         let reason = reason.into();
         if recovery_id.trim().is_empty() || reason.trim().is_empty() {
@@ -761,6 +986,18 @@ impl<B: CodextBackend> RuntimeAdapter<B> {
         {
             return Ok(false);
         }
+        self.recoveries
+            .entry(recovery_id.clone())
+            .or_insert_with(|| RecoveryState {
+                recovery_id: recovery_id.clone(),
+                thread_id: thread_id.clone(),
+                turn_id: turn_id.clone(),
+                source_account_id: source_account_id.clone(),
+                transition_id: None,
+                target_account_id: None,
+                expected_generation: None,
+                phase: RecoveryPhase::Parked,
+            });
         self.emit_event(
             EventBase::new(
                 EVENT_RECOVERY_PARKED,
@@ -769,7 +1006,13 @@ impl<B: CodextBackend> RuntimeAdapter<B> {
                 self.identity.auth_generation,
                 None,
             ),
-            &RecoveryParkedPayload { recovery_id, reason },
+            &RecoveryParkedPayload {
+                recovery_id,
+                reason,
+                thread_id,
+                turn_id,
+                source_account_id,
+            },
         )?;
         Ok(true)
     }
@@ -777,6 +1020,16 @@ impl<B: CodextBackend> RuntimeAdapter<B> {
     pub fn forward_recovery_started(
         &mut self,
         recovery_id: impl Into<String>,
+    ) -> Result<bool, AdapterError> {
+        self.forward_recovery_started_with_context(recovery_id, None, None)
+    }
+
+    /// Forward a native recovery-started observation with optional context.
+    pub fn forward_recovery_started_with_context(
+        &mut self,
+        recovery_id: impl Into<String>,
+        thread_id: Option<String>,
+        turn_id: Option<String>,
     ) -> Result<bool, AdapterError> {
         let recovery_id = recovery_id.into();
         if recovery_id.trim().is_empty() {
@@ -788,15 +1041,36 @@ impl<B: CodextBackend> RuntimeAdapter<B> {
         {
             return Ok(false);
         }
+        let state = self
+            .recoveries
+            .entry(recovery_id.clone())
+            .or_insert_with(|| RecoveryState::parked(recovery_id.clone()));
+        if state.thread_id.is_none() {
+            state.thread_id = thread_id.clone();
+        }
+        if state.turn_id.is_none() {
+            state.turn_id = turn_id.clone();
+        }
+        state.phase = RecoveryPhase::Started;
+        let event_thread_id = thread_id.or_else(|| state.thread_id.clone());
+        let event_turn_id = turn_id.or_else(|| state.turn_id.clone());
+        let event_auth_generation = state
+            .expected_generation
+            .unwrap_or(self.identity.auth_generation);
+        let event_transition_id = state.transition_id.clone();
         self.emit_event(
             EventBase::new(
                 EVENT_RECOVERY_STARTED,
                 (self.now)(),
                 self.identity.runtime_id.clone(),
-                self.identity.auth_generation,
-                None,
+                event_auth_generation,
+                event_transition_id,
             ),
-            &RecoveryStartedPayload { recovery_id },
+            &RecoveryStartedPayload {
+                recovery_id,
+                thread_id: event_thread_id,
+                turn_id: event_turn_id,
+            },
         )?;
         Ok(true)
     }
@@ -806,6 +1080,18 @@ impl<B: CodextBackend> RuntimeAdapter<B> {
         recovery_id: impl Into<String>,
         outcome: impl Into<String>,
         error_code: Option<String>,
+    ) -> Result<bool, AdapterError> {
+        self.forward_recovery_completed_with_context(recovery_id, outcome, error_code, None, None)
+    }
+
+    /// Forward a native recovery-completed observation with optional context.
+    pub fn forward_recovery_completed_with_context(
+        &mut self,
+        recovery_id: impl Into<String>,
+        outcome: impl Into<String>,
+        error_code: Option<String>,
+        thread_id: Option<String>,
+        turn_id: Option<String>,
     ) -> Result<bool, AdapterError> {
         let recovery_id = recovery_id.into();
         let outcome = outcome.into();
@@ -820,21 +1106,146 @@ impl<B: CodextBackend> RuntimeAdapter<B> {
         {
             return Ok(false);
         }
+        let state = self
+            .recoveries
+            .entry(recovery_id.clone())
+            .or_insert_with(|| RecoveryState::parked(recovery_id.clone()));
+        if state.thread_id.is_none() {
+            state.thread_id = thread_id.clone();
+        }
+        if state.turn_id.is_none() {
+            state.turn_id = turn_id.clone();
+        }
+        state.phase = RecoveryPhase::Completed;
+        let event_thread_id = thread_id.or_else(|| state.thread_id.clone());
+        let event_turn_id = turn_id.or_else(|| state.turn_id.clone());
+        let event_auth_generation = state
+            .expected_generation
+            .unwrap_or(self.identity.auth_generation);
+        let event_transition_id = state.transition_id.clone();
         self.emit_event(
             EventBase::new(
                 EVENT_RECOVERY_COMPLETED,
                 (self.now)(),
                 self.identity.runtime_id.clone(),
-                self.identity.auth_generation,
-                None,
+                event_auth_generation,
+                event_transition_id,
             ),
             &RecoveryCompletedPayload {
                 recovery_id,
                 outcome,
                 error_code,
+                thread_id: event_thread_id,
+                turn_id: event_turn_id,
             },
         )?;
         Ok(true)
+    }
+
+    /// Authorize the native runtime to release a parked recovery. This method
+    /// never creates a prompt or submits a user turn. It validates the
+    /// transition generation and preserves the first successful result so a
+    /// repeated request after a lost acknowledgement cannot dispatch twice.
+    pub fn release_recovery(
+        &mut self,
+        params: RecoveryReleaseParams,
+    ) -> Result<RecoveryReleaseResult, AdapterError> {
+        params
+            .validate()
+            .map_err(AdapterError::InvalidParams)?;
+        if let Some(previous) = self.release_results.get(&params.recovery_id) {
+            return Ok(previous.clone());
+        }
+        if params.expected_generation != self.identity.auth_generation {
+            return Ok(self.recovery_release_rejected(
+                &params,
+                "stale_generation",
+                "runtime identity generation does not match the verified transition".to_string(),
+            ));
+        }
+        let Some(existing) = self.recoveries.get(&params.recovery_id).cloned() else {
+            return Ok(self.recovery_release_rejected(
+                &params,
+                "recovery_not_found",
+                "no native parked recovery exists for this ID".to_string(),
+            ));
+        };
+        if let Some(thread_id) = params.thread_id.as_deref()
+            && existing
+                .thread_id
+                .as_deref()
+                .is_some_and(|value| value != thread_id)
+        {
+            return Ok(self.recovery_release_rejected(
+                &params,
+                "thread_id_mismatch",
+                "recovery belongs to a different Codex thread".to_string(),
+            ));
+        }
+        if let Some(transition_id) = existing.transition_id.as_deref()
+            && transition_id != params.transition_id
+        {
+            return Ok(self.recovery_release_rejected(
+                &params,
+                "transition_id_mismatch",
+                "recovery is bound to a different transition".to_string(),
+            ));
+        }
+        match existing.phase {
+            RecoveryPhase::Started | RecoveryPhase::Completed | RecoveryPhase::Released => {
+                let result = RecoveryReleaseResult {
+                    recovery_id: params.recovery_id.clone(),
+                    thread_id: existing.thread_id.clone(),
+                    outcome: RecoveryReleaseOutcome::AlreadyReleased,
+                    error_code: None,
+                    error_message: None,
+                };
+                self.release_results
+                    .insert(params.recovery_id.clone(), result.clone());
+                return Ok(result);
+            }
+            RecoveryPhase::Parked => {}
+        }
+        let mut result = self.backend.release_recovery(params.clone())?;
+        if result.recovery_id.is_empty() {
+            result.recovery_id = params.recovery_id.clone();
+        }
+        if result.recovery_id != params.recovery_id {
+            return Err(AdapterError::Protocol(
+                "backend recovery release returned a different recovery_id".to_string(),
+            ));
+        }
+        if result.thread_id.is_none() {
+            result.thread_id = existing.thread_id.clone();
+        }
+        if matches!(
+            result.outcome,
+            RecoveryReleaseOutcome::Released | RecoveryReleaseOutcome::AlreadyReleased
+        ) {
+            if let Some(state) = self.recoveries.get_mut(&params.recovery_id) {
+                state.phase = RecoveryPhase::Released;
+                state.transition_id = Some(params.transition_id.clone());
+                state.expected_generation = Some(params.expected_generation);
+            }
+            self.release_results
+                .insert(params.recovery_id.clone(), result.clone());
+        }
+        Ok(result)
+    }
+
+    fn recovery_release_rejected(
+        &self,
+        params: &RecoveryReleaseParams,
+        code: &str,
+        message: String,
+    ) -> RecoveryReleaseResult {
+        RecoveryReleaseResult {
+            recovery_id: params.recovery_id.clone(),
+            thread_id: params.thread_id.clone(),
+            outcome: RecoveryReleaseOutcome::Rejected,
+            error_code: Some(code.to_string()),
+            error_message: Some(message),
+        }
     }
 
     fn emit_event<T: serde::Serialize>(

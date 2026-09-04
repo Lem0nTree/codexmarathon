@@ -140,6 +140,14 @@ type CredentialDeployer interface {
 	Deploy(accountID string) (credentials.DeploymentResult, error)
 }
 
+// RuntimeAuthSnapshotReader exposes the native runtime's current opaque auth
+// snapshot. It is optional for compatibility with small runtimes and fakes,
+// but production transitions should implement it so refreshed Account A
+// credentials are synchronized before Account B is deployed.
+type RuntimeAuthSnapshotReader interface {
+	ReadAuthSnapshot(context.Context) (runtime.NativeAuthSnapshotResult, error)
+}
+
 // Clock is injectable for deterministic transition and journal tests.
 type Clock func() time.Time
 
@@ -148,6 +156,10 @@ type Clock func() time.Time
 type Config struct {
 	Runtime  Runtime
 	Deployer CredentialDeployer
+	// SnapshotWriter receives the active account's opaque native snapshot
+	// before target deployment. It must be the same protected vault used by
+	// Deployer; no token material enters transition state or the journal.
+	SnapshotWriter credentials.SnapshotWriter
 
 	// Disk is the preferred spelling. DiskIdentity is accepted as a
 	// compatibility alias when wiring older callers.
@@ -166,6 +178,7 @@ type Config struct {
 type Coordinator struct {
 	runtime  Runtime
 	deployer CredentialDeployer
+	snapshotWriter credentials.SnapshotWriter
 	disk     DiskIdentityReader
 	journal  journal.Journal
 	now      Clock
@@ -253,6 +266,7 @@ func NewCoordinator(value any, args ...any) *Coordinator {
 	c := &Coordinator{
 		runtime:              config.Runtime,
 		deployer:             config.Deployer,
+		snapshotWriter:       config.SnapshotWriter,
 		disk:                 disk,
 		journal:              config.Journal,
 		now:                  now,

@@ -108,6 +108,32 @@ func TestSchedulerRevalidationRequestNeverMarksAccountReady(t *testing.T) {
 	}
 }
 
+func TestSchedulerSchedulesBoundedDataWakeWithoutInventingReset(t *testing.T) {
+	now := time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC)
+	scheduler := NewSchedulerWithConfig(SchedulerConfig{DataBackoff: 10 * time.Second, MaxDataBackoff: 20 * time.Second, WaitSlice: time.Second}, func() time.Time { return now })
+	decision := scheduler.Evaluate([]telemetry.AccountTelemetry{{AccountID: "account-a", IsUsable: false}}, now)
+	if decision.State != ResetWaitForData || !decision.RefetchRequired {
+		t.Fatalf("unexpected data wait: %#v", decision)
+	}
+	if !decision.ResetAt.IsZero() {
+		t.Fatalf("data wait synthesized reset: %v", decision.ResetAt)
+	}
+	wake, ok := scheduler.NextDataRecheck()
+	if !ok || !wake.Equal(now.Add(10*time.Second)) {
+		t.Fatalf("data wake = %v, %v", wake, ok)
+	}
+}
+
+func TestSchedulerIncludesEarliestResetAccountInRevalidation(t *testing.T) {
+	now := time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC)
+	resetAt := now.Add(time.Hour)
+	scheduler := NewScheduler(func() time.Time { return now })
+	decision := scheduler.Evaluate([]telemetry.AccountTelemetry{exhaustedAccount("account-a", "codex", resetAt, now)}, now)
+	if len(decision.RefreshAccountIDs) != 1 || decision.RefreshAccountIDs[0] != "account-a" {
+		t.Fatalf("reset candidate missing mandatory refresh: %#v", decision)
+	}
+}
+
 func exhaustedAccount(accountID, limitID string, resetAt, observedAt time.Time) telemetry.AccountTelemetry {
 	window := telemetry.WindowTelemetry{
 		Kind:       telemetry.PrimaryWindow,

@@ -39,6 +39,17 @@ const (
 	TransitionReconciled  EventType = "TransitionReconciled"
 	RuntimeConnected      EventType = "RuntimeConnected"
 	RuntimeDisconnected   EventType = "RuntimeDisconnected"
+	// Recovery records describe the controller's durable authorization of a
+	// runtime-owned UsageLimitExceeded continuation.  They contain only
+	// correlation metadata; the prompt and credentials remain in Codext.
+	RecoveryParked           EventType = "RecoveryParked"
+	RecoveryWaiting          EventType = "RecoveryWaiting"
+	RecoveryBound            EventType = "RecoveryBound"
+	RecoveryReleaseRequested EventType = "RecoveryReleaseRequested"
+	RecoveryReleased         EventType = "RecoveryReleased"
+	RecoveryStarted          EventType = "RecoveryStarted"
+	RecoveryCompleted        EventType = "RecoveryCompleted"
+	RecoveryUncertain        EventType = "RecoveryUncertain"
 
 	// Event-prefixed aliases make call sites self-documenting when journal and
 	// runtime event constants are imported together.
@@ -52,6 +63,14 @@ const (
 	EventTransitionReconciled = TransitionReconciled
 	EventRuntimeConnected     = RuntimeConnected
 	EventRuntimeDisconnected  = RuntimeDisconnected
+	EventRecoveryParked       = RecoveryParked
+	EventRecoveryWaiting      = RecoveryWaiting
+	EventRecoveryBound        = RecoveryBound
+	EventRecoveryReleaseRequested = RecoveryReleaseRequested
+	EventRecoveryReleased     = RecoveryReleased
+	EventRecoveryStarted      = RecoveryStarted
+	EventRecoveryCompleted    = RecoveryCompleted
+	EventRecoveryUncertain    = RecoveryUncertain
 )
 
 // Event is the complete journal wire record. The fields are deliberately
@@ -61,10 +80,14 @@ type Event struct {
 	At              time.Time `json:"at"`
 	Type            EventType `json:"type"`
 	TransitionID    string    `json:"transition_id,omitempty"`
+	RecoveryID      string    `json:"recovery_id,omitempty"`
+	ThreadID        string    `json:"thread_id,omitempty"`
+	TurnID          string    `json:"turn_id,omitempty"`
 	// Generation zero is a valid initial runtime generation. Keep the field on
 	// the JSON record even when it is zero so every transition record carries
 	// the correlation field required by the protocol contract.
 	AuthGeneration  uint64    `json:"auth_generation"`
+	ExpectedGeneration uint64 `json:"expected_generation,omitempty"`
 	RuntimeID       string    `json:"runtime_id,omitempty"`
 	AccountID       string    `json:"account_id,omitempty"`
 	FromAccountID   string    `json:"from_account_id,omitempty"`
@@ -255,8 +278,19 @@ func ValidateEvent(event Event) error {
 			return fmt.Errorf("%w: runtime_id is required for %s", ErrInvalidEvent, event.Type)
 		}
 	}
+	if isRecoveryEvent(event.Type) {
+		if event.RecoveryID == "" {
+			return fmt.Errorf("%w: recovery_id is required for %s", ErrInvalidEvent, event.Type)
+		}
+		if event.RuntimeID == "" {
+			return fmt.Errorf("%w: runtime_id is required for %s", ErrInvalidEvent, event.Type)
+		}
+	}
 	for name, value := range map[string]string{
 		"transition_id":    event.TransitionID,
+		"recovery_id":      event.RecoveryID,
+		"thread_id":        event.ThreadID,
+		"turn_id":          event.TurnID,
 		"runtime_id":        event.RuntimeID,
 		"account_id":        event.AccountID,
 		"from_account_id":   event.FromAccountID,
@@ -276,6 +310,17 @@ func isTransitionEvent(eventType EventType) bool {
 	case TransitionCreated, TransitionPrepared, AuthDeployed, CommitSent,
 		IdentityConfirmed, TransitionCommitted, TransitionUncertain,
 		TransitionReconciled:
+		return true
+	default:
+		return false
+	}
+}
+
+func isRecoveryEvent(eventType EventType) bool {
+	switch eventType {
+	case RecoveryParked, RecoveryWaiting, RecoveryBound,
+		RecoveryReleaseRequested, RecoveryReleased, RecoveryStarted,
+		RecoveryCompleted, RecoveryUncertain:
 		return true
 	default:
 		return false

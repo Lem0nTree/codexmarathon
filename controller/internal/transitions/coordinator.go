@@ -101,6 +101,7 @@ func (c *Coordinator) RequestTransition(ctx context.Context, targetAccountID str
 		Type:            journal.TransitionCreated,
 		TransitionID:    transitionID,
 		AuthGeneration:  initial.Identity.AuthGeneration,
+		ExpectedGeneration: params.ExpectedGeneration,
 		RuntimeID:       initial.Identity.RuntimeID,
 		FromAccountID:   record.state.CurrentAccountID,
 		TargetAccountID: targetAccountID,
@@ -380,7 +381,17 @@ func (c *Coordinator) deployAndCommit(ctx context.Context, transitionID string) 
 		return nil, ErrTransitionNotFound
 	}
 	params := record.params
+	currentAccountID := record.state.CurrentAccountID
 	c.mu.Unlock()
+
+	// AuthManager may have refreshed Account A while the turn was running.
+	// Synchronize that native snapshot into the same protected vault used by
+	// the deployer before reading/deploying B. The opaque bytes never enter
+	// transition state or the journal, and a mismatched native identity leaves
+	// the transition uncertain for three-way reconciliation.
+	if err := c.syncActiveSnapshot(ctx, currentAccountID); err != nil {
+		return c.markUncertain(transitionID, fmt.Errorf("synchronize active auth snapshot: %w", err))
+	}
 
 	deployed, err := c.deployer.Deploy(params.TargetAccountID)
 	if err != nil {
@@ -459,6 +470,33 @@ func (c *Coordinator) deployAndCommit(ctx context.Context, transitionID string) 
 		return c.markUncertain(transitionID, err)
 	}
 	return result, nil
+}
+
+func (c *Coordinator) syncActiveSnapshot(ctx context.Context, currentAccountID string) error {
+	if currentAccountID == "" {
+		return nil
+	}
+	reader, ok := c.runtime.(RuntimeAuthSnapshotReader)
+	if !ok {
+		// Keep the coordinator compatible with legacy/test runtimes. The
+		// embedded Codex runtime implements this seam, so production switching
+		// always gets the synchronization barrier.
+		return nil
+	}
+	if c.snapshotWriter == nil {
+		return errors.New("active auth snapshot writer is unavailable")
+	}
+	snapshot, err := reader.ReadAuthSnapshot(ctx)
+	if err != nil {
+		return err
+	}
+	if snapshot.AccountID != currentAccountID {
+		return fmt.Errorf("%w: native snapshot account %q, expected %q", ErrIdentityMismatch, snapshot.AccountID, currentAccountID)
+	}
+	if err := c.snapshotWriter.Save(currentAccountID, snapshot.AuthJSON); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (c *Coordinator) verifyCommitted(ctx context.Context, transitionID string, ack runtime.TransitionResult, oldGeneration uint64) (*TransitionResult, error) {

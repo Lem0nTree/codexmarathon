@@ -1,11 +1,10 @@
 // Package app contains the small CodexMarathon controller composition root.
 //
 // It wires the durable controller domains (accounts, credentials, journal,
-// telemetry, policy, and reset scheduling) to a single runtime client.  The
-// package deliberately does not supervise or launch Codext: a runtime is an
-// already-running peer connected through an io.ReadWriteCloser.  A future
-// process supervisor can own that transport without changing the controller
-// domains.
+// telemetry, policy, and reset scheduling) to a single runtime client. The
+// RuntimeSupervisor in lifecycle.go owns the one-command bundled runtime
+// process/IPC boundary; the domain package remains usable with an injected
+// io.ReadWriteCloser for focused tests.
 package app
 
 import (
@@ -23,9 +22,11 @@ import (
 	"time"
 
 	"codexmarathon/controller/internal/accounts"
+	"codexmarathon/controller/internal/automation"
 	"codexmarathon/controller/internal/credentials"
 	"codexmarathon/controller/internal/journal"
 	"codexmarathon/controller/internal/policy"
+	"codexmarathon/controller/internal/recovery"
 	"codexmarathon/controller/internal/reset"
 	"codexmarathon/controller/internal/runtime"
 	"codexmarathon/controller/internal/telemetry"
@@ -135,12 +136,14 @@ type Controller struct {
 
 	registry *accounts.FileRegistry
 	vault    *credentials.FileVault
+	accountManager *accounts.Manager
 	journal  *journal.FileJournal
 	store    *telemetry.StateStore
 	cache    *telemetry.SnapshotCache
 	router   *telemetry.MultiAccountUsageRouter
 	scheduler *reset.Scheduler
 	policy   *policy.Engine
+	recovery *recovery.Manager
 
 	mu            sync.RWMutex
 	runtime      *runtime.Client
@@ -152,6 +155,9 @@ type Controller struct {
 	eventCancel context.CancelFunc
 	eventDone   chan struct{}
 	eventErrors chan error
+	automationCancel context.CancelFunc
+	automationDone chan struct{}
+	automationEvents chan automation.Event
 	closeOnce   sync.Once
 }
 
@@ -164,7 +170,16 @@ func New(config Config) (*Controller, error) {
 	}
 	registry := accounts.NewFileRegistry(config.RegistryPath)
 	vault := credentials.NewFileVault(config.VaultDir)
+	accountManager := accounts.NewManager(accounts.ManagerConfig{
+		Registry: registry,
+		Vault:    vault,
+		AuthPath: config.AuthPath,
+	})
 	fileJournal := journal.NewFileJournal(config.JournalPath)
+	recoveryManager, err := recovery.New(recovery.Config{Journal: fileJournal})
+	if err != nil {
+		return nil, fmt.Errorf("replay recovery journal: %w", err)
+	}
 	store := telemetry.NewStateStore()
 	cache := telemetry.NewSnapshotCache(config.TelemetryTTL)
 	router := telemetry.NewMultiAccountUsageRouter(cache, store)
@@ -173,12 +188,14 @@ func New(config Config) (*Controller, error) {
 		config:      config,
 		registry:    registry,
 		vault:       vault,
+		accountManager: accountManager,
 		journal:     fileJournal,
 		store:       store,
 		cache:       cache,
 		router:      router,
 		scheduler:   scheduler,
 		policy:      policy.NewEngine(scheduler),
+		recovery:    recoveryManager,
 		eventErrors: make(chan error, 32),
 	}, nil
 }
@@ -225,12 +242,45 @@ func (c *Controller) Vault() *credentials.FileVault {
 	return c.vault
 }
 
+// AccountManager returns the integrated multi-account profile lifecycle seam.
+// Native login and refresh are supplied by the embedded runtime through
+// SetAuthService; no external Codex executable is launched by this package.
+func (c *Controller) AccountManager() *accounts.Manager {
+	if c == nil {
+		return nil
+	}
+	return c.accountManager
+}
+
+// Accounts is a concise alias for AccountManager.
+func (c *Controller) Accounts() *accounts.Manager { return c.AccountManager() }
+
+// SetAuthService attaches the embedded runtime's native login/refresh
+// implementation to the account manager. Passing nil restores the explicit
+// unavailable state and never installs a shell-out fallback.
+func (c *Controller) SetAuthService(service accounts.AuthService) {
+	if c == nil || c.accountManager == nil {
+		return
+	}
+	c.accountManager.SetAuthService(service)
+}
+
 // Journal returns the append-only metadata journal.
 func (c *Controller) Journal() *journal.FileJournal {
 	if c == nil {
 		return nil
 	}
 	return c.journal
+}
+
+// Recovery returns the durable coordinator for Codext-owned parked
+// UsageLimitExceeded continuations. It never exposes prompt or credential
+// bytes.
+func (c *Controller) Recovery() *recovery.Manager {
+	if c == nil {
+		return nil
+	}
+	return c.recovery
 }
 
 // Store returns the normalized in-memory telemetry state store.
@@ -299,6 +349,34 @@ func (c *Controller) RuntimeClient() *runtime.Client {
 // RuntimeConnected reports whether a live runtime client is attached.
 func (c *Controller) RuntimeConnected() bool { return c.RuntimeClient() != nil }
 
+// RuntimeProtocolVersion returns the negotiated Marathon protocol version, or
+// zero when no runtime is attached.  The value is diagnostic metadata only;
+// all requests still go through the negotiated client.
+func (c *Controller) RuntimeProtocolVersion() int {
+	if c == nil {
+		return 0
+	}
+	c.mu.RLock()
+	version := c.protocolVersion
+	c.mu.RUnlock()
+	return version
+}
+
+// DisconnectRuntime detaches the current runtime without closing the
+// controller's durable domains.  It is used by the lifecycle supervisor when
+// a managed runtime exits or its IPC transport breaks; a later reconnect can
+// install a fresh protocol client and perform reconciliation.
+func (c *Controller) DisconnectRuntime(reason string) error {
+	if c == nil {
+		return nil
+	}
+	if strings.TrimSpace(reason) == "" {
+		reason = "runtime connection closed"
+	}
+	c.StopEventLoop()
+	return c.detachRuntimeWithReason(reason)
+}
+
 // EventErrors exposes non-fatal protocol/telemetry errors from the event
 // loop. A consumer may ignore this channel when it only needs request APIs.
 func (c *Controller) EventErrors() <-chan error {
@@ -332,16 +410,18 @@ func (c *Controller) ConnectRuntime(ctx context.Context, conn io.ReadWriteCloser
 	c.runtimeFacade = &clientRuntime{client: client}
 	deployer := credentials.NewAtomicDeployer(c.vault, c.config.AuthPath)
 	c.coordinator = transitions.NewCoordinator(transitions.Config{
-		Runtime:  c.runtimeFacade,
-		Deployer: deployer,
-		Disk:     transitions.NewFileIdentityReader(c.config.AuthPath),
-		Journal:  c.journal,
+		Runtime:        c.runtimeFacade,
+		Deployer:       deployer,
+		SnapshotWriter: c.vault,
+		Disk:           transitions.NewFileIdentityReader(c.config.AuthPath),
+		Journal:        c.journal,
 	})
 	c.mu.Unlock()
 
 	connected := false
 	defer func() {
 		if !connected {
+			c.StopEventLoop()
 			_ = c.detachRuntime()
 		}
 	}()
@@ -359,7 +439,24 @@ func (c *Controller) ConnectRuntime(ctx context.Context, conn io.ReadWriteCloser
 	c.mu.Lock()
 	c.runtimeID = state.Identity.RuntimeID
 	c.protocolVersion = negotiated.ProtocolVersion
+	coordinator := c.coordinator
 	c.mu.Unlock()
+	// Restore controller-owned transition intent before publishing the new
+	// runtime connection.  Without this replay, a controller restart loses the
+	// transition ID/generation needed to reconcile a command that may already
+	// have been accepted by the runtime.
+	if coordinator != nil && c.journal != nil {
+		events, readErr := c.journal.ReadAll()
+		if readErr != nil {
+			return fmt.Errorf("read transition journal before reconnect: %w", readErr)
+		}
+		if restoreErr := coordinator.Restore(events); restoreErr != nil {
+			return fmt.Errorf("restore transition intent before reconnect: %w", restoreErr)
+		}
+	}
+	if c.recovery != nil {
+		c.recovery.SetRuntime(client)
+	}
 	if err := c.journal.Append(journal.Event{
 		Type:       journal.RuntimeConnected,
 		RuntimeID:  state.Identity.RuntimeID,
@@ -370,6 +467,21 @@ func (c *Controller) ConnectRuntime(ctx context.Context, conn io.ReadWriteCloser
 	}
 	if err := c.StartEventLoop(context.Background()); err != nil {
 		return err
+	}
+	// Replay runtime-owned recovery state after the transport is live. A
+	// transient reconciliation failure is observable but must not discard a
+	// parked continuation or prevent the controller from reconnecting.
+	if c.recovery != nil {
+		if err := c.recovery.Reconcile(ctx); err != nil && !errors.Is(err, recovery.ErrRuntimeUnavailable) {
+			c.reportEventError(fmt.Errorf("reconcile parked recoveries: %w", err))
+		}
+	}
+	// Attach the direct native auth service only after negotiation/state
+	// validation succeeds. Account login/refresh commands can then use the
+	// same embedded runtime connection without shelling out to Codex.
+	c.SetAuthService(NewRuntimeAuthService(client))
+	if err := c.StartAutomationLoop(context.Background()); err != nil {
+		return fmt.Errorf("start quota automation loop: %w", err)
 	}
 	connected = true
 	return nil
@@ -485,16 +597,153 @@ func (c *Controller) StopEventLoop() {
 	}
 }
 
+// StartAutomationLoop starts the controller-owned quota policy loop for the
+// currently attached runtime. Runtime telemetry notifications are translated
+// into secret-free automation events by HandleRuntimeEvent. Only one loop is
+// allowed per controller connection; a reconnect creates a fresh loop while
+// the policy engine and durable account state remain shared.
+func (c *Controller) StartAutomationLoop(ctx context.Context) error {
+	if c == nil {
+		return errors.New("nil controller")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	loop, err := c.NewAutomationLoop()
+	if err != nil {
+		return err
+	}
+	loopCtx, cancel := context.WithCancel(ctx)
+	events := make(chan automation.Event, 256)
+	done := make(chan struct{})
+	c.mu.Lock()
+	if c.runtime == nil {
+		c.mu.Unlock()
+		cancel()
+		return ErrRuntimeNotConnected
+	}
+	if c.automationDone != nil {
+		c.mu.Unlock()
+		cancel()
+		return errors.New("quota automation loop is already running")
+	}
+	c.automationCancel = cancel
+	c.automationDone = done
+	c.automationEvents = events
+	c.mu.Unlock()
+	go func() {
+		defer close(done)
+		if runErr := loop.Run(loopCtx, events); runErr != nil && !errors.Is(runErr, context.Canceled) {
+			c.reportEventError(fmt.Errorf("quota automation loop: %w", runErr))
+		}
+	}()
+	return nil
+}
+
+// StopAutomationLoop stops policy evaluation without detaching the runtime.
+// It is idempotent and keeps durable account/transition state intact.
+func (c *Controller) StopAutomationLoop() {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	cancel, done := c.automationCancel, c.automationDone
+	c.automationCancel = nil
+	c.automationDone = nil
+	c.automationEvents = nil
+	c.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	if done != nil {
+		<-done
+	}
+}
+
+func (c *Controller) emitAutomationEvent(event runtime.Event) {
+	if c == nil {
+		return
+	}
+	automationEvent, ok := automationEventFromRuntime(event)
+	if !ok {
+		return
+	}
+	c.mu.RLock()
+	events := c.automationEvents
+	c.mu.RUnlock()
+	if events == nil {
+		return
+	}
+	select {
+	case events <- automationEvent:
+	default:
+		// A full wake-up queue must not block the runtime protocol reader. The
+		// loop also has a bounded polling/timer wake-up, so dropping a duplicate
+		// telemetry edge is safe; hard events carry stable IDs and remain
+		// visible through the diagnostic channel.
+		c.reportEventError(errors.New("quota automation event queue is full"))
+	}
+}
+
+func automationEventFromRuntime(event runtime.Event) (automation.Event, bool) {
+	base := automation.Event{OccurredAt: eventTime(event.OccurredAt)}
+	switch event.EventType {
+	case runtime.EventRateLimitsSnapshot, runtime.EventRateLimitsUpdated:
+		base.Type = automation.EventTelemetryChanged
+		// Telemetry edges are intentionally not assigned an EventID. A runtime
+		// can emit two valid snapshots in the same second, and policy should
+		// re-evaluate both rather than suppressing the second one.
+		return base, true
+	case runtime.EventRecoveryParked:
+		decoded, err := event.DecodePayload()
+		if err != nil {
+			return automation.Event{}, false
+		}
+		parked, ok := decoded.(*runtime.RecoveryParkedEvent)
+		if !ok || parked.RecoveryID == "" {
+			return automation.Event{}, false
+		}
+		base.Type = automation.EventUsageLimitExceeded
+		base.ID = "recovery/" + parked.RecoveryID
+		base.AccountID = parked.SourceAccountID
+		return base, true
+	case runtime.EventTurnCompleted:
+		decoded, err := event.DecodePayload()
+		if err != nil {
+			return automation.Event{}, false
+		}
+		completed, ok := decoded.(*runtime.TurnCompletedEvent)
+		if !ok || !isUsageLimitEvent(completed.Outcome, completed.ErrorCode) {
+			return automation.Event{}, false
+		}
+		base.Type = automation.EventUsageLimitExceeded
+		base.ID = "turn/" + completed.TurnID
+		return base, true
+	default:
+		return automation.Event{}, false
+	}
+}
+
+func isUsageLimitEvent(outcome string, errorCode *string) bool {
+	value := strings.ToLower(outcome)
+	if errorCode != nil {
+		value += " " + strings.ToLower(*errorCode)
+	}
+	return strings.Contains(value, "usage_limit") || strings.Contains(value, "usage limit") || strings.Contains(value, "usagelimit")
+}
+
 func (c *Controller) runEventLoop(ctx context.Context, client *runtime.Client, done chan struct{}) {
 	defer close(done)
 	errorEvents := client.Errors()
+	disconnected := false
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case event, ok := <-client.Events():
 			if !ok {
-				return
+				disconnected = true
+				goto finished
 			}
 			if err := c.HandleRuntimeEvent(event); err != nil {
 				c.reportEventError(err)
@@ -506,6 +755,25 @@ func (c *Controller) runEventLoop(ctx context.Context, client *runtime.Client, d
 				errorEvents = nil
 				continue
 			}
+			c.reportEventError(err)
+		}
+	}
+
+finished:
+	// A transport-owned disconnect reaches this goroutine without going
+	// through StopEventLoop.  Clear the loop handles before detaching so a
+	// supervisor reconnect can install a fresh event loop; StopEventLoop clears
+	// the same fields first when cancellation is operator-initiated.
+	c.mu.Lock()
+	if c.eventDone == done {
+		c.eventDone = nil
+		c.eventCancel = nil
+	}
+	c.mu.Unlock()
+	// StopEventLoop cancels the loop while leaving a healthy client attached.
+	// Only a client whose own Done channel is closed represents an IPC loss.
+	if disconnected && client.Closed() {
+		if err := c.detachRuntimeWithReason("runtime transport disconnected"); err != nil {
 			c.reportEventError(err)
 		}
 	}
@@ -546,6 +814,16 @@ func (c *Controller) HandleRuntimeEvent(event runtime.Event) error {
 			return err
 		}
 	}
+	if c.recovery != nil {
+		switch event.EventType {
+		case runtime.EventRecoveryParked, runtime.EventRecoveryStarted, runtime.EventRecoveryCompleted:
+			if err := c.recovery.HandleEvent(event); err != nil {
+				return err
+			}
+			c.emitAutomationEvent(event)
+			return nil
+		}
+	}
 
 	switch event.EventType {
 	case runtime.EventRateLimitsSnapshot:
@@ -567,7 +845,11 @@ func (c *Controller) HandleRuntimeEvent(event runtime.Event) error {
 		snapshot := telemetry.NormalizeSnapshot(accountID, payload.RateLimits, payload.RateLimitsByID, observedAt)
 		c.router.IngestFull(accountID, snapshot)
 		_ = c.router.Register(accountID, snapshotProvider{store: c.store})
-		return c.markTelemetry(accountID, observedAt)
+		if err := c.markTelemetry(accountID, observedAt); err != nil {
+			return err
+		}
+		c.emitAutomationEvent(event)
+		return nil
 
 	case runtime.EventRateLimitsUpdated:
 		decoded, err := event.DecodePayload()
@@ -588,8 +870,13 @@ func (c *Controller) HandleRuntimeEvent(event runtime.Event) error {
 		if result.RefetchRequired {
 			return fmt.Errorf("%w for account %q: %s", ErrTelemetryRefetchRequired, accountID, result.Reason)
 		}
-		return c.markTelemetry(accountID, eventTime(event.OccurredAt))
+		if err := c.markTelemetry(accountID, eventTime(event.OccurredAt)); err != nil {
+			return err
+		}
+		c.emitAutomationEvent(event)
+		return nil
 	default:
+		c.emitAutomationEvent(event)
 		return nil
 	}
 }
@@ -625,8 +912,9 @@ func optionalAccountID(value *string) string {
 }
 
 // AccountsTelemetry returns one normalized observation per registered
-// account. Missing observations are explicitly unusable; they are not
-// represented as zero usage.
+// account. It is a read of state already ingested from runtime/provider
+// events; missing observations are explicitly unusable and never represented
+// as zero usage. Use ObserveTelemetry for a bounded provider refresh pass.
 func (c *Controller) AccountsTelemetry() ([]telemetry.AccountTelemetry, error) {
 	if c == nil {
 		return nil, errors.New("nil controller")
@@ -648,6 +936,43 @@ func (c *Controller) AccountsTelemetry() ([]telemetry.AccountTelemetry, error) {
 		})
 	}
 	return observations, nil
+}
+
+// ObserveTelemetry performs one deterministic active/inactive account
+// observation pass. Active runtime events and inactive credential-backed
+// providers share the router; a provider failure remains an unusable account
+// observation so policy can evaluate the rest of the pool.
+func (c *Controller) ObserveTelemetry(ctx context.Context, force bool) ([]telemetry.AccountObservation, error) {
+	if c == nil {
+		return nil, errors.New("nil controller")
+	}
+	registered, err := c.registry.List()
+	if err != nil {
+		return nil, err
+	}
+	ids := make([]string, 0, len(registered))
+	for _, account := range registered {
+		ids = append(ids, account.ID)
+	}
+	return c.router.Observe(ctx, ids, telemetry.ObserveOptions{Force: force, MaxAge: c.config.TelemetryTTL, Now: time.Now().UTC()})
+}
+
+// EvaluatePolicyTrigger evaluates a threshold, hard-limit, or reset event
+// against caller-supplied observations. It is the bridge for the event loop;
+// no transition is started here, so the transition coordinator remains the
+// sole authentication authority.
+func (c *Controller) EvaluatePolicyTrigger(observations []telemetry.AccountTelemetry, activeAccountID string, trigger policy.Trigger, eventID string, now time.Time) policy.PolicyDecision {
+	if c == nil || c.policy == nil {
+		return policy.PolicyDecision{Type: policy.PolicyNoTelemetry, Trigger: trigger, Reason: "policy engine is unavailable"}
+	}
+	return c.policy.EvaluateInput(policy.EvaluationInput{
+		Accounts:        observations,
+		ActiveAccountID: activeAccountID,
+		Trigger:         trigger,
+		EventID:         eventID,
+		FreshnessTTL:    c.config.TelemetryTTL,
+		Now:             now,
+	})
 }
 
 // EvaluatePolicy applies the composed policy and reset scheduler to all
@@ -674,7 +999,32 @@ func (c *Controller) RequestTransition(ctx context.Context, accountID string) (*
 	if coordinator == nil {
 		return nil, ErrRuntimeNotConnected
 	}
-	return coordinator.RequestTransition(ctx, accountID)
+	result, err := coordinator.RequestTransition(ctx, accountID)
+	if result != nil && result.Outcome == transitions.TransitionCommitted {
+		// The coordinator verifies the runtime and disk authorities, but the
+		// registry's active marker is a separate controller-owned authority.
+		// Keep it aligned before policy/recovery code observes the commit, or a
+		// successful switch would be evaluated again as if the old account were
+		// still active after a restart.
+		if c.registry != nil && result.TargetAccountID != "" {
+			if activeErr := c.registry.SetActive(result.TargetAccountID); activeErr != nil {
+				return result, fmt.Errorf("record committed active account %q: %w", result.TargetAccountID, activeErr)
+			}
+		}
+		if c.recovery != nil && result.TransitionID != "" {
+			if releaseErr := c.recovery.OnTransitionCommitted(ctx, recovery.TransitionCommit{
+			TransitionID:       result.TransitionID,
+			RuntimeID:          result.RuntimeID,
+			TargetAccountID:    result.TargetAccountID,
+			ExpectedGeneration: result.ExpectedGeneration,
+			FinalGeneration:    result.FinalGeneration,
+			Outcome:            string(result.Outcome),
+			}); releaseErr != nil {
+				return result, releaseErr
+			}
+		}
+	}
+	return result, err
 }
 
 // Reconcile delegates an uncertain transition to the coordinator.
@@ -686,7 +1036,27 @@ func (c *Controller) Reconcile(ctx context.Context, transitionID string) (*trans
 	if coordinator == nil {
 		return nil, ErrRuntimeNotConnected
 	}
-	return coordinator.Reconcile(ctx, transitionID)
+	result, err := coordinator.Reconcile(ctx, transitionID)
+	if result != nil && result.Outcome == transitions.TransitionCommitted {
+		if c.registry != nil && result.TargetAccountID != "" {
+			if activeErr := c.registry.SetActive(result.TargetAccountID); activeErr != nil {
+				return result, fmt.Errorf("record reconciled active account %q: %w", result.TargetAccountID, activeErr)
+			}
+		}
+		if c.recovery != nil && result.TransitionID != "" {
+			if releaseErr := c.recovery.OnTransitionCommitted(ctx, recovery.TransitionCommit{
+			TransitionID:       result.TransitionID,
+			RuntimeID:          result.RuntimeID,
+			TargetAccountID:    result.TargetAccountID,
+			ExpectedGeneration: result.ExpectedGeneration,
+			FinalGeneration:    result.FinalGeneration,
+			Outcome:            string(result.Outcome),
+			}); releaseErr != nil {
+				return result, releaseErr
+			}
+		}
+	}
+	return result, err
 }
 
 // RuntimeState performs one explicit runtime read for a status or operator
@@ -717,6 +1087,11 @@ func (c *Controller) Close() error {
 }
 
 func (c *Controller) detachRuntime() error {
+	return c.detachRuntimeWithReason("controller closed runtime connection")
+}
+
+func (c *Controller) detachRuntimeWithReason(reason string) error {
+	c.StopAutomationLoop()
 	c.mu.Lock()
 	client := c.runtime
 	runtimeID := c.runtimeID
@@ -726,11 +1101,16 @@ func (c *Controller) detachRuntime() error {
 	c.runtimeID = ""
 	c.protocolVersion = 0
 	c.mu.Unlock()
+	if c.recovery != nil {
+		c.recovery.SetRuntime(nil)
+	}
+	// Do not leave an account manager pointing at a closed runtime client.
+	c.SetAuthService(nil)
 	if client == nil {
 		return nil
 	}
 	if runtimeID != "" && c.journal != nil {
-		if err := c.journal.Append(journal.Event{Type: journal.RuntimeDisconnected, RuntimeID: runtimeID, Reason: "controller closed runtime connection"}); err != nil {
+		if err := c.journal.Append(journal.Event{Type: journal.RuntimeDisconnected, RuntimeID: runtimeID, Reason: reason}); err != nil {
 			closeErr := client.Close()
 			return errors.Join(closeErr, err)
 		}
@@ -761,6 +1141,9 @@ func (r *clientRuntime) GetIdentity(ctx context.Context) (runtime.Identity, erro
 }
 func (r *clientRuntime) GetAuthGeneration(ctx context.Context) (runtime.AuthGenerationResult, error) {
 	return r.client.GetAuthGeneration(ctx)
+}
+func (r *clientRuntime) ReadAuthSnapshot(ctx context.Context) (runtime.NativeAuthSnapshotResult, error) {
+	return r.client.ReadAuthSnapshot(ctx)
 }
 
 // snapshotProvider exposes already-ingested runtime state through the common

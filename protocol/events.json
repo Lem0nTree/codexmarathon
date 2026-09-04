@@ -261,7 +261,10 @@
           "properties": {
             "event_type": { "const": "recovery_parked" },
             "recovery_id": { "type": "string", "minLength": 1 },
-            "reason": { "type": "string", "minLength": 1 }
+            "reason": { "type": "string", "minLength": 1 },
+            "thread_id": { "type": "string", "minLength": 1 },
+            "turn_id": { "type": "string", "minLength": 1 },
+            "source_account_id": { "type": "string", "minLength": 1 }
           },
           "additionalProperties": true
         }
@@ -276,7 +279,9 @@
           "required": ["event_type", "recovery_id"],
           "properties": {
             "event_type": { "const": "recovery_started" },
-            "recovery_id": { "type": "string", "minLength": 1 }
+            "recovery_id": { "type": "string", "minLength": 1 },
+            "thread_id": { "type": "string", "minLength": 1 },
+            "turn_id": { "type": "string", "minLength": 1 }
           },
           "additionalProperties": true
         }
@@ -293,7 +298,9 @@
             "event_type": { "const": "recovery_completed" },
             "recovery_id": { "type": "string", "minLength": 1 },
             "outcome": { "type": "string", "enum": ["completed", "failed", "skipped"] },
-            "error_code": { "type": ["string", "null"] }
+            "error_code": { "type": ["string", "null"] },
+            "thread_id": { "type": "string", "minLength": 1 },
+            "turn_id": { "type": "string", "minLength": 1 }
           },
           "additionalProperties": true
         }

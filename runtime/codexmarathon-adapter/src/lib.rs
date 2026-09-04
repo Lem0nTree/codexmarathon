@@ -1,13 +1,15 @@
-//! CodexMarathon's standalone Rust runtime adapter seam.
+//! CodexMarathon's Rust runtime adapter seam.
 //!
-//! The crate is intentionally independent from the donor checkout.  A small
-//! integration patch in Codext implements [`CodextBackend`] and forwards its
-//! existing observations into [`RuntimeAdapter`].
+//! The crate is an internal workspace component of the embedded Codex runtime.
+//! `codexmarathon-runtime` implements the production bridge while tests and
+//! other integrations can implement [`CodextBackend`] directly. The adapter
+//! never owns credentials, a second turn counter, or a recovery queue.
 
 mod adapter;
 mod error;
 pub mod framing;
 pub mod protocol;
+pub mod server;
 pub mod telemetry;
 
 pub use adapter::{
@@ -15,6 +17,7 @@ pub use adapter::{
     RuntimeAdapter,
 };
 pub use error::{AdapterError, BackendError};
+pub use server::{RuntimeServer, ServerConfig};
 
 #[cfg(test)]
 mod tests {
@@ -22,7 +25,7 @@ mod tests {
     use crate::framing::JsonLineCodec;
     use crate::protocol::*;
     use serde_json::{json, Value};
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, VecDeque};
     use std::io::Cursor;
     use std::sync::{Arc, Mutex};
 
@@ -32,7 +35,13 @@ mod tests {
         active_turn_count: u32,
         reload: Result<BackendReload, BackendError>,
         rate_limits: Option<BackendRateLimits>,
+        login: Option<Result<NativeLoginResult, BackendError>>,
+        auth_snapshot: Option<Result<NativeAuthSnapshotResult, BackendError>>,
+        refresh: Option<Result<NativeRefreshResult, BackendError>>,
+        recovery_release: Option<Result<RecoveryReleaseResult, BackendError>>,
+        recovery_events: Arc<Mutex<VecDeque<RecoveryLifecycleEvent>>>,
         reload_calls: Arc<Mutex<u32>>,
+        recovery_release_calls: Arc<Mutex<u32>>,
     }
 
     impl FakeBackend {
@@ -45,7 +54,13 @@ mod tests {
                     changed: false,
                 }),
                 rate_limits: None,
+                login: None,
+                auth_snapshot: None,
+                refresh: None,
+                recovery_release: None,
+                recovery_events: Arc::new(Mutex::new(VecDeque::new())),
                 reload_calls: Arc::new(Mutex::new(0)),
+                recovery_release_calls: Arc::new(Mutex::new(0)),
             }
         }
     }
@@ -68,6 +83,59 @@ mod tests {
             self.rate_limits.clone().ok_or_else(|| {
                 BackendError::new("missing_rate_limits", "test rate limits are not configured")
             })
+        }
+
+        fn login_account(
+            &mut self,
+            _params: NativeLoginParams,
+        ) -> Result<NativeLoginResult, BackendError> {
+            self.login.clone().ok_or_else(|| {
+                BackendError::new("missing_login", "test login is not configured")
+            })?
+        }
+
+        fn refresh_account(
+            &mut self,
+            _params: NativeRefreshParams,
+        ) -> Result<NativeRefreshResult, BackendError> {
+            self.refresh.clone().ok_or_else(|| {
+                BackendError::new("missing_refresh", "test refresh is not configured")
+            })?
+        }
+
+        fn read_auth_snapshot(
+            &mut self,
+        ) -> Result<NativeAuthSnapshotResult, BackendError> {
+            self.auth_snapshot.clone().ok_or_else(|| {
+                BackendError::new("missing_snapshot", "test snapshot is not configured")
+            })?
+        }
+
+        fn release_recovery(
+            &mut self,
+            params: RecoveryReleaseParams,
+        ) -> Result<RecoveryReleaseResult, BackendError> {
+            *self
+                .recovery_release_calls
+                .lock()
+                .expect("test mutex poisoned") += 1;
+            self.recovery_release
+                .clone()
+                .ok_or_else(|| BackendError::new("missing_recovery_release", "test recovery release is not configured"))
+                .map(|mut result| {
+                    if result.recovery_id.is_empty() {
+                        result.recovery_id = params.recovery_id;
+                    }
+                    result
+                })
+        }
+
+        fn drain_recovery_events(&mut self) -> Vec<RecoveryLifecycleEvent> {
+            self.recovery_events
+                .lock()
+                .expect("test mutex poisoned")
+                .drain(..)
+                .collect()
         }
     }
 
@@ -145,6 +213,100 @@ mod tests {
     }
 
     #[test]
+    fn native_account_handlers_delegate_opaque_login_and_refresh() {
+        let mut backend = FakeBackend::new("account-a", 0);
+        backend.login = Some(Ok(NativeLoginResult {
+            account_id: "account-b".to_string(),
+            alias: Some("work".to_string()),
+            auth_json: json!({
+                "auth_mode": "chatgpt",
+                "tokens": {"access_token": "opaque-test-value"}
+            }),
+            metadata: BTreeMap::from([(String::from("source"), String::from("native"))]),
+        }));
+        backend.refresh = Some(Ok(NativeRefreshResult {
+            access_token: Some("new-access".to_string()),
+            id_token: None,
+            refresh_token: Some("new-refresh".to_string()),
+            account_id: Some("account-b".to_string()),
+        }));
+        let mut adapter = adapter(backend);
+        let ready = adapter.handle_request(RpcRequest::new(
+            "ready",
+            METHOD_NEGOTIATE,
+            json!({"supported_versions": [1]}),
+        ));
+        assert!(ready.error.is_none());
+
+        let login = adapter.handle_request(RpcRequest::new(
+            "login",
+            METHOD_LOGIN_ACCOUNT,
+            json!({"alias": "work"}),
+        ));
+        assert_eq!(login.error, None);
+        let login_result = login.result.expect("login result");
+        assert_eq!(login_result["account_id"], "account-b");
+        assert_eq!(login_result["auth_json"]["tokens"]["access_token"], "opaque-test-value");
+
+        let refresh = adapter.handle_request(RpcRequest::new(
+            "refresh",
+            METHOD_REFRESH_ACCOUNT,
+            json!({
+                "account_id": "account-b",
+                "auth_json": {"auth_mode": "chatgpt"}
+            }),
+        ));
+        assert_eq!(refresh.error, None);
+        assert_eq!(refresh.result.expect("refresh result")["account_id"], "account-b");
+    }
+
+    #[test]
+    fn native_account_handlers_reject_invalid_opaque_payloads() {
+        let mut adapter = adapter(FakeBackend::new("account-a", 0));
+        let _ = adapter.handle_request(RpcRequest::new(
+            "ready",
+            METHOD_NEGOTIATE,
+            json!({"supported_versions": [1]}),
+        ));
+        let invalid = adapter.handle_request(RpcRequest::new(
+            "refresh",
+            METHOD_REFRESH_ACCOUNT,
+            json!({"account_id": "account-b", "auth_json": "not-an-object"}),
+        ));
+        assert_eq!(invalid.error.expect("invalid params").code, -32602);
+    }
+
+    #[test]
+    fn native_auth_snapshot_handler_delegates_opaque_value() {
+        let mut backend = FakeBackend::new("account-a", 0);
+        backend.auth_snapshot = Some(Ok(NativeAuthSnapshotResult {
+            account_id: "account-a".to_string(),
+            auth_json: json!({
+                "auth_mode": "chatgpt",
+                "tokens": {"account_id": "account-a", "access_token": "opaque"}
+            }),
+        }));
+        let mut adapter = adapter(backend);
+        let ready = adapter.handle_request(RpcRequest::new(
+            "ready",
+            METHOD_NEGOTIATE,
+            json!({"supported_versions": [1]}),
+        ));
+        assert!(ready.error.is_none());
+
+        let response = adapter.handle_request(RpcRequest::new(
+            "snapshot",
+            METHOD_READ_AUTH_SNAPSHOT,
+            json!({}),
+        ));
+        assert_eq!(response.error, None);
+        assert_eq!(
+            response.result.expect("snapshot result")["account_id"],
+            "account-a"
+        );
+    }
+
+    #[test]
     fn running_turn_keeps_commit_pending_until_boundary() {
         let mut backend = FakeBackend::new("account-a", 1);
         backend.reload = Ok(BackendReload {
@@ -182,6 +344,7 @@ mod tests {
             .commit(transition("tx-1", "account-b", 2))
             .expect("commit after boundary");
         assert_eq!(committed.outcome, TransitionOutcome::Committed);
+        assert_eq!(committed.expected_generation, Some(2));
         assert_eq!(committed.auth_generation, 2);
         assert_eq!(committed.account_id.as_deref(), Some("account-b"));
         assert!(adapter.pending_transition().is_none());
@@ -247,6 +410,31 @@ mod tests {
     }
 
     #[test]
+    fn reload_with_wrong_native_identity_is_not_committed() {
+        let mut backend = FakeBackend::new("account-a", 0);
+        backend.reload = Ok(BackendReload {
+            identity: BackendIdentity::new(Some("account-c".to_string())),
+            changed: true,
+        });
+        let mut adapter = adapter(backend);
+        adapter
+            .prepare(transition("tx-wrong", "account-b", 2))
+            .expect("prepare");
+        adapter.drain_events();
+        let result = adapter
+            .commit(transition("tx-wrong", "account-b", 2))
+            .expect("commit");
+        assert_eq!(result.outcome, TransitionOutcome::Rejected);
+        assert_eq!(result.error_code.as_deref(), Some("identity_mismatch"));
+        assert_eq!(result.account_id.as_deref(), Some("account-c"));
+        assert_eq!(adapter.identity().auth_generation, 2);
+        assert!(adapter.pending_transition().is_none());
+        let events = adapter.drain_events();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1].base.event_type, EVENT_AUTH_RELOAD_FAILED);
+    }
+
+    #[test]
     fn telemetry_attaches_connection_identity_and_preserves_sparse_shape() {
         let mut backend = FakeBackend::new("account-a", 0);
         let mut by_id = BTreeMap::new();
@@ -287,6 +475,134 @@ mod tests {
             .forward_recovery_completed("recovery-1", "completed", None)
             .expect("completed"));
         assert_eq!(adapter.drain_events().len(), 3);
+    }
+
+    #[test]
+    fn recovery_release_is_idempotent_and_does_not_create_prompt() {
+        let mut backend = FakeBackend::new("account-a", 0);
+        backend.recovery_release = Some(Ok(RecoveryReleaseResult {
+            recovery_id: String::new(),
+            thread_id: Some("thread-1".to_string()),
+            outcome: RecoveryReleaseOutcome::Released,
+            error_code: None,
+            error_message: None,
+        }));
+        let calls = Arc::clone(&backend.recovery_release_calls);
+        let mut adapter = adapter(backend);
+        assert!(adapter
+            .forward_recovery_parked_with_context(
+                "recovery-1",
+                "usage_limit_exceeded",
+                Some("thread-1".to_string()),
+                Some("turn-1".to_string()),
+                Some("account-a".to_string()),
+            )
+            .expect("parked"));
+        let params = RecoveryReleaseParams {
+            recovery_id: "recovery-1".to_string(),
+            thread_id: Some("thread-1".to_string()),
+            transition_id: "tx-1".to_string(),
+            expected_generation: 1,
+        };
+        let first = adapter.release_recovery(params.clone()).expect("first release");
+        assert_eq!(first.outcome, RecoveryReleaseOutcome::Released);
+        let second = adapter.release_recovery(params).expect("idempotent release");
+        assert_eq!(second.outcome, RecoveryReleaseOutcome::Released);
+        assert_eq!(*calls.lock().expect("test mutex poisoned"), 1);
+        assert!(adapter.drain_events().len() == 1, "release creates no synthetic event");
+    }
+
+    #[test]
+    fn native_recovery_drain_registers_before_release_and_correlates_later_stages() {
+        let mut backend = FakeBackend::new("account-a", 0);
+        backend.recovery_release = Some(Ok(RecoveryReleaseResult {
+            recovery_id: String::new(),
+            thread_id: Some("thread-1".to_string()),
+            outcome: RecoveryReleaseOutcome::Released,
+            error_code: None,
+            error_message: None,
+        }));
+        let recovery_events = Arc::clone(&backend.recovery_events);
+        recovery_events
+            .lock()
+            .expect("test mutex poisoned")
+            .push_back(RecoveryLifecycleEvent::Parked(RecoveryParkedPayload {
+                recovery_id: "recovery-1".to_string(),
+                reason: "usage_limit_exceeded".to_string(),
+                thread_id: Some("thread-1".to_string()),
+                turn_id: Some("failed-turn".to_string()),
+                source_account_id: Some("account-a".to_string()),
+            }));
+        let mut adapter = adapter(backend);
+
+        assert_eq!(adapter.drain_native_recovery_events().expect("parked drain"), 1);
+        assert_eq!(
+            adapter
+                .runtime_state()
+                .expect("runtime state")
+                .recoveries[0]
+                .phase,
+            RecoveryPhase::Parked
+        );
+        let parked = adapter.drain_events();
+        assert_eq!(parked.len(), 1);
+
+        let release = adapter
+            .release_recovery(RecoveryReleaseParams {
+                recovery_id: "recovery-1".to_string(),
+                thread_id: Some("thread-1".to_string()),
+                transition_id: "tx-1".to_string(),
+                expected_generation: 1,
+            })
+            .expect("release parked recovery");
+        assert_eq!(release.outcome, RecoveryReleaseOutcome::Released);
+
+        recovery_events
+            .lock()
+            .expect("test mutex poisoned")
+            .extend([
+                RecoveryLifecycleEvent::Started(RecoveryStartedPayload {
+                    recovery_id: "recovery-1".to_string(),
+                    thread_id: None,
+                    turn_id: None,
+                }),
+                RecoveryLifecycleEvent::Completed(RecoveryCompletedPayload {
+                    recovery_id: "recovery-1".to_string(),
+                    outcome: "completed".to_string(),
+                    error_code: None,
+                    thread_id: None,
+                    turn_id: None,
+                }),
+                // Simulate a replay after reconnect. The adapter must not
+                // duplicate any stage already observed.
+                RecoveryLifecycleEvent::Started(RecoveryStartedPayload {
+                    recovery_id: "recovery-1".to_string(),
+                    thread_id: None,
+                    turn_id: None,
+                }),
+            ]);
+        assert_eq!(adapter.drain_native_recovery_events().expect("later drain"), 2);
+        let events = adapter.drain_events();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].base.event_type, EVENT_RECOVERY_STARTED);
+        assert_eq!(events[0].base.auth_generation, 1);
+        assert_eq!(events[0].base.transition_id.as_deref(), Some("tx-1"));
+        let started: RecoveryStartedPayload = events[0].payload_as().expect("started payload");
+        assert_eq!(started.thread_id.as_deref(), Some("thread-1"));
+        assert_eq!(started.turn_id.as_deref(), Some("failed-turn"));
+        assert_eq!(events[1].base.event_type, EVENT_RECOVERY_COMPLETED);
+        assert_eq!(events[1].base.auth_generation, 1);
+        assert_eq!(events[1].base.transition_id.as_deref(), Some("tx-1"));
+        let state = adapter
+            .runtime_state()
+            .expect("runtime state after completion")
+            .recoveries
+            .into_iter()
+            .find(|state| state.recovery_id == "recovery-1")
+            .expect("recovery state");
+        assert_eq!(state.phase, RecoveryPhase::Completed);
+        assert_eq!(state.transition_id.as_deref(), Some("tx-1"));
+        assert_eq!(state.expected_generation, Some(1));
     }
 
     #[test]

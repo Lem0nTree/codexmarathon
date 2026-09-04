@@ -104,6 +104,30 @@ func TestFileRegistryActiveRemovalAndTelemetryMarkers(t *testing.T) {
 	}
 }
 
+func TestFileRegistryRenamePreservesStableIdentityAndSelection(t *testing.T) {
+	registry := NewFileRegistry(filepath.Join(t.TempDir(), "accounts.json"))
+	if err := registry.Register(Account{ID: "acct-1", Alias: "old", CredentialRef: "acct-1"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := registry.SetActive("acct-1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := registry.Rename("acct-1", "new"); err != nil {
+		t.Fatalf("Rename() error = %v", err)
+	}
+	account, err := registry.Get("acct-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if account.ID != "acct-1" || account.Alias != "new" || account.CredentialRef != "acct-1" {
+		t.Fatalf("renamed account = %#v", account)
+	}
+	activeID, err := registry.ActiveID()
+	if err != nil || activeID != "acct-1" {
+		t.Fatalf("active ID after rename = %q, error %v", activeID, err)
+	}
+}
+
 func TestValidateAccountRejectsUnsafeIDsAndMetadata(t *testing.T) {
 	for _, id := range []string{"", ".", "..", "../escape", `nested\name`, "nested/name", "line\nfeed"} {
 		if err := ValidateAccount(Account{ID: id}); !errors.Is(err, ErrInvalidAccountID) {

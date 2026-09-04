@@ -11,6 +11,7 @@ runtime event
     -> StateStore (sparse merge authority)
     -> SnapshotCache (deep-copy TTL cache)
     -> policy.Engine
+    -> automation.Loop
     -> reset.Scheduler when the pool is exhausted
 ```
 
@@ -47,6 +48,25 @@ hint. At that boundary the controller must refresh telemetry and reevaluate;
 it must not transition merely because the timestamp elapsed.
 
 The default runtime provider is event-driven. Inactive-profile providers are
-pluggable through `telemetry.UsageProvider`; the controller does not add a
-second Humeo-style active-account probe.
+pluggable through `telemetry.UsageProvider`; `internal/quota.Provider` adapts
+the donor `codex-switch/internal/quota` calibration request and retry/header
+rules to that interface. `app.NewAutomationLoop` installs that provider for
+stored accounts that do not already have an active runtime snapshot provider,
+so inactive profiles are checked without invoking a second Codex executable.
+The active runtime provider remains the event/state-store authority and
+replaces the fallback when its authoritative snapshot event arrives.
 
+## Automatic policy
+
+`internal/automation.Loop` is the feature boundary that turns observations
+into an action. It refreshes every configured account once per event, maps
+`threshold_reached`, `usage_limit_exceeded`, and reset wakes to explicit
+policy triggers, and calls the transition layer only for a deterministic
+replacement. A provider error stays attached to that account and cannot be
+interpreted as available quota.
+
+The policy engine carries a one-minute donor-compatible cooldown, remembers
+event IDs, and suppresses an in-flight target. When all accounts are
+unavailable it returns the earliest future server reset plus the account that
+must be revalidated; when no reset is trustworthy it returns a bounded data
+retry hint. A wake-up never marks quota restored by elapsed time alone.

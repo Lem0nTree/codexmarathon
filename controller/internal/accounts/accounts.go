@@ -165,6 +165,36 @@ func (r *FileRegistry) Upsert(account Account) error {
 	return r.saveUnlocked(state)
 }
 
+// Rename updates the operator-facing alias for one account without changing
+// its credential reference, telemetry markers, or active selection.  The
+// operation is intentionally registry-only: credential files are keyed by the
+// stable account ID and therefore never move during a rename.
+func (r *FileRegistry) Rename(accountID, alias string) error {
+	if r == nil {
+		return errors.New("nil account registry")
+	}
+	if err := ValidateAccountID(accountID); err != nil {
+		return err
+	}
+	if err := ValidateAlias(alias); err != nil {
+		return err
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	state, err := r.loadUnlocked()
+	if err != nil {
+		return err
+	}
+	account, ok := state.Accounts[accountID]
+	if !ok {
+		return fmt.Errorf("%w: %s", ErrAccountNotFound, accountID)
+	}
+	account.Alias = alias
+	account.UpdatedAt = r.clockNow()
+	state.Accounts[accountID] = account
+	return r.saveUnlocked(state)
+}
+
 // Save is an alias for Upsert.
 func (r *FileRegistry) Save(account Account) error {
 	return r.Upsert(account)
@@ -399,11 +429,8 @@ func ValidateAccount(account Account) error {
 	if err := ValidateAccountID(account.ID); err != nil {
 		return err
 	}
-	if strings.TrimSpace(account.Alias) != account.Alias {
-		return fmt.Errorf("%w: alias has surrounding whitespace", ErrInvalidRegistry)
-	}
-	if strings.ContainsRune(account.Alias, 0) || strings.ContainsAny(account.Alias, "\r\n") {
-		return fmt.Errorf("%w: invalid alias", ErrInvalidRegistry)
+	if err := ValidateAlias(account.Alias); err != nil {
+		return err
 	}
 	if account.CredentialRef != "" {
 		if err := ValidateAccountID(account.CredentialRef); err != nil {
@@ -423,6 +450,23 @@ func ValidateAccount(account Account) error {
 		if looksSensitiveMetadata(key) {
 			return fmt.Errorf("%w: sensitive metadata key %q", ErrInvalidRegistry, key)
 		}
+	}
+	return nil
+}
+
+// ValidateAlias enforces the non-secret, operator-facing profile label
+// contract. Empty aliases are allowed so a provider identity or account ID can
+// be used as the display fallback, but a supplied alias must be a single-line
+// value without surrounding whitespace or NUL bytes.
+func ValidateAlias(alias string) error {
+	if strings.TrimSpace(alias) != alias {
+		return fmt.Errorf("%w: alias has surrounding whitespace", ErrInvalidRegistry)
+	}
+	if strings.ContainsRune(alias, 0) || strings.ContainsAny(alias, "\r\n") {
+		return fmt.Errorf("%w: invalid alias", ErrInvalidRegistry)
+	}
+	if len(alias) > 256 {
+		return fmt.Errorf("%w: alias is too long", ErrInvalidRegistry)
 	}
 	return nil
 }

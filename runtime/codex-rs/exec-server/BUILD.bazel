@@ -1,0 +1,45 @@
+load("//:defs.bzl", "codex_rust_crate")
+load("//bazel/rules/testing/compat:exec_server_compat_test.bzl", "exec_server_compat_test")
+
+exports_files(
+    ["src/proto/codex.exec_server.relay.v1.rs"],
+    visibility = ["//codex-rs/exec-server/tests/support:__pkg__"],
+)
+
+codex_rust_crate(
+    name = "exec-server",
+    crate_name = "codex_exec_server",
+    deps_extra = [
+        "@crates//:opentelemetry",
+        "@crates//:opentelemetry_sdk",
+        "@crates//:toml",
+    ],
+    extra_binaries = [
+        "//codex-rs/bwrap:bwrap",
+    ],
+    integration_compile_data_extra = [
+        "src/proto/codex.exec_server.relay.v1.rs",
+    ],
+    # Keep the crate's tests single-threaded under Bazel because they install
+    # process-global test-binary dispatch state, and the remote exec-server
+    # cases already rely on serialization around the full CLI path.
+    integration_test_args = ["--test-threads=1"],
+    test_tags = ["no-sandbox"],
+    unit_test_args = ["--test-threads=1"],
+)
+
+exec_server_compat_test(
+    name = "exec-server-current-version-test",
+    comparison_binary = "//codex-rs/cli:codex",
+    current_binary = "//codex-rs/cli:codex",
+)
+
+exec_server_compat_test(
+    name = "exec-server-stable-release-test",
+    release = "@codex_release_0.150.1_linux_x86_64",
+)
+
+exec_server_compat_test(
+    name = "exec-server-minimum-release-test",
+    release = "@codex_release_0.145.0_linux_x86_64",
+)

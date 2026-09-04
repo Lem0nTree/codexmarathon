@@ -3,6 +3,7 @@
 package reset
 
 import (
+	"context"
 	"time"
 
 	"codexmarathon/controller/internal/telemetry"
@@ -91,4 +92,15 @@ type ResetScheduler interface {
 	Evaluate(accounts []telemetry.AccountTelemetry, now time.Time) ResetDecision
 	NextRecheck() (time.Time, bool)
 	Clear()
+}
+
+// Waiter is the optional timer surface implemented by Scheduler. Keeping it
+// separate from ResetScheduler preserves compatibility with small test
+// doubles and lets policy depend only on decision-making.
+type Waiter interface {
+	// NextWake returns either the selected authoritative reset boundary or the
+	// bounded data-refresh wake-up. It never implies that quota is restored.
+	NextWake() (time.Time, bool)
+	// Wait blocks until the next bounded wake-up or context cancellation.
+	Wait(context.Context) error
 }

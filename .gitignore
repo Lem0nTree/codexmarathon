@@ -7,9 +7,16 @@ donor/
 .state/
 
 # Build outputs.
+__pycache__/
+*.py[cod]
 codexmarathon.exe
 controller/codexmarathon
 runtime/codexmarathon-adapter/target/
+runtime/codex-rs/target/
+runtime/codex-rs/target-*/
+
+# Release build and archive output.
+dist/
 
 # Editor and OS metadata.
 .idea/

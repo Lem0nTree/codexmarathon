@@ -29,6 +29,7 @@ type Runtime struct {
 	activeTurnCount int
 	pending         *runtime.PendingTransition
 	completed       map[string]runtime.TransitionResult
+	recoveries      map[string]runtime.RecoveryState
 
 	events chan runtime.Event
 	closed bool
@@ -44,6 +45,8 @@ type Runtime struct {
 	prepareCalls []runtime.AuthTransitionParams
 	commitCalls  []runtime.AuthTransitionParams
 	cancelCalls  []runtime.CancelAuthTransitionParams
+	recoveryReleaseCalls []runtime.RecoveryReleaseParams
+	dropNextRecoveryAck bool
 }
 
 // New creates a fake runtime with a stable runtime ID and the supplied
@@ -58,6 +61,7 @@ func New(accountID string, generation uint64) *Runtime {
 		identity:  runtime.Identity{RuntimeID: "fake-runtime", AccountID: account, AuthGeneration: generation},
 		events:    make(chan runtime.Event, 64),
 		completed: make(map[string]runtime.TransitionResult),
+		recoveries: make(map[string]runtime.RecoveryState),
 	}
 }
 
@@ -401,6 +405,42 @@ func (f *Runtime) CancelCalls() []runtime.CancelAuthTransitionParams {
 	return append([]runtime.CancelAuthTransitionParams(nil), f.cancelCalls...)
 }
 
+// SetRecovery installs a runtime-owned parked recovery for an integration
+// fixture. The fixture stores only correlation metadata, matching the real
+// adapter contract; prompt and credential bytes are never represented.
+func (f *Runtime) SetRecovery(recoveryID, threadID, turnID, sourceAccountID string) {
+	if f == nil || recoveryID == "" {
+		return
+	}
+	f.mu.Lock()
+	f.recoveries[recoveryID] = runtime.RecoveryState{
+		RecoveryID: recoveryID, ThreadID: threadID, TurnID: turnID,
+		SourceAccountID: sourceAccountID, Phase: runtime.RecoveryParkedPhase,
+	}
+	f.mu.Unlock()
+}
+
+// RecoveryReleaseCalls returns the controller-to-runtime release requests in
+// order, allowing integration tests to assert exactly-once dispatch.
+func (f *Runtime) RecoveryReleaseCalls() []runtime.RecoveryReleaseParams {
+	if f == nil {
+		return nil
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]runtime.RecoveryReleaseParams(nil), f.recoveryReleaseCalls...)
+}
+
+// DropNextRecoveryReleaseAck applies one release and drops its acknowledgement.
+func (f *Runtime) DropNextRecoveryReleaseAck() {
+	if f == nil {
+		return
+	}
+	f.mu.Lock()
+	f.dropNextRecoveryAck = true
+	f.mu.Unlock()
+}
+
 // GetRuntimeState implements transitions.Runtime.
 func (f *Runtime) GetRuntimeState(ctx context.Context) (runtime.RuntimeState, error) {
 	if err := f.check(ctx); err != nil {
@@ -412,7 +452,52 @@ func (f *Runtime) GetRuntimeState(ctx context.Context) (runtime.RuntimeState, er
 		Identity:          cloneIdentity(f.identity),
 		ActiveTurnCount:   f.activeTurnCount,
 		PendingTransition: clonePending(f.pending),
+		Recoveries:        cloneRecoveries(f.recoveries),
 	}, nil
+}
+
+// ReleaseRecovery implements recovery.Runtime. It authorizes one already
+// parked runtime recovery and never constructs or submits a prompt.
+func (f *Runtime) ReleaseRecovery(ctx context.Context, params runtime.RecoveryReleaseParams) (runtime.RecoveryReleaseResult, error) {
+	if err := f.check(ctx); err != nil {
+		return runtime.RecoveryReleaseResult{}, err
+	}
+	if err := params.Validate(); err != nil {
+		return runtime.RecoveryReleaseResult{}, err
+	}
+	f.mu.Lock()
+	f.recoveryReleaseCalls = append(f.recoveryReleaseCalls, params)
+	state, ok := f.recoveries[params.RecoveryID]
+	if !ok {
+		f.mu.Unlock()
+		code, message := "recovery_not_found", "recovery not found"
+		return runtime.RecoveryReleaseResult{RecoveryID: params.RecoveryID, ThreadID: params.ThreadID, Outcome: runtime.RecoveryReleaseRejected, ErrorCode: &code, ErrorMessage: &message}, nil
+	}
+	if params.ExpectedGeneration != f.identity.AuthGeneration {
+		f.mu.Unlock()
+		code, message := "stale_generation", "runtime identity generation does not match release"
+		return runtime.RecoveryReleaseResult{RecoveryID: params.RecoveryID, ThreadID: state.ThreadID, Outcome: runtime.RecoveryReleaseRejected, ErrorCode: &code, ErrorMessage: &message}, nil
+	}
+	if state.ThreadID != "" && params.ThreadID != "" && state.ThreadID != params.ThreadID {
+		f.mu.Unlock()
+		code, message := "thread_id_mismatch", "recovery belongs to another thread"
+		return runtime.RecoveryReleaseResult{RecoveryID: params.RecoveryID, ThreadID: state.ThreadID, Outcome: runtime.RecoveryReleaseRejected, ErrorCode: &code, ErrorMessage: &message}, nil
+	}
+	if state.Phase == runtime.RecoveryReleasedPhase || state.Phase == runtime.RecoveryStartedPhase || state.Phase == runtime.RecoveryCompletedPhase {
+		f.mu.Unlock()
+		return runtime.RecoveryReleaseResult{RecoveryID: params.RecoveryID, ThreadID: state.ThreadID, Outcome: runtime.RecoveryAlreadyReleased}, nil
+	}
+	state.Phase = runtime.RecoveryReleasedPhase
+	state.TransitionID = params.TransitionID
+	state.ExpectedGeneration = params.ExpectedGeneration
+	f.recoveries[params.RecoveryID] = state
+	dropAck := f.dropNextRecoveryAck
+	f.dropNextRecoveryAck = false
+	f.mu.Unlock()
+	if dropAck {
+		return runtime.RecoveryReleaseResult{}, ErrAckLost
+	}
+	return runtime.RecoveryReleaseResult{RecoveryID: params.RecoveryID, ThreadID: state.ThreadID, Outcome: runtime.RecoveryReleased}, nil
 }
 
 // PrepareAuthTransition records intent without changing identity.
@@ -654,6 +739,17 @@ func clonePending(value *runtime.PendingTransition) *runtime.PendingTransition {
 	}
 	copy := *value
 	return &copy
+}
+
+func cloneRecoveries(values map[string]runtime.RecoveryState) []runtime.RecoveryState {
+	if len(values) == 0 {
+		return nil
+	}
+	result := make([]runtime.RecoveryState, 0, len(values))
+	for _, value := range values {
+		result = append(result, value)
+	}
+	return result
 }
 
 func mustJSON(value any) []byte {

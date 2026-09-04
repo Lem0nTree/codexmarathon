@@ -131,3 +131,32 @@ func TestJournalPreservesInitialZeroGeneration(t *testing.T) {
 		t.Fatalf("journal omitted zero generation: %s", data)
 	}
 }
+
+func TestJournalAcceptsSecretFreeRecoveryLifecycle(t *testing.T) {
+	j := NewFileJournal(filepath.Join(t.TempDir(), "events.jsonl"))
+	events := []Event{
+		{Type: RecoveryParked, RecoveryID: "recovery-1", RuntimeID: "runtime-1", ThreadID: "thread-1", TurnID: "turn-1", AccountID: "acct-a", AuthGeneration: 1, Reason: "runtime parked usage-limit recovery"},
+		{Type: RecoveryBound, RecoveryID: "recovery-1", RuntimeID: "runtime-1", ThreadID: "thread-1", TransitionID: "tx-1", TargetAccountID: "acct-b", AuthGeneration: 2, ExpectedGeneration: 2},
+		{Type: RecoveryReleaseRequested, RecoveryID: "recovery-1", RuntimeID: "runtime-1", ThreadID: "thread-1", TransitionID: "tx-1", TargetAccountID: "acct-b", AuthGeneration: 2, ExpectedGeneration: 2},
+		{Type: RecoveryReleased, RecoveryID: "recovery-1", RuntimeID: "runtime-1", ThreadID: "thread-1", TransitionID: "tx-1", TargetAccountID: "acct-b", AuthGeneration: 2, ExpectedGeneration: 2, Outcome: "released"},
+	}
+	for _, event := range events {
+		if err := j.Append(event); err != nil {
+			t.Fatalf("Append(%s) error = %v", event.Type, err)
+		}
+	}
+	got, err := j.ReadAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != len(events) || got[2].RecoveryID != "recovery-1" || got[2].TransitionID != "tx-1" || got[2].ExpectedGeneration != 2 {
+		t.Fatalf("replayed recovery events = %#v", got)
+	}
+	raw, err := os.ReadFile(j.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "prompt") || strings.Contains(string(raw), "access_token") {
+		t.Fatalf("recovery journal contains sensitive/prompt marker: %s", raw)
+	}
+}

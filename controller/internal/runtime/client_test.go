@@ -136,6 +136,72 @@ func TestClientRejectsUnsupportedNegotiatedVersion(t *testing.T) {
 	}
 }
 
+func TestClientNativeAccountMethodsKeepOpaquePayloadsInMemory(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	client := NewClient(clientConn)
+	defer client.Close()
+	defer serverConn.Close()
+
+	serverErr := make(chan error, 1)
+	go func() {
+		reader := bufio.NewReader(serverConn)
+		for index, expectedMethod := range []string{string(MethodLoginAccount), string(MethodRefreshAccount)} {
+			line, err := reader.ReadBytes('\n')
+			if err != nil {
+				serverErr <- err
+				return
+			}
+			var request map[string]any
+			if err := json.Unmarshal(line, &request); err != nil {
+				serverErr <- err
+				return
+			}
+			if request["method"] != expectedMethod {
+				serverErr <- errors.New("unexpected native account method")
+				return
+			}
+			result := map[string]any{"account_id": "account-a"}
+			if index == 0 {
+				result["auth_json"] = map[string]any{"tokens": map[string]string{"account_id": "account-a"}}
+			} else {
+				result["access_token"] = "refreshed-in-memory"
+			}
+			if err := writeJSONLine(serverConn, map[string]any{
+				"jsonrpc": "2.0",
+				"id":      request["id"],
+				"result":  result,
+			}); err != nil {
+				serverErr <- err
+				return
+			}
+		}
+		serverErr <- nil
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	login, err := client.LoginAccount(ctx, NativeLoginParams{Alias: "work"})
+	if err != nil {
+		t.Fatalf("LoginAccount() error = %v", err)
+	}
+	if login.AccountID != "account-a" || len(login.AuthJSON) == 0 {
+		t.Fatalf("LoginAccount() = %#v, want opaque account snapshot", login)
+	}
+	refresh, err := client.RefreshAccount(ctx, NativeRefreshParams{
+		AccountID: "account-a",
+		AuthJSON:  login.AuthJSON,
+	})
+	if err != nil {
+		t.Fatalf("RefreshAccount() error = %v", err)
+	}
+	if refresh.AccessToken != "refreshed-in-memory" || refresh.AccountID != "account-a" {
+		t.Fatalf("RefreshAccount() = %#v, want refreshed account token fields", refresh)
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatalf("server error = %v", err)
+	}
+}
+
 func TestTransitionParamsValidation(t *testing.T) {
 	if err := (AuthTransitionParams{}).Validate(); err == nil {
 		t.Fatal("empty transition params unexpectedly validated")

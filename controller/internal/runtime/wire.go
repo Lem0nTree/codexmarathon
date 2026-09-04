@@ -34,6 +34,22 @@ const (
 	MethodGetIdentity Method = "runtime/identity/read"
 	// MethodGetAuthGeneration reads the runtime's monotonic auth generation.
 	MethodGetAuthGeneration Method = "runtime/authGeneration/read"
+	// MethodLoginAccount starts a native Codex login flow in the embedded
+	// runtime and returns the resulting opaque auth snapshot in memory. The
+	// controller persists it only in its protected credential vault.
+	MethodLoginAccount Method = "account/login"
+	// MethodRefreshAccount asks the embedded runtime's native AuthManager/login
+	// crate to refresh one opaque account snapshot.
+	MethodRefreshAccount Method = "account/refresh"
+	// MethodReadAuthSnapshot reads the active opaque AuthManager snapshot so
+	// the controller can synchronize refreshed Account A credentials before a
+	// live switch deploys Account B.
+	MethodReadAuthSnapshot Method = "account/authSnapshot/read"
+	// MethodReleaseRecovery releases one recovery turn that Codex parked after
+	// UsageLimitExceeded. The runtime owns the queued prompt and the
+	// conversation; the controller only authorizes its already-correlated
+	// dispatch after an identity-changing transition is verified.
+	MethodReleaseRecovery Method = "recovery/release"
 )
 
 // EventNotificationMethod is the JSON-RPC method used for runtime events.
@@ -90,6 +106,10 @@ type RuntimeState struct {
 	Identity          Identity           `json:"identity"`
 	ActiveTurnCount   int                `json:"active_turn_count"`
 	PendingTransition *PendingTransition `json:"pending_transition"`
+	// Recoveries is runtime-owned recovery state. It is optional for older
+	// peers; when present it lets a restarted controller reconcile a release
+	// acknowledgement without submitting a second continuation.
+	Recoveries []RecoveryState `json:"recoveries,omitempty"`
 }
 
 // VersionNegotiationParams advertises versions supported by a peer.
@@ -135,6 +155,103 @@ type TransitionResult struct {
 // AuthGenerationResult is returned by runtime/authGeneration/read.
 type AuthGenerationResult struct {
 	AuthGeneration uint64 `json:"auth_generation"`
+}
+
+// NativeLoginParams is the non-secret operator intent sent to the embedded
+// Codex login runtime. The runtime owns OAuth/browser/device login.
+type NativeLoginParams struct {
+	AccountID string `json:"account_id,omitempty"`
+	Alias     string `json:"alias,omitempty"`
+	Overwrite bool   `json:"overwrite,omitempty"`
+}
+
+// NativeLoginResult is the in-memory handoff from the integrated runtime.
+// AuthJSON is intentionally never logged or included in journal records.
+type NativeLoginResult struct {
+	AccountID string            `json:"account_id"`
+	Alias     string            `json:"alias,omitempty"`
+	AuthJSON  json.RawMessage   `json:"auth_json"`
+	Metadata  map[string]string `json:"metadata,omitempty"`
+}
+
+// NativeRefreshParams supplies the target and opaque snapshot to the native
+// runtime. This keeps provider-specific token parsing in Codex's login crate.
+type NativeRefreshParams struct {
+	AccountID string          `json:"account_id"`
+	AuthJSON  json.RawMessage `json:"auth_json"`
+}
+
+// NativeRefreshResult contains only token fields needed for controller-side
+// write-back. It is never printed by the CLI.
+type NativeRefreshResult struct {
+	AccessToken  string `json:"access_token,omitempty"`
+	IDToken      string `json:"id_token,omitempty"`
+	RefreshToken string `json:"refresh_token,omitempty"`
+	AccountID    string `json:"account_id,omitempty"`
+}
+
+// NativeAuthSnapshotResult is the in-memory handoff of the active native
+// AuthManager snapshot. AuthJSON is never written to transition journals or
+// normal logs; the coordinator writes it only to the protected account vault.
+type NativeAuthSnapshotResult struct {
+	AccountID string          `json:"account_id"`
+	AuthJSON  json.RawMessage `json:"auth_json"`
+}
+
+// RecoveryPhase is the runtime's observable lifecycle for Codext's parked
+// UsageLimitExceeded recovery. The controller never supplies prompt text;
+// Codext retains and dispatches that native synthetic turn.
+type RecoveryPhase string
+
+const (
+	RecoveryParkedPhase    RecoveryPhase = "parked"
+	RecoveryReleasedPhase  RecoveryPhase = "released"
+	RecoveryStartedPhase   RecoveryPhase = "started"
+	RecoveryCompletedPhase RecoveryPhase = "completed"
+)
+
+// RecoveryState contains only correlation metadata. It intentionally has no
+// prompt or credential fields so it is safe to persist in a recovery journal.
+type RecoveryState struct {
+	RecoveryID       string        `json:"recovery_id"`
+	ThreadID         string        `json:"thread_id,omitempty"`
+	TurnID           string        `json:"turn_id,omitempty"`
+	SourceAccountID  string        `json:"source_account_id,omitempty"`
+	TransitionID     string        `json:"transition_id,omitempty"`
+	TargetAccountID  string        `json:"target_account_id,omitempty"`
+	ExpectedGeneration uint64      `json:"expected_generation,omitempty"`
+	Phase            RecoveryPhase `json:"phase"`
+}
+
+// RecoveryReleaseParams identifies the one native parked recovery to release.
+// TransitionID and ExpectedGeneration bind the release to a verified account
+// switch and prevent a stale controller from releasing under Account A.
+type RecoveryReleaseParams struct {
+	RecoveryID       string `json:"recovery_id"`
+	ThreadID         string `json:"thread_id,omitempty"`
+	TransitionID     string `json:"transition_id"`
+	ExpectedGeneration uint64 `json:"expected_generation"`
+}
+
+// RecoveryReleaseOutcome is the runtime acknowledgement of a release request.
+type RecoveryReleaseOutcome string
+
+const (
+	RecoveryReleased       RecoveryReleaseOutcome = "released"
+	RecoveryAlreadyReleased RecoveryReleaseOutcome = "already_released"
+	RecoveryReleaseRejected RecoveryReleaseOutcome = "rejected"
+	RecoveryReleaseUncertain RecoveryReleaseOutcome = "uncertain"
+)
+
+// RecoveryReleaseResult is secret-free and idempotently repeatable for one
+// recovery ID. A repeated request may return already_released without
+// dispatching the native prompt again.
+type RecoveryReleaseResult struct {
+	RecoveryID       string                 `json:"recovery_id"`
+	ThreadID         string                 `json:"thread_id,omitempty"`
+	Outcome          RecoveryReleaseOutcome  `json:"outcome"`
+	ErrorCode        *string                `json:"error_code,omitempty"`
+	ErrorMessage     *string                `json:"error_message,omitempty"`
 }
 
 // RateLimitWindowWire is the intentionally narrow Marathon representation of
@@ -269,12 +386,17 @@ type RecoveryParkedEvent struct {
 	EventBase
 	RecoveryID string `json:"recovery_id"`
 	Reason     string `json:"reason"`
+	ThreadID   string `json:"thread_id,omitempty"`
+	TurnID     string `json:"turn_id,omitempty"`
+	SourceAccountID string `json:"source_account_id,omitempty"`
 }
 
 // RecoveryStartedEvent observes dispatch of a parked runtime recovery.
 type RecoveryStartedEvent struct {
 	EventBase
 	RecoveryID string `json:"recovery_id"`
+	ThreadID   string `json:"thread_id,omitempty"`
+	TurnID     string `json:"turn_id,omitempty"`
 }
 
 // RecoveryCompletedEvent observes completion of a runtime-owned recovery.
@@ -283,6 +405,8 @@ type RecoveryCompletedEvent struct {
 	RecoveryID string  `json:"recovery_id"`
 	Outcome    string  `json:"outcome"`
 	ErrorCode  *string `json:"error_code,omitempty"`
+	ThreadID   string  `json:"thread_id,omitempty"`
+	TurnID     string  `json:"turn_id,omitempty"`
 }
 
 // Validate checks controller-owned transition fields before sending them.
@@ -301,6 +425,20 @@ func (p AuthTransitionParams) Validate() error {
 
 // Validate checks a cancellation request before sending it.
 func (p CancelAuthTransitionParams) Validate() error {
+	if p.TransitionID == "" {
+		return errors.New("transition_id is required")
+	}
+	if p.ExpectedGeneration == 0 {
+		return errors.New("expected_generation must be greater than zero")
+	}
+	return nil
+}
+
+// Validate checks a native recovery release request before sending it.
+func (p RecoveryReleaseParams) Validate() error {
+	if p.RecoveryID == "" {
+		return errors.New("recovery_id is required")
+	}
 	if p.TransitionID == "" {
 		return errors.New("transition_id is required")
 	}

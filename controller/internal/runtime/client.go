@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 )
@@ -174,6 +175,29 @@ func (c *Client) Errors() <-chan error {
 	return c.errors
 }
 
+// Done returns a channel that is closed when the runtime transport terminates
+// or the client is explicitly closed.  Supervisors use this as a
+// transport-liveness signal without consuming the event or error streams.
+func (c *Client) Done() <-chan struct{} {
+	if c == nil {
+		return nil
+	}
+	return c.done
+}
+
+// Closed reports whether the client has observed a transport termination.
+// It is intentionally a snapshot; callers that need notification should
+// select on Done instead.
+func (c *Client) Closed() bool {
+	if c == nil {
+		return true
+	}
+	c.stateMu.Lock()
+	closed := c.closed
+	c.stateMu.Unlock()
+	return closed
+}
+
 // Close terminates the transport and completes outstanding calls with
 // ErrClientClosed. It is safe to call more than once.
 func (c *Client) Close() error {
@@ -334,6 +358,119 @@ func (c *Client) GetAuthGeneration(ctx context.Context) (AuthGenerationResult, e
 		return AuthGenerationResult{}, err
 	}
 	return result, nil
+}
+
+// ReadAuthSnapshot reads the active opaque snapshot held by Codex's native
+// AuthManager. Callers must keep the result in memory only long enough to
+// synchronize the protected account vault; it must not be logged or journalled.
+func (c *Client) ReadAuthSnapshot(ctx context.Context) (NativeAuthSnapshotResult, error) {
+	var result NativeAuthSnapshotResult
+	if err := c.Call(ctx, MethodReadAuthSnapshot, struct{}{}, &result); err != nil {
+		return NativeAuthSnapshotResult{}, err
+	}
+	if result.AccountID == "" {
+		return NativeAuthSnapshotResult{}, errors.New("native auth snapshot has no account_id")
+	}
+	if err := validateRuntimeAccountID(result.AccountID); err != nil {
+		return NativeAuthSnapshotResult{}, err
+	}
+	if len(result.AuthJSON) == 0 || string(result.AuthJSON) == "null" || string(result.AuthJSON) == "{}" {
+		return NativeAuthSnapshotResult{}, errors.New("native auth snapshot has no auth_json")
+	}
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(result.AuthJSON, &object); err != nil || object == nil {
+		return NativeAuthSnapshotResult{}, errors.New("native auth snapshot auth_json is not an object")
+	}
+	return result, nil
+}
+
+// ReleaseRecovery authorizes Codex's already-parked UsageLimitExceeded
+// recovery turn after the controller has verified an identity-changing
+// transition. The runtime remains the sole owner of the queued prompt,
+// thread, and actual submission. The request is idempotent by recovery ID on
+// a compliant runtime, so a lost response can be retried during reconciliation
+// without duplicating the continuation.
+func (c *Client) ReleaseRecovery(ctx context.Context, params RecoveryReleaseParams) (RecoveryReleaseResult, error) {
+	if err := params.Validate(); err != nil {
+		return RecoveryReleaseResult{}, err
+	}
+	var result RecoveryReleaseResult
+	if err := c.Call(ctx, MethodReleaseRecovery, params, &result); err != nil {
+		return RecoveryReleaseResult{}, err
+	}
+	if result.RecoveryID != params.RecoveryID {
+		return RecoveryReleaseResult{}, fmt.Errorf("recovery release response id %q does not match %q", result.RecoveryID, params.RecoveryID)
+	}
+	if result.Outcome == "" {
+		return RecoveryReleaseResult{}, errors.New("recovery release response has no outcome")
+	}
+	if result.ThreadID != "" && params.ThreadID != "" && result.ThreadID != params.ThreadID {
+		return RecoveryReleaseResult{}, fmt.Errorf("recovery release response thread %q does not match %q", result.ThreadID, params.ThreadID)
+	}
+	return result, nil
+}
+
+// LoginAccount delegates browser/device/API login to the embedded Codex
+// runtime. The returned auth snapshot is an opaque in-memory handoff; callers
+// must persist it only in a protected vault and must not log it.
+func (c *Client) LoginAccount(ctx context.Context, params NativeLoginParams) (NativeLoginResult, error) {
+	if params.AccountID != "" {
+		if err := validateRuntimeAccountID(params.AccountID); err != nil {
+			return NativeLoginResult{}, err
+		}
+	}
+	var result NativeLoginResult
+	if err := c.Call(ctx, MethodLoginAccount, params, &result); err != nil {
+		return NativeLoginResult{}, err
+	}
+	if result.AccountID == "" {
+		return NativeLoginResult{}, errors.New("native login response has no account_id")
+	}
+	if len(result.AuthJSON) == 0 || string(result.AuthJSON) == "null" {
+		return NativeLoginResult{}, errors.New("native login response has no auth_json")
+	}
+	return result, nil
+}
+
+// RefreshAccount delegates token refresh to the embedded Codex login runtime.
+// The opaque snapshot and returned tokens stay in memory until the controller
+// performs validated write-back.
+func (c *Client) RefreshAccount(ctx context.Context, params NativeRefreshParams) (NativeRefreshResult, error) {
+	if params.AccountID == "" {
+		return NativeRefreshResult{}, errors.New("account_id is required")
+	}
+	if len(params.AuthJSON) == 0 || string(params.AuthJSON) == "null" {
+		return NativeRefreshResult{}, errors.New("auth_json is required")
+	}
+	if err := validateRuntimeAccountID(params.AccountID); err != nil {
+		return NativeRefreshResult{}, err
+	}
+	var result NativeRefreshResult
+	if err := c.Call(ctx, MethodRefreshAccount, params, &result); err != nil {
+		return NativeRefreshResult{}, err
+	}
+	if result.AccessToken == "" && result.IDToken == "" && result.RefreshToken == "" {
+		return NativeRefreshResult{}, errors.New("native refresh response has no updated token fields")
+	}
+	if result.AccountID != "" && result.AccountID != params.AccountID {
+		return NativeRefreshResult{}, fmt.Errorf("native refresh response account_id %q does not match %q", result.AccountID, params.AccountID)
+	}
+	return result, nil
+}
+
+func validateRuntimeAccountID(accountID string) error {
+	if accountID == "" || accountID == "." || accountID == ".." {
+		return errors.New("account_id is invalid")
+	}
+	for _, r := range accountID {
+		if r < 0x20 || r == 0x7f {
+			return errors.New("account_id contains control characters")
+		}
+	}
+	if strings.ContainsAny(accountID, `/\\<>:\"|?*`) {
+		return errors.New("account_id contains path characters")
+	}
+	return nil
 }
 
 func (c *Client) write(message any) error {

@@ -10,7 +10,11 @@
     { "$ref": "#/$defs/CommitAuthTransitionRequest" },
     { "$ref": "#/$defs/CancelAuthTransitionRequest" },
     { "$ref": "#/$defs/GetIdentityRequest" },
-    { "$ref": "#/$defs/GetAuthGenerationRequest" }
+    { "$ref": "#/$defs/GetAuthGenerationRequest" },
+    { "$ref": "#/$defs/NativeLoginRequest" },
+    { "$ref": "#/$defs/NativeAuthSnapshotRequest" },
+    { "$ref": "#/$defs/NativeRefreshRequest" },
+    { "$ref": "#/$defs/ReleaseRecoveryRequest" }
   ],
   "$defs": {
     "request_id": {
@@ -101,6 +105,21 @@
       },
       "additionalProperties": false
     },
+    "RecoveryState": {
+      "type": "object",
+      "required": ["recovery_id", "phase"],
+      "properties": {
+        "recovery_id": { "type": "string", "minLength": 1 },
+        "thread_id": { "type": "string", "minLength": 1 },
+        "turn_id": { "type": "string", "minLength": 1 },
+        "source_account_id": { "type": "string", "minLength": 1 },
+        "transition_id": { "type": "string", "minLength": 1 },
+        "target_account_id": { "type": "string", "minLength": 1 },
+        "expected_generation": { "type": "integer", "minimum": 1 },
+        "phase": { "type": "string", "enum": ["parked", "released", "started", "completed"] }
+      },
+      "additionalProperties": false
+    },
     "GetRuntimeStateResult": {
       "type": "object",
       "required": ["identity", "active_turn_count", "pending_transition"],
@@ -112,6 +131,10 @@
             { "$ref": "#/$defs/PendingTransition" },
             { "type": "null" }
           ]
+        },
+        "recoveries": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/RecoveryState" }
         }
       },
       "additionalProperties": true
@@ -222,6 +245,129 @@
       },
       "additionalProperties": false
     },
+    "NativeLoginRequest": {
+      "title": "NativeLogin",
+      "type": "object",
+      "required": ["jsonrpc", "id", "method", "params"],
+      "properties": {
+        "jsonrpc": { "const": "2.0" },
+        "id": { "$ref": "#/$defs/request_id" },
+        "method": { "const": "account/login" },
+        "params": { "$ref": "#/$defs/NativeLoginParams" }
+      },
+      "additionalProperties": false
+    },
+    "NativeLoginParams": {
+      "type": "object",
+      "properties": {
+        "account_id": { "type": "string", "minLength": 1 },
+        "alias": { "type": "string" },
+        "overwrite": { "type": "boolean" }
+      },
+      "additionalProperties": false
+    },
+    "NativeLoginResult": {
+      "type": "object",
+      "required": ["account_id", "auth_json"],
+      "properties": {
+        "account_id": { "type": "string", "minLength": 1 },
+        "alias": { "type": "string" },
+        "auth_json": { "type": "object" },
+        "metadata": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        }
+      },
+      "additionalProperties": false
+    },
+    "NativeAuthSnapshotRequest": {
+      "title": "NativeAuthSnapshot",
+      "type": "object",
+      "required": ["jsonrpc", "id", "method", "params"],
+      "properties": {
+        "jsonrpc": { "const": "2.0" },
+        "id": { "$ref": "#/$defs/request_id" },
+        "method": { "const": "account/authSnapshot/read" },
+        "params": { "type": "object", "maxProperties": 0 }
+      },
+      "additionalProperties": false
+    },
+    "NativeAuthSnapshotResult": {
+      "type": "object",
+      "required": ["account_id", "auth_json"],
+      "properties": {
+        "account_id": { "type": "string", "minLength": 1 },
+        "auth_json": { "type": "object" }
+      },
+      "additionalProperties": false
+    },
+    "NativeRefreshRequest": {
+      "title": "NativeRefresh",
+      "type": "object",
+      "required": ["jsonrpc", "id", "method", "params"],
+      "properties": {
+        "jsonrpc": { "const": "2.0" },
+        "id": { "$ref": "#/$defs/request_id" },
+        "method": { "const": "account/refresh" },
+        "params": { "$ref": "#/$defs/NativeRefreshParams" }
+      },
+      "additionalProperties": false
+    },
+    "NativeRefreshParams": {
+      "type": "object",
+      "required": ["account_id", "auth_json"],
+      "properties": {
+        "account_id": { "type": "string", "minLength": 1 },
+        "auth_json": { "type": "object" }
+      },
+      "additionalProperties": false
+    },
+    "NativeRefreshResult": {
+      "type": "object",
+      "properties": {
+        "access_token": { "type": "string" },
+        "id_token": { "type": "string" },
+        "refresh_token": { "type": "string" },
+        "account_id": { "type": "string" }
+      },
+      "minProperties": 1,
+      "additionalProperties": false
+    },
+    "ReleaseRecoveryRequest": {
+      "title": "ReleaseRecovery",
+      "type": "object",
+      "required": ["jsonrpc", "id", "method", "params"],
+      "properties": {
+        "jsonrpc": { "const": "2.0" },
+        "id": { "$ref": "#/$defs/request_id" },
+        "method": { "const": "recovery/release" },
+        "params": { "$ref": "#/$defs/RecoveryReleaseParams" }
+      },
+      "additionalProperties": false
+    },
+    "RecoveryReleaseParams": {
+      "type": "object",
+      "required": ["recovery_id", "transition_id", "expected_generation"],
+      "properties": {
+        "recovery_id": { "type": "string", "minLength": 1 },
+        "thread_id": { "type": "string", "minLength": 1 },
+        "transition_id": { "type": "string", "minLength": 1 },
+        "expected_generation": { "type": "integer", "minimum": 1 }
+      },
+      "additionalProperties": false
+    },
+    "RecoveryReleaseResult": {
+      "type": "object",
+      "required": ["recovery_id", "outcome"],
+      "properties": {
+        "recovery_id": { "type": "string", "minLength": 1 },
+        "thread_id": { "type": "string", "minLength": 1 },
+        "outcome": { "type": "string", "enum": ["released", "already_released", "rejected", "uncertain"] },
+        "error_code": { "type": "string" },
+        "error_message": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
     "CommandResult": {
       "description": "The result member of a successful JSON-RPC response. Select the matching result definition by request method.",
       "oneOf": [
@@ -229,7 +375,11 @@
         { "$ref": "#/$defs/GetRuntimeStateResult" },
         { "$ref": "#/$defs/TransitionResult" },
         { "$ref": "#/$defs/RuntimeIdentity" },
-        { "$ref": "#/$defs/AuthGenerationResult" }
+        { "$ref": "#/$defs/AuthGenerationResult" },
+        { "$ref": "#/$defs/NativeLoginResult" },
+        { "$ref": "#/$defs/NativeAuthSnapshotResult" },
+        { "$ref": "#/$defs/NativeRefreshResult" },
+        { "$ref": "#/$defs/RecoveryReleaseResult" }
       ]
     },
     "method_catalog": {
@@ -250,7 +400,11 @@
         { "name": "CancelAuthTransition", "wire_method": "auth/transition/cancel" },
         { "name": "GetIdentity", "wire_method": "runtime/identity/read" },
         { "name": "GetAuthGeneration", "wire_method": "runtime/authGeneration/read" },
-        { "name": "NegotiateVersion", "wire_method": "protocol/negotiate" }
+        { "name": "NegotiateVersion", "wire_method": "protocol/negotiate" },
+        { "name": "NativeLogin", "wire_method": "account/login" },
+        { "name": "NativeAuthSnapshot", "wire_method": "account/authSnapshot/read" },
+        { "name": "NativeRefresh", "wire_method": "account/refresh" },
+        { "name": "ReleaseRecovery", "wire_method": "recovery/release" }
       ]
     }
   }
