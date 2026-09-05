@@ -11,6 +11,7 @@
   },
   "include": [
     "README.md",
+    "docs/features-and-usage.md",
     "docs/release.md",
     "docs/companion-cli.md",
     "protocol/VERSION",

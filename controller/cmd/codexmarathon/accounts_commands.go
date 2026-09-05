@@ -45,7 +45,7 @@ Usage:
   codexmarathon accounts login [options]
   codexmarathon accounts add [options]
   codexmarathon accounts status [account-id] [options]
-  codexmarathon accounts rename <account-id> --name <alias> [options]
+  codexmarathon accounts rename --name <alias> <account-id> [options]
   codexmarathon accounts activate <account-id> [options]
   codexmarathon accounts use <account-id> [options]
   codexmarathon accounts refresh <account-id> --runtime <endpoint> [options]
