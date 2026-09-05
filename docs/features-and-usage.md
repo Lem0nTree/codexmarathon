@@ -16,8 +16,7 @@ keeps the conversation associated with the same Codex thread.
 
 The important design choice is that CodexMarathon is a companion. The Codex
 CLI is installed separately and remains the program that talks to the model.
-The normal companion archive is small because it contains no duplicate
-`codex-app-server`.
+The companion stays small and works beside that installation.
 
 ## Features
 
@@ -71,16 +70,8 @@ observations are not treated as proof of available quota.
 
 ### Small, safe distribution
 
-The normal archive contains the Go companion and allow-listed documentation,
-protocol, provenance, and license metadata. It does not contain:
-
-- an embedded Codex executable;
-- `auth.json` or credential snapshots;
-- journals or controller state;
-- donor repositories or build caches.
-
-The embedded Rust runtime remains available only as an explicit diagnostic and
-protocol-development package.
+The archive contains the companion and its documentation. It never contains
+your `auth.json`, credential snapshots, journals, or controller state.
 
 ## Install CodexMarathon
 
@@ -161,14 +152,14 @@ Arguments supplied with `--codex-arg` are passed as separate argument values;
 they are not interpreted by a shell. Positional values after the options are
 also forwarded to Codex when the command-line parser accepts them.
 
-If Codex is already running with a compatible local app-server, attach to it:
+If Codex is already running with a compatible local control channel, attach to it:
 
 ```bash
 codexmarathon run --attach-only
 ```
 
 Without `--attach-only`, the command starts the installed Codex executable if
-no compatible control endpoint is available.
+no compatible local control endpoint is available.
 
 ## Manage profiles
 
@@ -219,7 +210,7 @@ instructions before adding the resulting profile.
 
 ## Switch accounts
 
-For a live installed app-server, request a switch by account ID:
+For a live installed Codex session, request a switch by account ID:
 
 ```bash
 codexmarathon switch account-id
@@ -296,8 +287,7 @@ boundary that protects unrelated sessions.
 ### A command asks for `--runtime`
 
 The login and refresh paths require a compatible Marathon authentication
-endpoint. The normal installed-Codex process path uses `run`, `switch`, and the
-app-server control endpoint; it does not require the embedded Rust runtime.
+endpoint. The normal installed-Codex process path uses `run` and `switch`.
 
 ## Developer utilities
 
@@ -318,13 +308,6 @@ Verify a release archive from a clean environment:
 ```bash
 python3 scripts/verify_package.py --artifact dist/release/<artifact>.tar.gz
 python3 scripts/clean_machine_check.py --artifact dist/release/<artifact>.tar.gz
-```
-
-The optional Rust runtime and adapter checks are separate:
-
-```bash
-(cd runtime/codexmarathon-adapter && cargo test)
-(cd runtime/codex-rs && cargo test --locked -p codexmarathon-runtime)
 ```
 
 ## Security model
