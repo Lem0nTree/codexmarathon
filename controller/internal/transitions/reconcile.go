@@ -26,15 +26,15 @@ const (
 // IdentityObservation is the complete non-secret comparison input.  Empty
 // account IDs mean unauthenticated/unknown, never an inferred account.
 type IdentityObservation struct {
-	DesiredAccountID    string
-	PreviousAccountID   string
-	DiskAccountID       string
-	RuntimeAccountID    string
-	ExpectedRuntimeID   string
-	RuntimeID           string
+	DesiredAccountID     string
+	PreviousAccountID    string
+	DiskAccountID        string
+	RuntimeAccountID     string
+	ExpectedRuntimeID    string
+	RuntimeID            string
 	ControllerGeneration uint64
-	RuntimeGeneration   uint64
-	ExpectedGeneration  uint64
+	RuntimeGeneration    uint64
+	ExpectedGeneration   uint64
 }
 
 // ReconciliationObservation is a compatibility alias.

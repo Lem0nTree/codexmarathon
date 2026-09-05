@@ -13,27 +13,26 @@
 //! operations remain in the imported Codex runtime and are supplied through
 //! the hook trait.
 
+use codexmarathon_runtime_adapter::RuntimeAdapter;
+use codexmarathon_runtime_adapter::protocol::{
+    AuthTransitionParams, NativeAuthSnapshotResult, NativeLoginParams, NativeLoginResult,
+    NativeRefreshParams, NativeRefreshResult, RateLimitSnapshot, RecoveryLifecycleEvent,
+    RecoveryReleaseParams, RecoveryReleaseResult, RuntimeEvent, TransitionResult,
+};
 use codexmarathon_runtime_adapter::{
     AdapterError, BackendError, BackendIdentity, BackendRateLimits, BackendReload, CodextBackend,
 };
-use codexmarathon_runtime_adapter::protocol::{
-    AuthTransitionParams, NativeAuthSnapshotResult, NativeLoginParams, NativeLoginResult,
-    NativeRefreshParams, NativeRefreshResult, RateLimitSnapshot, RecoveryReleaseParams,
-    RecoveryLifecycleEvent, RecoveryReleaseResult, RuntimeEvent, TransitionResult,
-};
-use codexmarathon_runtime_adapter::RuntimeAdapter;
 use std::future::Future;
 use std::pin::Pin;
 
 mod native;
 
-pub use native::{CodexNativeRuntime, NativeAuthConfig};
 pub use codexmarathon_runtime_adapter::server::{RuntimeServer, ServerConfig};
+pub use native::{CodexNativeRuntime, NativeAuthConfig};
 
 /// Future returned by the native Codex/TUI recovery command seam.
-pub type NativeRecoveryReleaseFuture = Pin<
-    Box<dyn Future<Output = Result<RecoveryReleaseResult, BackendError>> + Send>,
->;
+pub type NativeRecoveryReleaseFuture =
+    Pin<Box<dyn Future<Output = Result<RecoveryReleaseResult, BackendError>> + Send>>;
 
 /// Native composition hook for releasing Codext's session-owned parked
 /// `UsageLimitExceeded` continuation.
@@ -242,7 +241,7 @@ pub struct EmbeddedRuntime<R> {
     adapter: RuntimeAdapter<NativeBackend<R>>,
 }
 
-impl<R: NativeCodexRuntime> EmbeddedRuntime<R> {
+impl<R: NativeCodexRuntime + Send + 'static> EmbeddedRuntime<R> {
     /// Construct an embedded runtime with the supplied runtime identifier.
     pub fn new(runtime: R, runtime_id: impl Into<String>) -> Result<Self, AdapterError> {
         Ok(Self {
@@ -550,9 +549,7 @@ mod tests {
             "test-runtime",
         )
         .expect("runtime should construct");
-        runtime
-            .read_and_forward_rate_limits()
-            .expect("rate limits");
+        runtime.read_and_forward_rate_limits().expect("rate limits");
         let events = runtime.drain_events();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].base.event_type, "rate_limits_snapshot");

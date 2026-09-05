@@ -1,73 +1,49 @@
-# Transition protocol and reconciliation
+# Account transition and reconciliation
 
-A transition has one controller-generated `transition_id` and one expected
-target generation. For a runtime currently at generation `N`, the controller
-sends `expected_generation = N + 1` in both prepare and commit. The runtime
-must reject a stale or mismatched ID/generation before changing AuthManager.
+CodexMarathon records one transition ID and one expected target generation for
+each account change. The installed Codex process remains authoritative for
+active turns, authentication reload, model transport invalidation, and runtime
+identity.
 
 ```text
-read runtime identity (A, N)
+read installed-Codex identity (A, N)
         |
-prepare(tx, B, N+1)
+prepare transition to B (tx, N+1)
         |
-wait for Codext safe boundary
+supported control: wait safe boundary, reload, invalidate
+or fallback: stop Codex, deploy auth, relaunch and resume
         |
-read latest native Account A snapshot -> protected vault write-back
+read runtime/process identity and active-auth identity
         |
-atomic deploy of B snapshot
-        |
-commit(tx, B, N+1)
-        |
-read runtime identity and disk identity
-        |
-committed only when both report B at N+1
+commit only when both agree on B, N+1, and the same conversation
 ```
 
-The runtime owns the running-turn guard. The controller does not create a
-second turn counter; it consumes `safe_boundary_reached` and falls back to
-state reads. `identity_changed` is meaningful only after the existing Codext
-reload/invalidation/config-refresh path has completed.
-
-When the runtime exposes the native snapshot reader, the coordinator captures
-Account A's latest AuthManager snapshot at that boundary and writes it to the
-same protected vault used by deployment. This preserves any token refresh that
-occurred during the interrupted turn before Account B replaces `auth.json`.
+The companion captures refreshed fields from Account A before deployment,
+atomically writes Account B's opaque snapshot, and verifies the target after
+reload or after the resumed process starts. It never treats an `auth.json`
+mtime, a successful file rename, or an uncorrelated process exit as proof of a
+committed switch.
 
 ## Outcomes
 
-* `committed`: disk and runtime agree at the expected generation.
-* `rejected`: the runtime gave a correlated domain rejection before adoption.
-* `uncertain`: an IPC, journal, deployment, or verification failure means the
-  controller cannot prove whether a state-changing operation was applied.
+- `committed`: installed Codex and the deployed credential agree on B at the
+  expected generation, with the intended conversation identity.
+- `rejected`: the installed process rejected the correlated transition before
+  adoption; the previous account remains active.
+- `uncertain`: a process, IPC, journal, or verification failure leaves the
+  effect unknown. The journal blocks a new transition until the same ID is
+  reconciled.
 
-An uncertain record blocks a new transition. Reconcile the same ID by reading
-runtime and disk authorities. If both already agree, adopt the committed
-state; if only the disk has advanced, retry the same correlated commit; if
-both remain at the previous identity, close as rejected. Split-brain or
-generation mismatch stays unresolved and requires operator investigation.
+For an uncertain transition, reconnect to the same installed Codex process or
+resume the recorded conversation, read both authorities, and resolve only
+when the account/generation/thread evidence agrees. If the process was lost,
+the controlled restart path uses the recorded executable and resume identity;
+it does not launch a different Codex installation or submit a duplicate
+recovery.
 
-## Generation compatibility
+## Safety requirements
 
-The Go controller and fake runtime define `expected_generation` as the target
-generation (`current + 1`). The standalone adapter must use the same meaning
-when it is connected to the controller. This explicit rule avoids the unsafe
-failure mode where one side interprets the same command as current generation
-and the other as next generation.
-
-## Interrupted-turn recovery
-
-Codext's native `UsageLimitExceeded` path parks its configured synthetic
-resume turn in the same thread and retains ordering with user-queued input.
-CodexMarathon observes that parked recovery by `recovery_id`; it does not copy
-the prompt or submit a replacement turn. A policy decision may keep the
-recovery in `waiting_for_capacity` while every configured account is exhausted
-or until the earliest reset.
-
-After the transition coordinator proves runtime identity, deployed identity,
-and `auth_generation` all match Account B, the controller durably records a
-`RecoveryReleaseRequested` event and sends `recovery/release`. The runtime
-returns `released` or `already_released` without creating another prompt. A
-lost response remains `release_requested`; on reconnect, the controller reads
-runtime identity/recovery state and retries the same ID only when the verified
-target generation is still active. Recovery journal records contain only IDs,
-account names, generations, phases, and bounded diagnostic reasons.
+The local control transport must be user-scoped and authenticated by the
+operating system. The fallback must confirm a clean process exit before
+writing the active credential. Both paths must preserve Codex's own recovery
+queue and release it once, after identity verification.

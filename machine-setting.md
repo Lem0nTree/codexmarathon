@@ -1,30 +1,27 @@
 # Ubuntu development-machine setup
 
-This prepares a clean Ubuntu 22.04 or 24.04 instance to build and test the Go
-controller, Rust adapter/integrated Codex runtime, integration tests, protocol
-files, and repository formatting tools.
-
-The pinned donor requirements currently imply:
-
-- Go 1.25.4 for reused codex-switch code (`donor/codex-switch/go.mod`).
-- Rust 1.95.0 with rustfmt, clippy, and rust-src (`donor/codext/rust-toolchain.toml`).
-- Node.js 22+ and pnpm 10.34.5 for Codext repository maintenance.
-- PowerShell 7 for `verify.ps1` (optional on Ubuntu; native commands are also
-  listed below).
+The normal CodexMarathon release is a Go companion for a separately installed
+Codex CLI. Go, Python, Git, and the existing Codex executable are enough for
+companion development and live handoff tests. Cargo is needed only when
+working on the optional local-control adapter or building the explicitly
+opt-in embedded-runtime package.
 
 ## 1. Install operating-system packages
 
 ```bash
 sudo apt-get update
 sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-  build-essential ca-certificates curl file git jq pkg-config unzip xz-utils \
-  clang cmake libclang-dev libssl-dev libsqlite3-dev protobuf-compiler \
-  libcap-dev libseccomp-dev zlib1g-dev
+  build-essential ca-certificates curl file git jq pkg-config unzip xz-utils
 ```
 
-## 2. Install Go 1.25.4
+The imported optional runtime may additionally need `clang`, `cmake`,
+`libclang-dev`, `libssl-dev`, `libsqlite3-dev`, `protobuf-compiler`,
+`libcap-dev`, `libseccomp-dev`, and `zlib1g-dev`.
 
-This installs Go under `/opt` and leaves an existing `/usr/local/go` untouched.
+## 2. Install Go
+
+Use Go 1.22 or newer. The following installs the version used by the release
+checks and maps the host architecture correctly:
 
 ```bash
 GO_VERSION=1.25.4
@@ -41,121 +38,86 @@ sudo tar -C "/opt/go${GO_VERSION}" --strip-components=1 \
 sudo ln -sfn "/opt/go${GO_VERSION}/bin/go" /usr/local/bin/go
 sudo ln -sfn "/opt/go${GO_VERSION}/bin/gofmt" /usr/local/bin/gofmt
 rm "go${GO_VERSION}.linux-${GO_ARCH}.tar.gz"
-
 go version
 ```
 
-## 3. Install the pinned Rust toolchain
+## 3. Install and verify Codex
+
+Install Codex through its normal distribution and ensure the executable is
+available:
+
+```bash
+command -v codex
+codex --version
+```
+
+If it is installed elsewhere, retain the absolute path and pass it to the
+companion's `--codex` option for acceptance tests. Use a disposable
+`CODEX_HOME` and test account when exercising authentication or process
+handoff.
+
+## 4. Run the companion checks
+
+From the repository root:
+
+```bash
+(cd controller && go mod download && go test ./... && go vet ./...)
+(cd integration && go mod download && go test ./...)
+python3 scripts/test_package_release.py
+python3 scripts/verify_provenance.py --root .
+python3 scripts/verify_package.py --root .
+python3 scripts/verify_protocol.py --root .
+```
+
+Build the normal Linux companion package:
+
+```bash
+bash scripts/build-release.sh
+```
+
+On an ARM64 machine this produces `linux-aarch64`; on amd64 it produces
+`linux-x86_64`. The build compiles only the Go companion and does not invoke
+Cargo.
+
+## 5. Optional Rust adapter/runtime work
+
+Install the pinned Rust toolchain only if you need the local-control adapter
+or optional self-contained package:
 
 ```bash
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
   | sh -s -- -y --profile minimal --default-toolchain 1.95.0
 source "$HOME/.cargo/env"
-
 rustup component add --toolchain 1.95.0 rustfmt clippy rust-src
-rustc --version
-cargo --version
-```
 
-Install the Codext workspace helpers:
-
-```bash
-cargo install --locked just
-cargo install --locked dotslash
-cargo install --locked cargo-nextest
-just --version
-cargo nextest --version
-```
-
-## 4. Install Node.js 22 and pnpm 10.34.5
-
-Node is used for Codext repository-wide schema/formatting maintenance, not for
-the CodexMarathon runtime itself.
-
-```bash
-curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
-sudo DEBIAN_FRONTEND=noninteractive apt-get install -y nodejs
-sudo corepack enable
-sudo corepack prepare pnpm@10.34.5 --activate
-
-node --version
-pnpm --version
-```
-
-## 5. Optional: install PowerShell 7
-
-Ubuntu 22.04 and 24.04 can install PowerShell from Microsoft's package feed.
-The repository can otherwise be tested with the native commands in the next
-section.
-
-```bash
-source /etc/os-release
-curl -fLO "https://packages.microsoft.com/config/ubuntu/${VERSION_ID}/packages-microsoft-prod.deb"
-sudo dpkg -i packages-microsoft-prod.deb
-rm packages-microsoft-prod.deb
-sudo apt-get update
-sudo DEBIAN_FRONTEND=noninteractive apt-get install -y powershell
-pwsh --version
-```
-
-## 6. Fetch dependencies and run current tests
-
-From the CodexMarathon repository root:
-
-```bash
-git submodule status || true
-
-(cd controller && go mod download && go test ./...)
-(cd integration && go mod download && go test ./...)
 (cd runtime/codexmarathon-adapter && cargo test)
-
-jq empty protocol/protocol.json
-jq empty protocol/commands.json
-jq empty protocol/events.json
-test "$(tr -d '\r\n ' < protocol/VERSION)" = "1"
+(cd runtime/codex-rs && cargo test --locked -p codexmarathon-runtime)
+CODEXMARATHON_INCLUDE_EMBEDDED_RUNTIME=1 bash scripts/build-release.sh
 ```
 
-If PowerShell was installed, also run the repository verifier:
+The optional build can consume substantial temporary disk space because Cargo
+retains intermediate objects. The resulting companion archive remains small;
+the large Rust target tree is a build cache and is not included by default.
+
+## 6. Formatting and repository verifier
+
+```bash
+find controller -name '*.go' -type f -print0 | xargs -0 gofmt -w
+find integration -name '*.go' -type f -print0 | xargs -0 gofmt -w
+```
+
+On a machine with PowerShell 7, run:
 
 ```bash
 pwsh -NoProfile -File ./verify.ps1
 ```
 
-## 7. Build the current components
+The verifier reports missing optional toolchains as `BLOCKED`; it does not
+turn an unavailable Rust or live Codex check into a pass.
 
-```bash
-mkdir -p build
-(cd controller && go build -o ../build/codexmarathon-controller ./cmd/codexmarathon)
-(cd runtime/codexmarathon-adapter && cargo build --release)
-```
+## Recommended capacity
 
-Build and test the tracked embedded runtime baseline with:
-
-```bash
-cd runtime/codex-rs
-cargo build -p codex-cli -p codexmarathon-runtime
-cargo test -p codex-app-server-protocol
-# Run the full suite only after focused packages pass:
-cargo nextest run
-```
-
-## 8. Formatting and quality checks
-
-```bash
-find controller -name '*.go' -type f -print0 | xargs -0 gofmt -w
-find integration -name '*.go' -type f -print0 | xargs -0 gofmt -w
-(cd controller && go vet ./...)
-(cd integration && go vet ./...)
-(cd runtime/codexmarathon-adapter && cargo fmt --check && cargo clippy --all-targets -- -D warnings)
-```
-
-For the imported Codext runtime, follow its in-tree `AGENTS.md` and upstream
-reapply guardrails. Some donor branches intentionally restrict formatting or
-test changes during an upstream reapply; repository instructions take priority.
-
-## 9. Recommended machine capacity
-
-- 4 CPU cores minimum; 8+ recommended.
-- 8 GB RAM minimum; 16 GB recommended for full Rust workspace tests.
-- At least 30 GB free disk for Rust targets, caches, and parallel builds.
-- Ubuntu 22.04/24.04 x86_64 or arm64.
+- 2 CPU cores and 2 GB RAM are sufficient for the normal Go companion build.
+- 4+ cores and 8 GB RAM are recommended for optional Rust compilation.
+- Keep at least 5 GB free for normal tests and packaging.
+- Keep at least 30 GB free only when compiling the full optional Codex runtime.

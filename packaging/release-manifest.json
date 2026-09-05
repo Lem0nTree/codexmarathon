@@ -2,13 +2,17 @@
   "schema_version": 1,
   "product": "codexmarathon",
   "artifact_root": "codexmarathon-{version}-{platform}",
+  "distribution": "companion",
   "entrypoints": {
-    "controller": "codexmarathon",
+    "controller": "codexmarathon"
+  },
+  "optional_entrypoints": {
     "runtime": "codexmarathon-runtime"
   },
   "include": [
     "README.md",
     "docs/release.md",
+    "docs/companion-cli.md",
     "protocol/VERSION",
     "protocol/protocol.json",
     "protocol/commands.json",

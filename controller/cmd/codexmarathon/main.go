@@ -1,5 +1,5 @@
 // Command codexmarathon is the decision-first operator CLI and one-command
-// launcher for the bundled Codex runtime.
+// launcher for the user's installed Codex CLI.
 package main
 
 import (
@@ -16,6 +16,7 @@ import (
 	"codexmarathon/controller/app"
 	"codexmarathon/controller/internal/journal"
 	"codexmarathon/controller/internal/policy"
+	installedruntime "codexmarathon/controller/internal/runtime"
 	"codexmarathon/controller/internal/transitions"
 )
 
@@ -35,12 +36,14 @@ Usage:
   codexmarathon accounts use <account-id> [options]
   codexmarathon accounts refresh <account-id> --runtime <endpoint> [options]
   codexmarathon accounts remove <account-id> [options]
-  codexmarathon transition <account-id> --runtime <endpoint> [options]
+  codexmarathon transition <account-id> [options]
+  codexmarathon switch <account-id> [options]
   codexmarathon reconcile [transition-id] --runtime <endpoint> [options]
 
-Options are command-local. The launcher defaults to a user-scoped Unix socket
-or Windows named pipe and refuses unauthenticated TCP. Runtime endpoints can
-be supplied explicitly only when they remain inside that local IPC policy.
+Options are command-local. The launcher discovers the installed Codex CLI from
+--codex, CODEX_BIN, or PATH. It prefers the installed app-server's user-scoped
+local control socket and uses controlled restart/resume when live reload is not
+available. A bundled Marathon runtime is used only with explicit runtime flags.
 `
 
 func main() {
@@ -62,6 +65,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 	case "accounts":
 		return runAccounts(args[1:], stdout, stderr)
 	case "transition":
+		return runTransition(args[1:], stdout, stderr)
+	case "switch":
 		return runTransition(args[1:], stdout, stderr)
 	case "reconcile":
 		return runReconcile(args[1:], stdout, stderr)
@@ -179,10 +184,10 @@ func runStatus(args []string, stdout, stderr io.Writer) int {
 		state, stateErr := controller.RuntimeState(context.Background())
 		if stateErr == nil {
 			status.Runtime = &runtimeView{
-				RuntimeID:        state.Identity.RuntimeID,
-				AccountID:        optionalID(state.Identity.AccountID),
-				AuthGeneration:   state.Identity.AuthGeneration,
-				ActiveTurnCount:  state.ActiveTurnCount,
+				RuntimeID:         state.Identity.RuntimeID,
+				AccountID:         optionalID(state.Identity.AccountID),
+				AuthGeneration:    state.Identity.AuthGeneration,
+				ActiveTurnCount:   state.ActiveTurnCount,
 				PendingTransition: state.PendingTransition != nil,
 			}
 		} else {
@@ -242,6 +247,16 @@ func runAccountsList(args []string, stdout, stderr io.Writer) int {
 }
 
 func runTransition(args []string, stdout, stderr io.Writer) int {
+	if !hasRunFlag(args, "--runtime") {
+		return runInstalledTransition(args, stdout, stderr)
+	}
+	return runManagedTransition(args, stdout, stderr)
+}
+
+// runManagedTransition retains the explicit legacy Marathon protocol path.
+// It is selected only when --runtime is supplied; normal transition/switch
+// commands use the installed Codex app-server below.
+func runManagedTransition(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("transition", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	var paths pathFlags
@@ -278,6 +293,58 @@ func runTransition(args []string, stdout, stderr io.Writer) int {
 		return printError(stderr, err)
 	}
 	return 0
+}
+
+func runInstalledTransition(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("transition", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	var paths pathFlags
+	paths.bind(fs)
+	codexPath := fs.String("codex", "", "installed Codex executable (default: codex on PATH or CODEX_BIN)")
+	codexHome := fs.String("codex-home", "", "Codex home containing the app-server control socket")
+	controlEndpoint := fs.String("app-server-endpoint", "", "explicit installed app-server endpoint")
+	timeout := fs.Duration("timeout", 2*time.Minute, "maximum transition duration")
+	jsonOutput := fs.Bool("json", false, "print machine-readable JSON")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if fs.NArg() != 1 {
+		return usageError(stderr, "transition requires exactly one target account id")
+	}
+	controller, err := app.New(paths.config())
+	if err != nil {
+		return printError(stderr, err)
+	}
+	defer func() { _ = controller.Close() }()
+	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
+	defer cancel()
+	installation, err := app.DiscoverInstalledCodex(ctx, installedDiscoveryOptions(*codexPath, *codexHome))
+	if err != nil {
+		return printError(stderr, err)
+	}
+	endpoint := strings.TrimSpace(*controlEndpoint)
+	if endpoint == "" {
+		endpoint = installation.ControlSocket
+	}
+	client, err := app.ConnectInstalledCodexEndpoint(ctx, endpoint)
+	if err != nil {
+		return printError(stderr, fmt.Errorf("connect installed Codex app-server at %s: %w; start Codex through `codexmarathon run` to enable controlled restart/resume when live reload is unavailable", endpoint, err))
+	}
+	defer func() { _ = client.Close() }()
+	result, err := controller.TransitionInstalled(ctx, client, fs.Arg(0))
+	if result.AccountID != "" && *jsonOutput {
+		_ = writeJSON(stdout, result)
+	} else if result.AccountID != "" {
+		_, _ = fmt.Fprintf(stdout, "transition: mode=%s account=%s verified=%t\n", result.Mode, result.AccountID, result.IdentityVerified)
+	}
+	if err != nil {
+		return printError(stderr, err)
+	}
+	return 0
+}
+
+func installedDiscoveryOptions(codexPath, codexHome string) installedruntime.DiscoveryOptions {
+	return installedruntime.DiscoveryOptions{Executable: codexPath, CodexHome: codexHome}
 }
 
 func runReconcile(args []string, stdout, stderr io.Writer) int {

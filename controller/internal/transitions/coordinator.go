@@ -98,13 +98,13 @@ func (c *Coordinator) RequestTransition(ctx context.Context, targetAccountID str
 	c.mu.Unlock()
 
 	if err := c.append(journal.Event{
-		Type:            journal.TransitionCreated,
-		TransitionID:    transitionID,
-		AuthGeneration:  initial.Identity.AuthGeneration,
+		Type:               journal.TransitionCreated,
+		TransitionID:       transitionID,
+		AuthGeneration:     initial.Identity.AuthGeneration,
 		ExpectedGeneration: params.ExpectedGeneration,
-		RuntimeID:       initial.Identity.RuntimeID,
-		FromAccountID:   record.state.CurrentAccountID,
-		TargetAccountID: targetAccountID,
+		RuntimeID:          initial.Identity.RuntimeID,
+		FromAccountID:      record.state.CurrentAccountID,
+		TargetAccountID:    targetAccountID,
 	}); err != nil {
 		return c.markUncertain(transitionID, fmt.Errorf("journal transition creation: %w", err))
 	}
@@ -641,7 +641,7 @@ func (c *Coordinator) markUncertain(transitionID string, reason error) (*Transit
 		AccountID:       state.DiskAccountID,
 		TargetAccountID: state.TargetAccountID,
 		Outcome:         string(TransitionUncertain),
-		Reason:           reason.Error(),
+		Reason:          reason.Error(),
 	})
 	return &result, reason
 }

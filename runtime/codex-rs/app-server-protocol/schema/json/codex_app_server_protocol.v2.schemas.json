@@ -4131,6 +4131,137 @@
         }
       ]
     },
+    "CodexMarathonRecoveryLifecycleNotification": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "description": "Lifecycle observation emitted by the embedded Codex TUI for the native Marathon recovery seam. The TUI sends this only after its existing pending synthetic turn is created, dispatched, or completed. It carries metadata, never prompt text or credentials.",
+      "properties": {
+        "errorCode": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "eventType": {
+          "description": "One of `recovery_parked`, `recovery_started`, or `recovery_completed`.",
+          "type": "string"
+        },
+        "outcome": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "recoveryId": {
+          "type": "string"
+        },
+        "sourceAccountId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "threadId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "turnId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "eventType",
+        "recoveryId"
+      ],
+      "title": "CodexMarathonRecoveryLifecycleNotification",
+      "type": "object"
+    },
+    "CodexMarathonRecoveryReleaseNotification": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "description": "Internal command from the embedded Marathon authority to the Codex TUI.\n\nThe TUI already owns the parked `UsageLimitExceeded` continuation.  This notification is only an authorization hand-off; it does not carry prompt text and must never be interpreted as a request to create another turn.",
+      "properties": {
+        "expectedGeneration": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "recoveryId": {
+          "type": "string"
+        },
+        "threadId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "transitionId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "expectedGeneration",
+        "recoveryId",
+        "transitionId"
+      ],
+      "title": "CodexMarathonRecoveryReleaseNotification",
+      "type": "object"
+    },
+    "CodexMarathonRecoveryReleaseResultNotification": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "description": "Result sent by the TUI after applying a Marathon release command to the session-owned pending recovery state.\n\nThe result is intentionally string-shaped at this upstream protocol seam; the Marathon adapter maps it to its typed release outcome without making the Codex app-server protocol depend on Marathon crates.",
+      "properties": {
+        "errorCode": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "errorMessage": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "expectedGeneration": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "outcome": {
+          "type": "string"
+        },
+        "recoveryId": {
+          "type": "string"
+        },
+        "threadId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "transitionId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "expectedGeneration",
+        "outcome",
+        "recoveryId",
+        "transitionId"
+      ],
+      "title": "CodexMarathonRecoveryReleaseResultNotification",
+      "type": "object"
+    },
     "CodexResponseHandoffMode": {
       "enum": [
         "thinking",
@@ -8166,6 +8297,10 @@
         "refreshToken": {
           "description": "When `true`, requests a proactive token refresh before returning.\n\nIn managed auth mode this triggers the normal refresh-token flow. In external auth mode this flag is ignored. Clients should refresh tokens themselves and call `account/login/start` with `chatgptAuthTokens`.",
           "type": "boolean"
+        },
+        "reloadAuthFromStorage": {
+          "description": "When `true`, reloads the auth snapshot from storage before returning.\n\nThis keeps long-lived clients in sync with `auth.json` updates without requiring a full app-server restart.",
+          "type": "boolean"
         }
       },
       "title": "GetAccountParams",
@@ -8232,11 +8367,16 @@
             }
           ]
         },
+        "authChanged": {
+          "description": "Whether this request reloaded a different auth snapshot from storage.",
+          "type": "boolean"
+        },
         "requiresOpenaiAuth": {
           "type": "boolean"
         }
       },
       "required": [
+        "authChanged",
         "requiresOpenaiAuth"
       ],
       "title": "GetAccountResponse",
@@ -16503,6 +16643,27 @@
             "params"
           ],
           "title": "ModelProvider/authRecoveryCompletedNotification",
+          "type": "object"
+        },
+        {
+          "description": "Internal-only command consumed by the embedded Codex TUI. It releases the TUI-owned pending usage-limit continuation after Marathon has verified an identity-changing transition.",
+          "properties": {
+            "method": {
+              "enum": [
+                "codexmarathon/recovery/release"
+              ],
+              "title": "Codexmarathon/recovery/releaseNotificationMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/CodexMarathonRecoveryReleaseNotification"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "title": "Codexmarathon/recovery/releaseNotification",
           "type": "object"
         },
         {

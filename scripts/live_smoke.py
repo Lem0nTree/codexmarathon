@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""Exercise the compiled embedded runtime over its Unix IPC boundary.
+"""Exercise an explicitly built optional embedded runtime over Unix IPC.
 
-This is intentionally a small unauthenticated smoke: it proves that the
-actual packaged app-server can start, expose the Marathon listener, negotiate
-protocol v1, and answer an identity read. It does not claim OAuth, quota, or
-task-continuation success.
+This check applies only to the opt-in self-contained package variant. It
+proves that the optional app-server can start, expose the Marathon listener,
+negotiate protocol v1, and answer an identity read. The normal companion
+package uses the user's separately installed Codex executable and does not
+run this binary. This smoke does not claim OAuth, quota, or task-continuation
+success.
 """
 
 from __future__ import annotations
@@ -65,7 +67,7 @@ def run(binary: Path, timeout: float) -> int:
         )
         return 2
     if not binary.is_file():
-        print(f"BLOCKED: embedded runtime binary not found: {binary}")
+        print(f"BLOCKED: optional embedded runtime binary not found: {binary}")
         return 2
     with tempfile.TemporaryDirectory(prefix="codexmarathon-live-") as temporary:
         root = Path(temporary)
@@ -108,7 +110,7 @@ def run(binary: Path, timeout: float) -> int:
                 result = identity.get("result")
                 if identity.get("error") is not None or not isinstance(result, dict) or not result.get("runtime_id"):
                     raise RuntimeError(f"runtime identity read failed: {identity}")
-                print(f"PASS: live embedded runtime smoke: runtime_id={result['runtime_id']} generation={result.get('auth_generation', 0)}")
+                print(f"PASS: live optional embedded runtime smoke: runtime_id={result['runtime_id']} generation={result.get('auth_generation', 0)}")
             process.terminate()
             try:
                 process.wait(timeout=5)
@@ -134,7 +136,7 @@ def main(argv: list[str]) -> int:
     try:
         return run(args.runtime_binary.resolve(), args.timeout)
     except (OSError, RuntimeError) as error:
-        print(f"FAIL: live embedded runtime smoke: {error}")
+        print(f"FAIL: live optional embedded runtime smoke: {error}")
         return 1
 
 

@@ -772,6 +772,34 @@
         }
       ]
     },
+    "CodexMarathonRecoveryReleaseNotification": {
+      "description": "Internal command from the embedded Marathon authority to the Codex TUI.\n\nThe TUI already owns the parked `UsageLimitExceeded` continuation.  This notification is only an authorization hand-off; it does not carry prompt text and must never be interpreted as a request to create another turn.",
+      "properties": {
+        "expectedGeneration": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "recoveryId": {
+          "type": "string"
+        },
+        "threadId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "transitionId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "expectedGeneration",
+        "recoveryId",
+        "transitionId"
+      ],
+      "type": "object"
+    },
     "CollabAgentState": {
       "properties": {
         "message": {
@@ -7840,6 +7868,27 @@
         "params"
       ],
       "title": "ModelProvider/authRecoveryCompletedNotification",
+      "type": "object"
+    },
+    {
+      "description": "Internal-only command consumed by the embedded Codex TUI. It releases the TUI-owned pending usage-limit continuation after Marathon has verified an identity-changing transition.",
+      "properties": {
+        "method": {
+          "enum": [
+            "codexmarathon/recovery/release"
+          ],
+          "title": "Codexmarathon/recovery/releaseNotificationMethod",
+          "type": "string"
+        },
+        "params": {
+          "$ref": "#/definitions/CodexMarathonRecoveryReleaseNotification"
+        }
+      },
+      "required": [
+        "method",
+        "params"
+      ],
+      "title": "Codexmarathon/recovery/releaseNotification",
       "type": "object"
     },
     {

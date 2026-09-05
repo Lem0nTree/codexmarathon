@@ -61,11 +61,11 @@ func TestClientCallAndDecodeEvent(t *testing.T) {
 			"jsonrpc": "2.0",
 			"method":  string(EventNotificationMethod),
 			"params": map[string]any{
-				"event_type":      string(EventIdentityChanged),
-				"occurred_at":     1725451200,
-				"runtime_id":      "runtime-test",
-				"auth_generation": 8,
-				"transition_id":   "tx-8",
+				"event_type":          string(EventIdentityChanged),
+				"occurred_at":         1725451200,
+				"runtime_id":          "runtime-test",
+				"auth_generation":     8,
+				"transition_id":       "tx-8",
 				"previous_account_id": "account-a",
 				"account_id":          "account-b",
 			},
@@ -124,7 +124,7 @@ func TestClientRejectsUnsupportedNegotiatedVersion(t *testing.T) {
 			"id":      request["id"],
 			"result": map[string]any{
 				"protocol_version": 2,
-				"server_versions":   []int{2},
+				"server_versions":  []int{2},
 			},
 		})
 	}()

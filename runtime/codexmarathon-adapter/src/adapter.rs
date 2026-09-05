@@ -45,8 +45,7 @@ pub struct BackendReload {
 #[derive(Clone, Debug, PartialEq)]
 pub struct BackendRateLimits {
     pub rate_limits: RateLimitSnapshot,
-    pub rate_limits_by_limit_id:
-        Option<std::collections::BTreeMap<String, RateLimitSnapshot>>,
+    pub rate_limits_by_limit_id: Option<std::collections::BTreeMap<String, RateLimitSnapshot>>,
 }
 
 /// Implement this trait in the Codext integration patch.
@@ -470,9 +469,7 @@ impl<B: CodextBackend> RuntimeAdapter<B> {
         &mut self,
         params: NativeLoginParams,
     ) -> Result<NativeLoginResult, AdapterError> {
-        params
-            .validate()
-            .map_err(AdapterError::InvalidParams)?;
+        params.validate().map_err(AdapterError::InvalidParams)?;
         let result = self.backend.login_account(params)?;
         result.validate().map_err(AdapterError::Protocol)?;
         Ok(result)
@@ -488,9 +485,7 @@ impl<B: CodextBackend> RuntimeAdapter<B> {
         &mut self,
         params: NativeRefreshParams,
     ) -> Result<NativeRefreshResult, AdapterError> {
-        params
-            .validate()
-            .map_err(AdapterError::InvalidParams)?;
+        params.validate().map_err(AdapterError::InvalidParams)?;
         let requested_account_id = params.account_id.clone();
         let result = self.backend.refresh_account(params)?;
         result
@@ -501,9 +496,7 @@ impl<B: CodextBackend> RuntimeAdapter<B> {
 
     fn negotiate(&mut self, params: Value) -> Result<Value, AdapterError> {
         let params: VersionNegotiationParams = decode_params(params)?;
-        params
-            .validate()
-            .map_err(AdapterError::InvalidParams)?;
+        params.validate().map_err(AdapterError::InvalidParams)?;
         let Some(version) = self
             .protocol_versions
             .iter()
@@ -538,10 +531,11 @@ impl<B: CodextBackend> RuntimeAdapter<B> {
         Ok(serde_json::to_value(result)?)
     }
 
-    pub fn prepare(&mut self, params: AuthTransitionParams) -> Result<TransitionResult, AdapterError> {
-        params
-            .validate()
-            .map_err(AdapterError::InvalidParams)?;
+    pub fn prepare(
+        &mut self,
+        params: AuthTransitionParams,
+    ) -> Result<TransitionResult, AdapterError> {
+        params.validate().map_err(AdapterError::InvalidParams)?;
         // The controller sends the generation that the transition is meant
         // to install (current + 1), not the generation currently loaded.
         // Keeping this check here makes stale prepare commands harmless and
@@ -581,10 +575,11 @@ impl<B: CodextBackend> RuntimeAdapter<B> {
         Ok(self.accepted_result(&params))
     }
 
-    pub fn commit(&mut self, params: AuthTransitionParams) -> Result<TransitionResult, AdapterError> {
-        params
-            .validate()
-            .map_err(AdapterError::InvalidParams)?;
+    pub fn commit(
+        &mut self,
+        params: AuthTransitionParams,
+    ) -> Result<TransitionResult, AdapterError> {
+        params.validate().map_err(AdapterError::InvalidParams)?;
         let Some(existing) = self.pending.as_ref() else {
             return Ok(self.rejected_result(
                 &params,
@@ -678,9 +673,9 @@ impl<B: CodextBackend> RuntimeAdapter<B> {
         };
 
         let new_generation = if reload.changed {
-            old_generation.checked_add(1).ok_or_else(|| {
-                AdapterError::Protocol("auth_generation overflow".to_string())
-            })?
+            old_generation
+                .checked_add(1)
+                .ok_or_else(|| AdapterError::Protocol("auth_generation overflow".to_string()))?
         } else {
             old_generation
         };
@@ -714,11 +709,7 @@ impl<B: CodextBackend> RuntimeAdapter<B> {
                 },
             )?;
             self.pending = None;
-            return Ok(self.rejected_result(
-                &params,
-                "identity_mismatch",
-                message,
-            ));
+            return Ok(self.rejected_result(&params, "identity_mismatch", message));
         }
         self.identity.account_id = reload.identity.account_id.clone();
         self.identity.auth_generation = new_generation;
@@ -774,9 +765,7 @@ impl<B: CodextBackend> RuntimeAdapter<B> {
         &mut self,
         params: CancelAuthTransitionParams,
     ) -> Result<TransitionResult, AdapterError> {
-        params
-            .validate()
-            .map_err(AdapterError::InvalidParams)?;
+        params.validate().map_err(AdapterError::InvalidParams)?;
         let Some(existing) = self.pending.as_ref() else {
             return Ok(self.rejected_cancel_result(
                 &params,
@@ -825,7 +814,10 @@ impl<B: CodextBackend> RuntimeAdapter<B> {
         self.observe_turn_count_value(active_turn_count)
     }
 
-    pub fn observe_turn_count_value(&mut self, active_turn_count: u32) -> Result<bool, AdapterError> {
+    pub fn observe_turn_count_value(
+        &mut self,
+        active_turn_count: u32,
+    ) -> Result<bool, AdapterError> {
         self.last_active_turn_count = active_turn_count;
         let Some(pending) = self.pending.as_ref() else {
             return Ok(false);
@@ -1033,7 +1025,9 @@ impl<B: CodextBackend> RuntimeAdapter<B> {
     ) -> Result<bool, AdapterError> {
         let recovery_id = recovery_id.into();
         if recovery_id.trim().is_empty() {
-            return Err(AdapterError::Protocol("recovery_id is required".to_string()));
+            return Err(AdapterError::Protocol(
+                "recovery_id is required".to_string(),
+            ));
         }
         if !self
             .seen_recovery_events
@@ -1150,9 +1144,7 @@ impl<B: CodextBackend> RuntimeAdapter<B> {
         &mut self,
         params: RecoveryReleaseParams,
     ) -> Result<RecoveryReleaseResult, AdapterError> {
-        params
-            .validate()
-            .map_err(AdapterError::InvalidParams)?;
+        params.validate().map_err(AdapterError::InvalidParams)?;
         if let Some(previous) = self.release_results.get(&params.recovery_id) {
             return Ok(previous.clone());
         }
@@ -1339,7 +1331,11 @@ fn decode_params<T: DeserializeOwned>(params: Value) -> Result<T, AdapterError> 
 }
 
 fn require_empty_params(params: &Value) -> Result<(), AdapterError> {
-    if params.as_object().map(|object| object.is_empty()).unwrap_or(false) {
+    if params
+        .as_object()
+        .map(|object| object.is_empty())
+        .unwrap_or(false)
+    {
         Ok(())
     } else {
         Err(AdapterError::InvalidParams(

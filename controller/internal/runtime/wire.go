@@ -59,19 +59,19 @@ const EventNotificationMethod Method = "codexmarathon/event"
 type EventType string
 
 const (
-	EventRuntimeReady         EventType = "runtime_ready"
-	EventRateLimitsSnapshot   EventType = "rate_limits_snapshot"
-	EventRateLimitsUpdated    EventType = "rate_limits_updated"
-	EventTurnStarted          EventType = "turn_started"
-	EventTurnCompleted        EventType = "turn_completed"
-	EventSafeBoundaryReached  EventType = "safe_boundary_reached"
-	EventAuthReloadStarted    EventType = "auth_reload_started"
-	EventAuthReloadSucceeded  EventType = "auth_reload_succeeded"
-	EventAuthReloadFailed     EventType = "auth_reload_failed"
-	EventIdentityChanged      EventType = "identity_changed"
-	EventRecoveryParked       EventType = "recovery_parked"
-	EventRecoveryStarted      EventType = "recovery_started"
-	EventRecoveryCompleted    EventType = "recovery_completed"
+	EventRuntimeReady        EventType = "runtime_ready"
+	EventRateLimitsSnapshot  EventType = "rate_limits_snapshot"
+	EventRateLimitsUpdated   EventType = "rate_limits_updated"
+	EventTurnStarted         EventType = "turn_started"
+	EventTurnCompleted       EventType = "turn_completed"
+	EventSafeBoundaryReached EventType = "safe_boundary_reached"
+	EventAuthReloadStarted   EventType = "auth_reload_started"
+	EventAuthReloadSucceeded EventType = "auth_reload_succeeded"
+	EventAuthReloadFailed    EventType = "auth_reload_failed"
+	EventIdentityChanged     EventType = "identity_changed"
+	EventRecoveryParked      EventType = "recovery_parked"
+	EventRecoveryStarted     EventType = "recovery_started"
+	EventRecoveryCompleted   EventType = "recovery_completed"
 )
 
 // TransitionOutcome describes the result observed by the runtime.
@@ -120,7 +120,7 @@ type VersionNegotiationParams struct {
 // VersionNegotiationResult is returned after selecting the common version.
 type VersionNegotiationResult struct {
 	ProtocolVersion int   `json:"protocol_version"`
-	ServerVersions   []int `json:"server_versions"`
+	ServerVersions  []int `json:"server_versions"`
 }
 
 // AuthTransitionParams correlates prepare and commit with one controller-owned
@@ -213,23 +213,23 @@ const (
 // RecoveryState contains only correlation metadata. It intentionally has no
 // prompt or credential fields so it is safe to persist in a recovery journal.
 type RecoveryState struct {
-	RecoveryID       string        `json:"recovery_id"`
-	ThreadID         string        `json:"thread_id,omitempty"`
-	TurnID           string        `json:"turn_id,omitempty"`
-	SourceAccountID  string        `json:"source_account_id,omitempty"`
-	TransitionID     string        `json:"transition_id,omitempty"`
-	TargetAccountID  string        `json:"target_account_id,omitempty"`
-	ExpectedGeneration uint64      `json:"expected_generation,omitempty"`
-	Phase            RecoveryPhase `json:"phase"`
+	RecoveryID         string        `json:"recovery_id"`
+	ThreadID           string        `json:"thread_id,omitempty"`
+	TurnID             string        `json:"turn_id,omitempty"`
+	SourceAccountID    string        `json:"source_account_id,omitempty"`
+	TransitionID       string        `json:"transition_id,omitempty"`
+	TargetAccountID    string        `json:"target_account_id,omitempty"`
+	ExpectedGeneration uint64        `json:"expected_generation,omitempty"`
+	Phase              RecoveryPhase `json:"phase"`
 }
 
 // RecoveryReleaseParams identifies the one native parked recovery to release.
 // TransitionID and ExpectedGeneration bind the release to a verified account
 // switch and prevent a stale controller from releasing under Account A.
 type RecoveryReleaseParams struct {
-	RecoveryID       string `json:"recovery_id"`
-	ThreadID         string `json:"thread_id,omitempty"`
-	TransitionID     string `json:"transition_id"`
+	RecoveryID         string `json:"recovery_id"`
+	ThreadID           string `json:"thread_id,omitempty"`
+	TransitionID       string `json:"transition_id"`
 	ExpectedGeneration uint64 `json:"expected_generation"`
 }
 
@@ -237,9 +237,9 @@ type RecoveryReleaseParams struct {
 type RecoveryReleaseOutcome string
 
 const (
-	RecoveryReleased       RecoveryReleaseOutcome = "released"
-	RecoveryAlreadyReleased RecoveryReleaseOutcome = "already_released"
-	RecoveryReleaseRejected RecoveryReleaseOutcome = "rejected"
+	RecoveryReleased         RecoveryReleaseOutcome = "released"
+	RecoveryAlreadyReleased  RecoveryReleaseOutcome = "already_released"
+	RecoveryReleaseRejected  RecoveryReleaseOutcome = "rejected"
 	RecoveryReleaseUncertain RecoveryReleaseOutcome = "uncertain"
 )
 
@@ -247,11 +247,11 @@ const (
 // recovery ID. A repeated request may return already_released without
 // dispatching the native prompt again.
 type RecoveryReleaseResult struct {
-	RecoveryID       string                 `json:"recovery_id"`
-	ThreadID         string                 `json:"thread_id,omitempty"`
-	Outcome          RecoveryReleaseOutcome  `json:"outcome"`
-	ErrorCode        *string                `json:"error_code,omitempty"`
-	ErrorMessage     *string                `json:"error_message,omitempty"`
+	RecoveryID   string                 `json:"recovery_id"`
+	ThreadID     string                 `json:"thread_id,omitempty"`
+	Outcome      RecoveryReleaseOutcome `json:"outcome"`
+	ErrorCode    *string                `json:"error_code,omitempty"`
+	ErrorMessage *string                `json:"error_message,omitempty"`
 }
 
 // RateLimitWindowWire is the intentionally narrow Marathon representation of
@@ -291,11 +291,11 @@ type AccountRateLimitsUpdatedWire struct {
 // EventBase is shared by all runtime events. Transition events additionally
 // require a non-empty TransitionID.
 type EventBase struct {
-	EventType       EventType `json:"event_type"`
-	OccurredAt      int64     `json:"occurred_at"`
-	RuntimeID       string    `json:"runtime_id"`
-	AuthGeneration  uint64    `json:"auth_generation"`
-	TransitionID    string    `json:"transition_id,omitempty"`
+	EventType      EventType `json:"event_type"`
+	OccurredAt     int64     `json:"occurred_at"`
+	RuntimeID      string    `json:"runtime_id"`
+	AuthGeneration uint64    `json:"auth_generation"`
+	TransitionID   string    `json:"transition_id,omitempty"`
 }
 
 // Event is the forward-compatible event representation delivered by Client.
@@ -317,16 +317,16 @@ type RuntimeReadyEvent struct {
 // RateLimitsSnapshotEvent is a complete active-account snapshot.
 type RateLimitsSnapshotEvent struct {
 	EventBase
-	AccountID      *string                         `json:"account_id"`
-	RateLimits     RateLimitSnapshotWire           `json:"rateLimits"`
+	AccountID      *string                          `json:"account_id"`
+	RateLimits     RateLimitSnapshotWire            `json:"rateLimits"`
 	RateLimitsByID map[string]RateLimitSnapshotWire `json:"rateLimitsByLimitId"`
 }
 
 // RateLimitsUpdatedEvent is a sparse active-account update.
 type RateLimitsUpdatedEvent struct {
 	EventBase
-	AccountID  *string                 `json:"account_id"`
-	RateLimits RateLimitSnapshotWire  `json:"rateLimits"`
+	AccountID  *string               `json:"account_id"`
+	RateLimits RateLimitSnapshotWire `json:"rateLimits"`
 }
 
 // TurnStartedEvent marks the beginning of a turn under Codext's turn guard.
@@ -349,8 +349,8 @@ type TurnCompletedEvent struct {
 // running-turn count reaches zero for a prepared transition.
 type SafeBoundaryReachedEvent struct {
 	EventBase
-	Reason  string  `json:"reason"`
-	TurnID  *string `json:"turn_id"`
+	Reason string  `json:"reason"`
+	TurnID *string `json:"turn_id"`
 }
 
 // AuthReloadStartedEvent marks the beginning of AuthManager reload.
@@ -384,10 +384,10 @@ type IdentityChangedEvent struct {
 // RecoveryParkedEvent observes runtime-owned recovery parking.
 type RecoveryParkedEvent struct {
 	EventBase
-	RecoveryID string `json:"recovery_id"`
-	Reason     string `json:"reason"`
-	ThreadID   string `json:"thread_id,omitempty"`
-	TurnID     string `json:"turn_id,omitempty"`
+	RecoveryID      string `json:"recovery_id"`
+	Reason          string `json:"reason"`
+	ThreadID        string `json:"thread_id,omitempty"`
+	TurnID          string `json:"turn_id,omitempty"`
 	SourceAccountID string `json:"source_account_id,omitempty"`
 }
 

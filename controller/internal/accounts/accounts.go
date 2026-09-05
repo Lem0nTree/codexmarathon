@@ -34,25 +34,25 @@ var (
 type CredentialHealth string
 
 const (
-	CredentialHealthUnknown  CredentialHealth = "unknown"
-	CredentialHealthHealthy  CredentialHealth = "healthy"
-	CredentialHealthStale    CredentialHealth = "stale"
-	CredentialHealthInvalid  CredentialHealth = "invalid"
+	CredentialHealthUnknown CredentialHealth = "unknown"
+	CredentialHealthHealthy CredentialHealth = "healthy"
+	CredentialHealthStale   CredentialHealth = "stale"
+	CredentialHealthInvalid CredentialHealth = "invalid"
 )
 
 // Account is the non-secret registry record for one configured identity.
 // Metadata values must be descriptive only; raw auth JSON and token fields are
 // intentionally not representable here.
 type Account struct {
-	ID                string            `json:"id"`
-	Alias             string            `json:"alias,omitempty"`
-	CredentialRef     string            `json:"credential_ref,omitempty"`
-	Metadata          map[string]string `json:"metadata,omitempty"`
-	LastTelemetryAt   *time.Time        `json:"last_telemetry_at,omitempty"`
-	TelemetrySource   string            `json:"telemetry_source,omitempty"`
-	CredentialHealth  CredentialHealth  `json:"credential_health,omitempty"`
-	CreatedAt         time.Time         `json:"created_at"`
-	UpdatedAt         time.Time         `json:"updated_at"`
+	ID               string            `json:"id"`
+	Alias            string            `json:"alias,omitempty"`
+	CredentialRef    string            `json:"credential_ref,omitempty"`
+	Metadata         map[string]string `json:"metadata,omitempty"`
+	LastTelemetryAt  *time.Time        `json:"last_telemetry_at,omitempty"`
+	TelemetrySource  string            `json:"telemetry_source,omitempty"`
+	CredentialHealth CredentialHealth  `json:"credential_health,omitempty"`
+	CreatedAt        time.Time         `json:"created_at"`
+	UpdatedAt        time.Time         `json:"updated_at"`
 }
 
 // RegistryState is the on-disk representation. The map is private to

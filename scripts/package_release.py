@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Assemble and verify a minimal CodexMarathon release archive.
+"""Assemble and verify a CodexMarathon companion release archive.
 
 Only explicit product inputs are copied. The script never walks donor/, build
 trees, controller state, or a user's Codex home, which makes accidental secret
-inclusion materially harder than a broad directory archive.
+inclusion materially harder than a broad directory archive. The normal mode
+copies only the Go companion; the embedded runtime requires an explicit opt-in.
 """
 
 from __future__ import annotations
@@ -83,7 +84,14 @@ def copy_file(root: Path, staging_root: Path, source: Path, destination: str) ->
     check_secret_text(str(safe), target.read_bytes())
 
 
-def make_generated_manifest(staging_root: Path, artifact_root: str, manifest: dict, version: str, platform: str) -> None:
+def make_generated_manifest(
+    staging_root: Path,
+    artifact_root: str,
+    manifest: dict,
+    version: str,
+    platform: str,
+    distribution: str,
+) -> None:
     records = []
     for path in sorted(staging_root.rglob("*")):
         if not path.is_file():
@@ -98,6 +106,7 @@ def make_generated_manifest(staging_root: Path, artifact_root: str, manifest: di
         "product": manifest["product"],
         "version": version,
         "platform": platform,
+        "distribution": distribution,
         "artifact_root": artifact_root,
         "created_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
         "provenance": manifest.get("provenance", {}),
@@ -144,7 +153,15 @@ def build(args: argparse.Namespace) -> Path:
     if not platform or any(char in platform for char in "/\\"):
         fail("platform must be a non-empty path-safe value")
     controller_binary = resolved_input(root, args.controller_binary, "controller binary")
-    runtime_binary = resolved_input(root, args.runtime_binary, "runtime binary", allow_build_output=True)
+    runtime_argument = getattr(args, "runtime_binary", None)
+    include_embedded_runtime = bool(getattr(args, "include_embedded_runtime", False))
+    if include_embedded_runtime and not runtime_argument:
+        fail("--include-embedded-runtime requires --runtime-binary")
+    if not include_embedded_runtime and runtime_argument:
+        fail("--runtime-binary requires the explicit --include-embedded-runtime opt-in")
+    runtime_binary = None
+    if include_embedded_runtime:
+        runtime_binary = resolved_input(root, runtime_argument, "runtime binary", allow_build_output=True)
     include = expected_required_files(manifest)
     source_paths = {relative: resolved_input(root, relative, "allow-listed release input") for relative in include}
     artifact_root = str(manifest.get("artifact_root", "codexmarathon-{version}-{platform}")).format(version=version, platform=platform)
@@ -157,14 +174,24 @@ def build(args: argparse.Namespace) -> Path:
         staging_root = staging_parent / artifact_root
         staging_root.mkdir()
         copy_file(root, staging_root, controller_binary, manifest["entrypoints"]["controller"] + (".exe" if args.windows_exe else ""))
-        copy_file(root, staging_root, runtime_binary, manifest["entrypoints"]["runtime"] + (".exe" if args.windows_exe else ""))
+        if runtime_binary is not None:
+            optional_entrypoints = manifest.get("optional_entrypoints", {})
+            runtime_name = optional_entrypoints.get("runtime")
+            if not isinstance(runtime_name, str) or not runtime_name.strip():
+                fail("manifest optional_entrypoints.runtime is required for embedded-runtime packages")
+            copy_file(root, staging_root, runtime_binary, runtime_name + (".exe" if args.windows_exe else ""))
         for relative, source in sorted(source_paths.items()):
             copy_file(root, staging_root, source, relative)
+        entrypoint_names = {manifest["entrypoints"]["controller"]}
+        if runtime_binary is not None:
+            entrypoint_names.add(runtime_name)
+        entrypoint_names |= {name + ".exe" for name in entrypoint_names}
         for path in staging_root.rglob("*"):
-            if path.is_file() and path.name in {manifest["entrypoints"]["controller"], manifest["entrypoints"]["runtime"], manifest["entrypoints"]["controller"] + ".exe", manifest["entrypoints"]["runtime"] + ".exe"}:
+            if path.is_file() and path.name in entrypoint_names:
                 if os.name != "nt":
                     path.chmod(0o755)
-        make_generated_manifest(staging_root, artifact_root, manifest, version, platform)
+        distribution = "companion-with-embedded-runtime" if include_embedded_runtime else "companion"
+        make_generated_manifest(staging_root, artifact_root, manifest, version, platform, distribution)
         archive_directory(staging_parent, artifact_root, output, args.format)
     # Re-read the final archive. This validates the exact bytes handed to the
     # caller rather than merely trusting the temporary staging directory.
@@ -178,7 +205,15 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--manifest", type=str)
     parser.add_argument("--output", type=Path, default=Path("dist/release"))
     parser.add_argument("--controller-binary", required=True)
-    parser.add_argument("--runtime-binary", required=True)
+    parser.add_argument(
+        "--runtime-binary",
+        help="embedded Codex app-server binary; usable only with --include-embedded-runtime",
+    )
+    parser.add_argument(
+        "--include-embedded-runtime",
+        action="store_true",
+        help="explicitly produce the optional self-contained package variant",
+    )
     parser.add_argument("--platform", required=True)
     parser.add_argument("--version", required=True)
     parser.add_argument("--format", choices=("tar.gz", "zip"), default="tar.gz")

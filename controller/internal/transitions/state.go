@@ -63,14 +63,14 @@ type Result = TransitionResult
 type TransitionPhase string
 
 const (
-	PhaseIdle              TransitionPhase = "idle"
-	PhasePrepared          TransitionPhase = "prepared"
+	PhaseIdle               TransitionPhase = "idle"
+	PhasePrepared           TransitionPhase = "prepared"
 	PhaseWaitingForBoundary TransitionPhase = "waiting_for_boundary"
-	PhaseDeploying         TransitionPhase = "deploying"
-	PhaseCommitSent        TransitionPhase = "commit_sent"
-	PhaseUncertain         TransitionPhase = "uncertain"
-	PhaseCommitted         TransitionPhase = "committed"
-	PhaseRejected          TransitionPhase = "rejected"
+	PhaseDeploying          TransitionPhase = "deploying"
+	PhaseCommitSent         TransitionPhase = "commit_sent"
+	PhaseUncertain          TransitionPhase = "uncertain"
+	PhaseCommitted          TransitionPhase = "committed"
+	PhaseRejected           TransitionPhase = "rejected"
 )
 
 // State is a snapshot of one controller-owned transition.  Copies returned by
@@ -176,20 +176,20 @@ type Config struct {
 // call concurrently.  Network, runtime, deployer, and journal calls happen
 // outside mu; local state remains serialized by mu.
 type Coordinator struct {
-	runtime  Runtime
-	deployer CredentialDeployer
-	snapshotWriter credentials.SnapshotWriter
-	disk     DiskIdentityReader
-	journal  journal.Journal
-	now      Clock
+	runtime              Runtime
+	deployer             CredentialDeployer
+	snapshotWriter       credentials.SnapshotWriter
+	disk                 DiskIdentityReader
+	journal              journal.Journal
+	now                  Clock
 	boundaryPollInterval time.Duration
-	idGenerator         func() string
+	idGenerator          func() string
 
 	mu          sync.Mutex
 	current     *State
 	transitions map[string]*transitionRecord
-	boundary   map[string]chan struct{}
-	sequence   atomic.Uint64
+	boundary    map[string]chan struct{}
+	sequence    atomic.Uint64
 }
 
 type transitionRecord struct {
@@ -314,7 +314,7 @@ func (c *Coordinator) State() (State, bool) {
 	if c.current == nil {
 		return State{}, false
 	}
-	return c.current.state, true
+	return *c.current, true
 }
 
 // CurrentState is a descriptive alias for State.

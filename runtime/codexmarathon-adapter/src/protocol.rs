@@ -555,10 +555,7 @@ impl NativeRefreshResult {
         if requested_account_id.trim().is_empty() {
             return Err("account_id is required".to_string());
         }
-        if self.access_token.is_none()
-            && self.id_token.is_none()
-            && self.refresh_token.is_none()
-        {
+        if self.access_token.is_none() && self.id_token.is_none() && self.refresh_token.is_none() {
             return Err("native refresh returned no token fields".to_string());
         }
         if self
@@ -854,8 +851,8 @@ impl<'de> Deserialize<'de> for RuntimeEvent {
             _ => return Err(serde::de::Error::custom("event must be an object")),
         };
         let base_value = Value::Object(fields.clone());
-        let base: EventBase = serde_json::from_value(base_value)
-            .map_err(serde::de::Error::custom)?;
+        let base: EventBase =
+            serde_json::from_value(base_value).map_err(serde::de::Error::custom)?;
         for field in [
             "event_type",
             "occurred_at",

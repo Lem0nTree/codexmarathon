@@ -11,11 +11,11 @@ import (
 )
 
 type resetCandidate struct {
-	accountID  string
-	limitID    string
-	kind       telemetry.WindowKind
-	resetAt    time.Time
-	duration   int
+	accountID string
+	limitID   string
+	kind      telemetry.WindowKind
+	resetAt   time.Time
+	duration  int
 }
 
 const (
@@ -38,16 +38,16 @@ type SchedulerConfig struct {
 // the controller should re-observe the pool.  It is safe for a policy loop and
 // timer loop to call its methods concurrently.
 type Scheduler struct {
-	mu      sync.Mutex
-	now     func() time.Time
-	config  SchedulerConfig
-	next    time.Time
-	hasNext bool
+	mu          sync.Mutex
+	now         func() time.Time
+	config      SchedulerConfig
+	next        time.Time
+	hasNext     bool
 	dataNext    time.Time
 	hasDataNext bool
 	dataBackoff time.Duration
-	wait    ResetWaitState
-	state   ResetState
+	wait        ResetWaitState
+	state       ResetState
 }
 
 // NewScheduler creates a reset scheduler.  An optional clock is used by
@@ -193,7 +193,7 @@ func (s *Scheduler) Evaluate(accounts []telemetry.AccountTelemetry, now time.Tim
 			ExpectedResetAt:    candidate.resetAt,
 			EnteredAt:          now,
 		}
-		 s.mu.Lock()
+		s.mu.Lock()
 		s.state = ResetWaitForReset
 		s.wait = wait
 		s.next = candidate.resetAt

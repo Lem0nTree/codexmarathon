@@ -79,10 +79,10 @@ const (
 type TriggerType = Trigger
 
 const (
-	Manual              = TriggerManual
-	ProactiveThreshold  = TriggerProactiveThreshold
-	UsageLimitExceeded  = TriggerUsageLimitExceeded
-	ResetRevalidation   = TriggerResetRevalidation
+	Manual             = TriggerManual
+	ProactiveThreshold = TriggerProactiveThreshold
+	UsageLimitExceeded = TriggerUsageLimitExceeded
+	ResetRevalidation  = TriggerResetRevalidation
 )
 
 // Thresholds are the donor watcher's primary/secondary threshold policy,

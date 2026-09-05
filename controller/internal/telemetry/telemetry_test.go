@@ -13,8 +13,8 @@ func TestSparseUpdateAbsentLimitIDIsAmbiguousWithoutMutation(t *testing.T) {
 		AccountID: "account-a",
 		IsUsable:  true,
 		Limits: map[string]LimitTelemetry{
-			"codex":  testLimit("codex", 10, now.Add(time.Hour)),
-			"other":  testLimit("other", 20, now.Add(2*time.Hour)),
+			"codex": testLimit("codex", 10, now.Add(time.Hour)),
+			"other": testLimit("other", 20, now.Add(2*time.Hour)),
 		},
 		Aggregate: ptrLimit(testLimit("codex", 10, now.Add(time.Hour))),
 	})

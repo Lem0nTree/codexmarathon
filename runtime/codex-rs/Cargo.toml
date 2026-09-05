@@ -139,7 +139,6 @@ members = [
     "plugin",
     "model-provider",
     "codexmarathon-runtime",
-    "../codexmarathon-adapter",
 ]
 resolver = "2"
 
@@ -287,7 +286,7 @@ codex-utils-template = { path = "utils/template" }
 codex-v8-poc = { path = "v8-poc" }
 codex-workload-identity = { path = "workload-identity" }
 codex-windows-sandbox = { path = "windows-sandbox-rs" }
-codexmarathon-runtime = { path = "../codexmarathon-runtime" }
+codexmarathon-runtime = { path = "codexmarathon-runtime" }
 codexmarathon-runtime-adapter = { path = "../codexmarathon-adapter" }
 core_test_support = { path = "core/tests/common" }
 mcp_test_support = { path = "mcp-server/tests/common" }

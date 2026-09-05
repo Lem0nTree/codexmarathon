@@ -78,9 +78,9 @@ func TestObserveDoesNotRefreshWithoutRegisteredProvider(t *testing.T) {
 
 func observedAccount(accountID string, observedAt time.Time, usage float64) AccountTelemetry {
 	return AccountTelemetry{
-		AccountID: accountID,
+		AccountID:  accountID,
 		ObservedAt: observedAt,
-		IsUsable: true,
-		Limits: map[string]LimitTelemetry{"codex": {LimitID: "codex", Windows: []WindowTelemetry{{Kind: PrimaryWindow, UsedPercent: usage, ObservedAt: observedAt, Freshness: WindowFresh}}}},
+		IsUsable:   true,
+		Limits:     map[string]LimitTelemetry{"codex": {LimitID: "codex", Windows: []WindowTelemetry{{Kind: PrimaryWindow, UsedPercent: usage, ObservedAt: observedAt, Freshness: WindowFresh}}}},
 	}
 }

@@ -4,7 +4,9 @@
 The check intentionally stops at controller initialization/status.  It proves
 that the packaged controller can create and read its own state without a
 repository, donor checkout, Go/Rust toolchain, or the operator's real Codex
-home.  It does not claim OAuth, provider quota, or continuation success.
+home.  The default companion archive does not need a bundled Codex runtime;
+the optional embedded-runtime entrypoint is inspected when present.  It does
+not claim OAuth, provider quota, or continuation success.
 """
 
 from __future__ import annotations
@@ -59,6 +61,17 @@ def entrypoint(root: Path, expected: str) -> Path:
     return matches[0]
 
 
+def optional_entrypoint(root: Path, expected: str) -> Path | None:
+    matches = sorted(
+        path
+        for path in root.rglob("*")
+        if path.is_file() and path.name in {expected, expected + ".exe"}
+    )
+    if len(matches) > 1:
+        fail(f"expected at most one packaged optional {expected} entrypoint, found {len(matches)}")
+    return matches[0] if matches else None
+
+
 def run_controller(controller: Path, args: list[str], environment: dict[str, str]) -> subprocess.CompletedProcess[str]:
     try:
         return subprocess.run(
@@ -84,6 +97,13 @@ def run_check(root: Path, artifact: Path, manifest: dict, skip_run: bool) -> Non
         extraction.mkdir()
         installed = extract_archive(artifact, extraction)
         controller = entrypoint(installed, str(manifest["entrypoints"]["controller"]))
+        optional = manifest.get("optional_entrypoints", {})
+        runtime_name = optional.get("runtime") if isinstance(optional, dict) else None
+        runtime = optional_entrypoint(installed, runtime_name) if isinstance(runtime_name, str) else None
+        if runtime is None:
+            print("INFO: clean-machine companion archive has no bundled Codex runtime")
+        else:
+            print(f"INFO: clean-machine found optional bundled runtime: {runtime.name}")
         if os.name != "nt":
             controller.chmod(0o755)
         if skip_run:

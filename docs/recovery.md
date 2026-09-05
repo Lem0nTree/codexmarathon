@@ -1,37 +1,62 @@
-# Runtime-owned recovery
+# Conversation recovery with an installed Codex CLI
 
-Codext remains the owner of `UsageLimitExceeded` handling and conversation
-continuity. It parks a recovery continuation, reloads authentication at the
-native safe boundary, invalidates account-bound transports, and dispatches the
-parked continuation once. The controller only observes:
+Codex remains the authority for the conversation, thread state, parked
+recovery turn, and exactly-once continuation. CodexMarathon only chooses a
+target account and coordinates the identity transition that must happen before
+Codex releases its existing recovery work.
+
+When Codex reports `UsageLimitExceeded`, the sequence is:
 
 ```text
-recovery_parked -> recovery_started -> recovery_completed
+Codex parks its existing recovery turn
+        |
+        v
+companion selects a fresh eligible account
+        |
+        +--> supported local control interface
+        |      safe boundary -> reload -> invalidate -> verify identity
+        |
+        `--> controlled process handoff
+               graceful stop -> atomic auth deploy -> relaunch codex
+               -> resume same thread -> verify identity
+        |
+        v
+Codex releases its parked recovery turn exactly once
 ```
 
-In the embedded build, these observations come from the real Codex TUI
-`ChatWidget` lifecycle. The TUI emits `recovery_parked` when its existing
-configured synthetic turn is created, `recovery_started` only after the normal
-input flow dispatches that turn, and `recovery_completed` when that same turn
-finishes. The app-server bridge carries metadata only and the runtime drains
-it before every controller request, so a release cannot race an unregistered
-parked recovery. No prompt is copied, and no second prompt or queue is made.
+The companion never edits `auth.json` during an active turn, creates another
+turn counter, copies the recovery prompt, or submits a second continuation.
+If no account has usable fresh telemetry, the recovery stays parked while the
+reset scheduler waits and then revalidates quota after the reset timestamp.
 
-Lifecycle notifications are stage/idempotent across reconnects: the TUI
-retains failed sends until the app-server boundary is available again, while
-the bridge and runtime adapter suppress repeated `(stage, recovery_id)`
-observations. Started and completed events inherit the released transition ID
-and target auth generation, allowing the controller to correlate the native
-turn with the exact account transition.
+## Supported local control path
 
-The controller may enter `POOL_EXHAUSTED` while a recovery is parked. It waits
-for fresh usable telemetry and a verified identity transition; it does not
-create a prompt, copy the recovery queue, or submit a duplicate continuation.
+For a compatible installed Codex version, the companion opens its protected
+user-scoped local control endpoint. It correlates a transition ID and expected
+auth generation, waits for the runtime-owned safe boundary, requests the
+native authentication reload and transport invalidation, and reads the
+resulting runtime identity. Recovery is released only after the target account,
+generation, and deployed credential identity agree.
 
-Recovery event IDs are deduplicated by the runtime adapter per stage. A
-controller event loop can therefore safely reconnect or receive repeated
-native notifications without treating one recovery as multiple turns.
+Lost replies remain unresolved in the journal. Reconnect/reconciliation retries
+the same transition ID and never starts a new recovery turn.
 
-If a transition is uncertain during recovery, preserve the transition ID and
-reconcile it after reconnecting to the same runtime identity. Do not infer
-success from an `auth.json` timestamp or from the reset schedule.
+## Controlled restart path
+
+When the installed Codex version has no compatible local control interface,
+the companion uses a controlled process boundary:
+
+1. Ask the Codex process to stop cleanly at its normal boundary and persist
+   the conversation/thread resume identity.
+2. Confirm the process has exited before changing the active credential file.
+3. Atomically deploy the selected profile snapshot and preserve any refreshed
+   fields written by the old process.
+4. Relaunch the same installed `codex` executable with the captured resume
+   identity and the original user arguments.
+5. Verify that the resumed process reports the target account before allowing
+   Codex's parked recovery turn to run.
+
+If a restart fails after deployment, journal the transition as uncertain and
+reconcile the same process/thread identity after the next launch. A timestamp
+or file existence check never proves that the new process adopted the target
+identity.

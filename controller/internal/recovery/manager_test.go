@@ -37,12 +37,12 @@ func (j *memoryJournal) ReadAll() ([]journal.Event, error) {
 }
 
 type fakeRuntime struct {
-	mu        sync.Mutex
-	identity  runtime.Identity
-	recoveries []runtime.RecoveryState
-	releaseCalls []runtime.RecoveryReleaseParams
-	release     runtime.RecoveryReleaseResult
-	releaseErr  error
+	mu             sync.Mutex
+	identity       runtime.Identity
+	recoveries     []runtime.RecoveryState
+	releaseCalls   []runtime.RecoveryReleaseParams
+	release        runtime.RecoveryReleaseResult
+	releaseErr     error
 	applyBeforeErr bool
 }
 
@@ -50,8 +50,8 @@ func (f *fakeRuntime) GetRuntimeState(context.Context) (runtime.RuntimeState, er
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return runtime.RuntimeState{
-		Identity:        f.identity,
-		Recoveries:      append([]runtime.RecoveryState(nil), f.recoveries...),
+		Identity:          f.identity,
+		Recoveries:        append([]runtime.RecoveryState(nil), f.recoveries...),
 		PendingTransition: nil,
 	}, nil
 }
@@ -62,12 +62,12 @@ func (f *fakeRuntime) ReleaseRecovery(_ context.Context, params runtime.Recovery
 	f.releaseCalls = append(f.releaseCalls, params)
 	if f.applyBeforeErr {
 		f.recoveries = []runtime.RecoveryState{{
-			RecoveryID:       params.RecoveryID,
-			ThreadID:          params.ThreadID,
-			TransitionID:     params.TransitionID,
-			TargetAccountID:  "acct-b",
+			RecoveryID:         params.RecoveryID,
+			ThreadID:           params.ThreadID,
+			TransitionID:       params.TransitionID,
+			TargetAccountID:    "acct-b",
 			ExpectedGeneration: params.ExpectedGeneration,
-			Phase:             runtime.RecoveryReleasedPhase,
+			Phase:              runtime.RecoveryReleasedPhase,
 		}}
 	}
 	if f.releaseErr != nil {
@@ -152,7 +152,7 @@ func commitForTest() TransitionCommit {
 func TestManagerResumesSameThreadExactlyOnceAndPreservesQueueOwner(t *testing.T) {
 	rt := &fakeRuntime{
 		identity: runtime.Identity{RuntimeID: "runtime-a", AuthGeneration: 2, AccountID: stringPtr("acct-b")},
-		release: runtime.RecoveryReleaseResult{Outcome: runtime.RecoveryReleased},
+		release:  runtime.RecoveryReleaseResult{Outcome: runtime.RecoveryReleased},
 	}
 	m, journalLog := newTestManager(t, rt)
 	if err := m.HandleEvent(parkedEvent(t, "rec-1", "thread-1", "turn-1", "acct-a", "runtime-a", 1)); err != nil {
@@ -195,7 +195,7 @@ func TestManagerResumesSameThreadExactlyOnceAndPreservesQueueOwner(t *testing.T)
 func TestManagerKeepsRecoveryParkedWhilePoolExhausted(t *testing.T) {
 	rt := &fakeRuntime{
 		identity: runtime.Identity{RuntimeID: "runtime-a", AuthGeneration: 1, AccountID: stringPtr("acct-a")},
-		release: runtime.RecoveryReleaseResult{Outcome: runtime.RecoveryReleased},
+		release:  runtime.RecoveryReleaseResult{Outcome: runtime.RecoveryReleased},
 	}
 	m, _ := newTestManager(t, rt)
 	if err := m.HandleEvent(parkedEvent(t, "rec-1", "thread-1", "turn-1", "acct-a", "runtime-a", 1)); err != nil {
@@ -222,9 +222,9 @@ func TestManagerKeepsRecoveryParkedWhilePoolExhausted(t *testing.T) {
 
 func TestManagerReconcilesLostReleaseAcknowledgementWithoutDuplicate(t *testing.T) {
 	rt := &fakeRuntime{
-		identity: runtime.Identity{RuntimeID: "runtime-a", AuthGeneration: 2, AccountID: stringPtr("acct-b")},
+		identity:       runtime.Identity{RuntimeID: "runtime-a", AuthGeneration: 2, AccountID: stringPtr("acct-b")},
 		applyBeforeErr: true,
-		releaseErr: errors.New("ack lost after native release"),
+		releaseErr:     errors.New("ack lost after native release"),
 	}
 	m, _ := newTestManager(t, rt)
 	if err := m.HandleEvent(parkedEvent(t, "rec-1", "thread-1", "turn-1", "acct-a", "runtime-a", 1)); err != nil {
@@ -299,7 +299,7 @@ func TestManagerReplaysReleaseIntentAcrossControllerCrash(t *testing.T) {
 func TestManagerRejectsMismatchedThreadBeforeRelease(t *testing.T) {
 	rt := &fakeRuntime{
 		identity: runtime.Identity{RuntimeID: "runtime-a", AuthGeneration: 2, AccountID: stringPtr("acct-b")},
-		release: runtime.RecoveryReleaseResult{Outcome: runtime.RecoveryReleased},
+		release:  runtime.RecoveryReleaseResult{Outcome: runtime.RecoveryReleased},
 	}
 	m, _ := newTestManager(t, rt)
 	if err := m.HandleEvent(parkedEvent(t, "rec-1", "thread-1", "turn-1", "acct-a", "runtime-a", 1)); err != nil {

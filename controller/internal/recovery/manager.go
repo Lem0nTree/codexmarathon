@@ -22,8 +22,8 @@ import (
 )
 
 var (
-	ErrNilManager            = errors.New("nil recovery manager")
-	ErrRecoveryNotFound      = errors.New("recovery not found")
+	ErrNilManager           = errors.New("nil recovery manager")
+	ErrRecoveryNotFound     = errors.New("recovery not found")
 	ErrRuntimeUnavailable   = errors.New("recovery runtime is unavailable")
 	ErrReleaseNotAuthorized = errors.New("recovery release is not authorized")
 	ErrIdentityNotVerified  = errors.New("recovery identity is not verified")
@@ -50,17 +50,17 @@ const (
 // the synthetic user message; only IDs, account names, and generations are
 // persisted here.
 type State struct {
-	RecoveryID       string    `json:"recovery_id"`
-	RuntimeID        string    `json:"runtime_id,omitempty"`
-	ThreadID         string    `json:"thread_id,omitempty"`
-	TurnID           string    `json:"turn_id,omitempty"`
-	SourceAccountID  string    `json:"source_account_id,omitempty"`
-	TransitionID     string    `json:"transition_id,omitempty"`
-	TargetAccountID  string    `json:"target_account_id,omitempty"`
-	ExpectedGeneration uint64  `json:"expected_generation,omitempty"`
-	Phase            Phase     `json:"phase"`
-	Reason           string    `json:"reason,omitempty"`
-	UpdatedAt        time.Time `json:"updated_at"`
+	RecoveryID         string    `json:"recovery_id"`
+	RuntimeID          string    `json:"runtime_id,omitempty"`
+	ThreadID           string    `json:"thread_id,omitempty"`
+	TurnID             string    `json:"turn_id,omitempty"`
+	SourceAccountID    string    `json:"source_account_id,omitempty"`
+	TransitionID       string    `json:"transition_id,omitempty"`
+	TargetAccountID    string    `json:"target_account_id,omitempty"`
+	ExpectedGeneration uint64    `json:"expected_generation,omitempty"`
+	Phase              Phase     `json:"phase"`
+	Reason             string    `json:"reason,omitempty"`
+	UpdatedAt          time.Time `json:"updated_at"`
 }
 
 // Runtime is the minimal runtime authority needed to release and reconcile a
@@ -95,22 +95,22 @@ type TransitionCommit struct {
 // is written before release authorization so a process crash can replay the
 // relationship without inventing a second recovery prompt.
 type Binding struct {
-	RecoveryID       string
-	RuntimeID        string
-	ThreadID         string
-	TurnID           string
-	TransitionID     string
-	TargetAccountID  string
+	RecoveryID         string
+	RuntimeID          string
+	ThreadID           string
+	TurnID             string
+	TransitionID       string
+	TargetAccountID    string
 	ExpectedGeneration uint64
 }
 
 // Manager owns recovery state and its append-only metadata journal.
 type Manager struct {
-	mu      sync.Mutex
-	journal journal.Journal
-	runtime Runtime
-	now     func() time.Time
-	states  map[string]State
+	mu        sync.Mutex
+	journal   journal.Journal
+	runtime   Runtime
+	now       func() time.Time
+	states    map[string]State
 	committed map[string]TransitionCommit
 }
 
@@ -123,10 +123,10 @@ func New(config Config) (*Manager, error) {
 		now = func() time.Time { return time.Now().UTC() }
 	}
 	m := &Manager{
-		journal: config.Journal,
-		runtime: config.Runtime,
-		now:     now,
-		states:  make(map[string]State),
+		journal:   config.Journal,
+		runtime:   config.Runtime,
+		now:       now,
+		states:    make(map[string]State),
 		committed: make(map[string]TransitionCommit),
 	}
 	if config.Journal == nil {
@@ -467,16 +467,16 @@ func (m *Manager) Bind(binding Binding) error {
 	state.Reason = "recovery bound to verified transition"
 	state.UpdatedAt = m.nowUTC()
 	if err := m.appendLocked(journal.Event{
-		Type:              journal.RecoveryBound,
-		RecoveryID:        state.RecoveryID,
-		RuntimeID:         state.RuntimeID,
-		ThreadID:          state.ThreadID,
-		TurnID:            state.TurnID,
-		TransitionID:      state.TransitionID,
-		TargetAccountID:   state.TargetAccountID,
-		AuthGeneration:    state.ExpectedGeneration,
+		Type:               journal.RecoveryBound,
+		RecoveryID:         state.RecoveryID,
+		RuntimeID:          state.RuntimeID,
+		ThreadID:           state.ThreadID,
+		TurnID:             state.TurnID,
+		TransitionID:       state.TransitionID,
+		TargetAccountID:    state.TargetAccountID,
+		AuthGeneration:     state.ExpectedGeneration,
 		ExpectedGeneration: state.ExpectedGeneration,
-		Reason:            state.Reason,
+		Reason:             state.Reason,
 	}); err != nil {
 		return err
 	}
@@ -709,17 +709,17 @@ func (m *Manager) markReleased(recoveryID string, outcome runtime.RecoveryReleas
 	state.Reason = "runtime acknowledged recovery release"
 	state.UpdatedAt = m.nowUTC()
 	if err := m.appendLocked(journal.Event{
-		Type:              journal.RecoveryReleased,
-		RecoveryID:        state.RecoveryID,
-		RuntimeID:         state.RuntimeID,
-		ThreadID:          state.ThreadID,
-		TurnID:            state.TurnID,
-		TransitionID:      state.TransitionID,
-		TargetAccountID:   state.TargetAccountID,
-		AuthGeneration:    state.ExpectedGeneration,
+		Type:               journal.RecoveryReleased,
+		RecoveryID:         state.RecoveryID,
+		RuntimeID:          state.RuntimeID,
+		ThreadID:           state.ThreadID,
+		TurnID:             state.TurnID,
+		TransitionID:       state.TransitionID,
+		TargetAccountID:    state.TargetAccountID,
+		AuthGeneration:     state.ExpectedGeneration,
 		ExpectedGeneration: state.ExpectedGeneration,
-		Outcome:           string(outcome),
-		Reason:            state.Reason,
+		Outcome:            string(outcome),
+		Reason:             state.Reason,
 	}); err != nil {
 		return err
 	}
@@ -741,17 +741,17 @@ func (m *Manager) markUncertain(recoveryID string, reason error) error {
 	state.Reason = safeFailureReason(reason.Error())
 	state.UpdatedAt = m.nowUTC()
 	if err := m.appendLocked(journal.Event{
-		Type:              journal.RecoveryUncertain,
-		RecoveryID:        state.RecoveryID,
-		RuntimeID:         state.RuntimeID,
-		ThreadID:          state.ThreadID,
-		TurnID:            state.TurnID,
-		TransitionID:      state.TransitionID,
-		TargetAccountID:   state.TargetAccountID,
-		AuthGeneration:    state.ExpectedGeneration,
+		Type:               journal.RecoveryUncertain,
+		RecoveryID:         state.RecoveryID,
+		RuntimeID:          state.RuntimeID,
+		ThreadID:           state.ThreadID,
+		TurnID:             state.TurnID,
+		TransitionID:       state.TransitionID,
+		TargetAccountID:    state.TargetAccountID,
+		AuthGeneration:     state.ExpectedGeneration,
 		ExpectedGeneration: state.ExpectedGeneration,
-		Outcome:           "uncertain",
-		Reason:            state.Reason,
+		Outcome:            "uncertain",
+		Reason:             state.Reason,
 	}); err != nil {
 		return err
 	}
@@ -887,17 +887,17 @@ func (m *Manager) mergeRemote(runtimeID string, item runtime.RecoveryState) erro
 		eventType = journal.RecoveryCompleted
 	}
 	if err := m.appendLocked(journal.Event{
-		Type:              eventType,
-		RecoveryID:        existing.RecoveryID,
-		RuntimeID:         existing.RuntimeID,
-		ThreadID:          existing.ThreadID,
-		TurnID:            existing.TurnID,
-		TransitionID:      existing.TransitionID,
-		TargetAccountID:   existing.TargetAccountID,
-		AuthGeneration:    existing.ExpectedGeneration,
+		Type:               eventType,
+		RecoveryID:         existing.RecoveryID,
+		RuntimeID:          existing.RuntimeID,
+		ThreadID:           existing.ThreadID,
+		TurnID:             existing.TurnID,
+		TransitionID:       existing.TransitionID,
+		TargetAccountID:    existing.TargetAccountID,
+		AuthGeneration:     existing.ExpectedGeneration,
 		ExpectedGeneration: existing.ExpectedGeneration,
-		Outcome:           string(existing.Phase),
-		Reason:            "runtime recovery state reconciled",
+		Outcome:            string(existing.Phase),
+		Reason:             "runtime recovery state reconciled",
 	}); err != nil {
 		return err
 	}
@@ -934,17 +934,17 @@ func (m *Manager) observeRemotePhase(runtimeID string, item runtime.RecoveryStat
 		return nil
 	}
 	if err := m.appendLocked(journal.Event{
-		Type:              eventType,
-		RecoveryID:        state.RecoveryID,
-		RuntimeID:         state.RuntimeID,
-		ThreadID:          state.ThreadID,
-		TurnID:            state.TurnID,
-		TransitionID:      state.TransitionID,
-		TargetAccountID:   state.TargetAccountID,
-		AuthGeneration:    state.ExpectedGeneration,
+		Type:               eventType,
+		RecoveryID:         state.RecoveryID,
+		RuntimeID:          state.RuntimeID,
+		ThreadID:           state.ThreadID,
+		TurnID:             state.TurnID,
+		TransitionID:       state.TransitionID,
+		TargetAccountID:    state.TargetAccountID,
+		AuthGeneration:     state.ExpectedGeneration,
 		ExpectedGeneration: state.ExpectedGeneration,
-		Outcome:           string(phase),
-		Reason:            state.Reason,
+		Outcome:            string(phase),
+		Reason:             state.Reason,
 	}); err != nil {
 		return err
 	}

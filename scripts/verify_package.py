@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify source release inputs or an assembled CodexMarathon archive."""
+"""Verify companion release inputs or an assembled CodexMarathon archive."""
 
 from __future__ import annotations
 
@@ -91,8 +91,27 @@ def expected_required_files(manifest: dict) -> set[str]:
     return include
 
 
+def expected_optional_entrypoints(manifest: dict) -> dict[str, str]:
+    optional = manifest.get("optional_entrypoints", {})
+    if not isinstance(optional, dict):
+        fail("release manifest optional_entrypoints must be an object")
+    result: dict[str, str] = {}
+    for role, value in optional.items():
+        if not isinstance(role, str) or not isinstance(value, str) or not value.strip():
+            fail("release manifest optional entrypoint names must be non-empty strings")
+        safe_relative(value)
+        if "/" in value.replace("\\", "/"):
+            fail(f"release entrypoint must be a file name, not a path: {value!r}")
+        result[role] = value
+    return result
+
+
 def validate_source(root: Path, manifest: dict) -> list[str]:
     required = expected_required_files(manifest)
+    entrypoints = manifest.get("entrypoints", {})
+    if not isinstance(entrypoints, dict) or not isinstance(entrypoints.get("controller"), str):
+        fail("release manifest must define the codexmarathon controller entrypoint")
+    expected_optional_entrypoints(manifest)
     for relative in required:
         safe_relative(relative)
         path = root / Path(relative)
@@ -136,6 +155,7 @@ def read_archive(path: Path) -> dict[str, bytes]:
 def validate_archive(path: Path, manifest: dict) -> list[str]:
     files = read_archive(path)
     required = expected_required_files(manifest)
+    optional_entrypoints = expected_optional_entrypoints(manifest)
     # Archives have a generated root directory. Match required metadata and
     # notices by suffix so the verifier is independent of version/platform.
     by_suffix: dict[str, tuple[str, bytes]] = {}
@@ -169,6 +189,21 @@ def validate_archive(path: Path, manifest: dict) -> list[str]:
         fail(f"generated release manifest is invalid: {error}")
     if generated.get("product") != manifest.get("product"):
         fail("generated release manifest product does not match source manifest")
+    distribution = generated.get("distribution")
+    if distribution not in {"companion", "companion-with-embedded-runtime"}:
+        fail("generated release manifest has an invalid distribution")
+    runtime_name = optional_entrypoints.get("runtime")
+    runtime_candidates = []
+    if runtime_name:
+        runtime_candidates = [
+            suffix
+            for suffix in by_suffix
+            if PurePosixPath(suffix).name in {runtime_name, runtime_name + ".exe"}
+        ]
+    if distribution == "companion" and runtime_candidates:
+        fail("companion archive unexpectedly contains the embedded runtime")
+    if distribution == "companion-with-embedded-runtime" and runtime_name and not runtime_candidates:
+        fail("embedded-runtime archive is missing its optional runtime entrypoint")
     records = generated.get("files")
     if not isinstance(records, list):
         fail("generated release manifest has no file hash records")

@@ -25,6 +25,16 @@ func (c *Controller) RegisterUsageProvider(accountID string, provider telemetry.
 // registry and transition coordinator. The returned loop is not started; the
 // caller owns its event channel and goroutine lifecycle.
 func (c *Controller) NewAutomationLoop() (*automation.Loop, error) {
+	return c.NewAutomationLoopWithTransition(nil)
+}
+
+// NewAutomationLoopWithTransition composes the event-driven quota policy with
+// the account registry and a caller-supplied transition boundary.  The
+// installed-Codex companion uses this seam because its transition is owned by
+// the installed app-server/process supervisor rather than the embedded
+// Marathon runtime coordinator.  A nil callback preserves the normal
+// embedded-runtime behavior.
+func (c *Controller) NewAutomationLoopWithTransition(transition automation.TransitionFunc) (*automation.Loop, error) {
 	if c == nil {
 		return nil, errors.New("controller is nil")
 	}
@@ -33,6 +43,12 @@ func (c *Controller) NewAutomationLoop() (*automation.Loop, error) {
 	}
 	if err := c.ensureInactiveQuotaProviders(); err != nil {
 		return nil, err
+	}
+	if transition == nil {
+		transition = func(ctx context.Context, accountID string) error {
+			_, err := c.RequestTransition(ctx, accountID)
+			return err
+		}
 	}
 	return automation.New(automation.Config{
 		Router:       c.router,
@@ -55,11 +71,8 @@ func (c *Controller) NewAutomationLoop() (*automation.Loop, error) {
 				return c.registry.ActiveID()
 			},
 		},
-		Transition: func(ctx context.Context, accountID string) error {
-			_, err := c.RequestTransition(ctx, accountID)
-			return err
-		},
-		OnError: c.reportEventError,
+		Transition: transition,
+		OnError:    c.reportEventError,
 	}), nil
 }
 

@@ -33,12 +33,12 @@ func (o SparseUpdateOutcome) String() string {
 // SparseUpdateResult gives the runtime adapter enough information to issue a
 // complete account/rateLimits/read when a sparse update is ambiguous.
 type SparseUpdateResult struct {
-	Outcome          SparseUpdateOutcome
-	AccountID        string
-	TargetLimitID    string
-	Reason           string
-	RefetchRequired  bool
-	Snapshot         AccountTelemetry
+	Outcome         SparseUpdateOutcome
+	AccountID       string
+	TargetLimitID   string
+	Reason          string
+	RefetchRequired bool
+	Snapshot        AccountTelemetry
 }
 
 func (r SparseUpdateResult) Applied() bool { return r.Outcome == SparseUpdateApplied }

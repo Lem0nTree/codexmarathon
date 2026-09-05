@@ -13,7 +13,9 @@ codex-backend-client = { workspace = true }
 codex-core = { workspace = true }
 codex-http-client = { workspace = true }
 codex-login = { workspace = true }
+codex-protocol = { workspace = true }
 codexmarathon-runtime-adapter = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["io-util", "net", "rt", "sync", "time"] }

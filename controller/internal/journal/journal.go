@@ -8,6 +8,7 @@ package journal
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -29,16 +30,16 @@ var (
 type EventType string
 
 const (
-	TransitionCreated     EventType = "TransitionCreated"
-	TransitionPrepared    EventType = "TransitionPrepared"
-	AuthDeployed          EventType = "AuthDeployed"
-	CommitSent            EventType = "CommitSent"
-	IdentityConfirmed     EventType = "IdentityConfirmed"
-	TransitionCommitted   EventType = "TransitionCommitted"
-	TransitionUncertain   EventType = "TransitionUncertain"
-	TransitionReconciled  EventType = "TransitionReconciled"
-	RuntimeConnected      EventType = "RuntimeConnected"
-	RuntimeDisconnected   EventType = "RuntimeDisconnected"
+	TransitionCreated    EventType = "TransitionCreated"
+	TransitionPrepared   EventType = "TransitionPrepared"
+	AuthDeployed         EventType = "AuthDeployed"
+	CommitSent           EventType = "CommitSent"
+	IdentityConfirmed    EventType = "IdentityConfirmed"
+	TransitionCommitted  EventType = "TransitionCommitted"
+	TransitionUncertain  EventType = "TransitionUncertain"
+	TransitionReconciled EventType = "TransitionReconciled"
+	RuntimeConnected     EventType = "RuntimeConnected"
+	RuntimeDisconnected  EventType = "RuntimeDisconnected"
 	// Recovery records describe the controller's durable authorization of a
 	// runtime-owned UsageLimitExceeded continuation.  They contain only
 	// correlation metadata; the prompt and credentials remain in Codext.
@@ -53,47 +54,47 @@ const (
 
 	// Event-prefixed aliases make call sites self-documenting when journal and
 	// runtime event constants are imported together.
-	EventTransitionCreated    = TransitionCreated
-	EventTransitionPrepared   = TransitionPrepared
-	EventAuthDeployed         = AuthDeployed
-	EventCommitSent           = CommitSent
-	EventIdentityConfirmed    = IdentityConfirmed
-	EventTransitionCommitted  = TransitionCommitted
-	EventTransitionUncertain  = TransitionUncertain
-	EventTransitionReconciled = TransitionReconciled
-	EventRuntimeConnected     = RuntimeConnected
-	EventRuntimeDisconnected  = RuntimeDisconnected
-	EventRecoveryParked       = RecoveryParked
-	EventRecoveryWaiting      = RecoveryWaiting
-	EventRecoveryBound        = RecoveryBound
+	EventTransitionCreated        = TransitionCreated
+	EventTransitionPrepared       = TransitionPrepared
+	EventAuthDeployed             = AuthDeployed
+	EventCommitSent               = CommitSent
+	EventIdentityConfirmed        = IdentityConfirmed
+	EventTransitionCommitted      = TransitionCommitted
+	EventTransitionUncertain      = TransitionUncertain
+	EventTransitionReconciled     = TransitionReconciled
+	EventRuntimeConnected         = RuntimeConnected
+	EventRuntimeDisconnected      = RuntimeDisconnected
+	EventRecoveryParked           = RecoveryParked
+	EventRecoveryWaiting          = RecoveryWaiting
+	EventRecoveryBound            = RecoveryBound
 	EventRecoveryReleaseRequested = RecoveryReleaseRequested
-	EventRecoveryReleased     = RecoveryReleased
-	EventRecoveryStarted      = RecoveryStarted
-	EventRecoveryCompleted    = RecoveryCompleted
-	EventRecoveryUncertain    = RecoveryUncertain
+	EventRecoveryReleased         = RecoveryReleased
+	EventRecoveryStarted          = RecoveryStarted
+	EventRecoveryCompleted        = RecoveryCompleted
+	EventRecoveryUncertain        = RecoveryUncertain
 )
 
 // Event is the complete journal wire record. The fields are deliberately
 // scalar and non-secret; use Reason for a short operator-safe explanation, not
 // raw provider responses or token material.
 type Event struct {
-	At              time.Time `json:"at"`
-	Type            EventType `json:"type"`
-	TransitionID    string    `json:"transition_id,omitempty"`
-	RecoveryID      string    `json:"recovery_id,omitempty"`
-	ThreadID        string    `json:"thread_id,omitempty"`
-	TurnID          string    `json:"turn_id,omitempty"`
+	At           time.Time `json:"at"`
+	Type         EventType `json:"type"`
+	TransitionID string    `json:"transition_id,omitempty"`
+	RecoveryID   string    `json:"recovery_id,omitempty"`
+	ThreadID     string    `json:"thread_id,omitempty"`
+	TurnID       string    `json:"turn_id,omitempty"`
 	// Generation zero is a valid initial runtime generation. Keep the field on
 	// the JSON record even when it is zero so every transition record carries
 	// the correlation field required by the protocol contract.
-	AuthGeneration  uint64    `json:"auth_generation"`
+	AuthGeneration     uint64 `json:"auth_generation"`
 	ExpectedGeneration uint64 `json:"expected_generation,omitempty"`
-	RuntimeID       string    `json:"runtime_id,omitempty"`
-	AccountID       string    `json:"account_id,omitempty"`
-	FromAccountID   string    `json:"from_account_id,omitempty"`
-	TargetAccountID string    `json:"target_account_id,omitempty"`
-	Outcome         string    `json:"outcome,omitempty"`
-	Reason          string    `json:"reason,omitempty"`
+	RuntimeID          string `json:"runtime_id,omitempty"`
+	AccountID          string `json:"account_id,omitempty"`
+	FromAccountID      string `json:"from_account_id,omitempty"`
+	TargetAccountID    string `json:"target_account_id,omitempty"`
+	Outcome            string `json:"outcome,omitempty"`
+	Reason             string `json:"reason,omitempty"`
 }
 
 // Journal is the persistence seam consumed by transition orchestration.
@@ -233,7 +234,7 @@ func (j *FileJournal) ReadAll() ([]Event, error) {
 	line := 0
 	for scanner.Scan() {
 		line++
-		data := strings.TrimSpace(scanner.Bytes())
+		data := bytes.TrimSpace(scanner.Bytes())
 		if len(data) == 0 {
 			continue
 		}
@@ -277,6 +278,9 @@ func ValidateEvent(event Event) error {
 		if event.RuntimeID == "" {
 			return fmt.Errorf("%w: runtime_id is required for %s", ErrInvalidEvent, event.Type)
 		}
+		if (event.Type == TransitionCommitted || event.Type == TransitionReconciled) && event.AuthGeneration == 0 {
+			return fmt.Errorf("%w: auth_generation is required for %s", ErrInvalidEvent, event.Type)
+		}
 	}
 	if isRecoveryEvent(event.Type) {
 		if event.RecoveryID == "" {
@@ -287,10 +291,10 @@ func ValidateEvent(event Event) error {
 		}
 	}
 	for name, value := range map[string]string{
-		"transition_id":    event.TransitionID,
-		"recovery_id":      event.RecoveryID,
-		"thread_id":        event.ThreadID,
-		"turn_id":          event.TurnID,
+		"transition_id":     event.TransitionID,
+		"recovery_id":       event.RecoveryID,
+		"thread_id":         event.ThreadID,
+		"turn_id":           event.TurnID,
 		"runtime_id":        event.RuntimeID,
 		"account_id":        event.AccountID,
 		"from_account_id":   event.FromAccountID,

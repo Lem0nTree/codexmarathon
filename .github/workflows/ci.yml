@@ -32,9 +32,11 @@ jobs:
         run: python scripts/verify_protocol.py --root .
       - name: Compile release scripts
         run: python -m compileall -q scripts
+      - name: Test companion packaging modes
+        run: python scripts/test_package_release.py
 
   build-test:
-    name: Go, Rust, and embedded runtime (${{ matrix.os }})
+    name: Go companion and optional bridge tests (${{ matrix.os }})
     needs: static
     strategy:
       fail-fast: false
@@ -78,9 +80,6 @@ jobs:
       - name: Run native bridge tests
         shell: bash
         run: cd runtime/codex-rs && cargo test --locked -p codexmarathon-runtime
-      - name: Build embedded runtime
-        shell: bash
-        run: cd runtime/codex-rs && cargo build --locked --release -p codex-app-server
       - name: Build controller and package Linux artifact
         if: matrix.os == 'ubuntu-latest'
         shell: bash
@@ -90,15 +89,10 @@ jobs:
           python scripts/package_release.py \
             --root . --output dist/release \
             --controller-binary dist/build/codexmarathon \
-            --runtime-binary runtime/codex-rs/target/release/codex-app-server \
             --platform linux-x86_64 --version 0.1.0 --format tar.gz
           artifact=$(find dist/release -maxdepth 1 -type f -name '*.tar.gz' -print -quit)
           python scripts/verify_package.py --artifact "$artifact" --manifest packaging/release-manifest.json
           python scripts/clean_machine_check.py --root . --artifact "$artifact"
-      - name: Exercise compiled embedded runtime over Unix IPC
-        if: matrix.os == 'ubuntu-latest'
-        shell: bash
-        run: python scripts/live_smoke.py --runtime-binary runtime/codex-rs/target/release/codex-app-server
       - name: Build controller and package Windows artifact
         if: matrix.os == 'windows-latest'
         shell: pwsh
@@ -110,7 +104,6 @@ jobs:
           python scripts/package_release.py `
             --root . --output dist/release `
             --controller-binary dist/build/codexmarathon.exe `
-            --runtime-binary runtime/codex-rs/target/release/codex-app-server.exe `
             --platform windows-x86_64 --version 0.1.0 --format zip --windows-exe
           $artifact = (Get-ChildItem dist/release -Filter '*.zip' | Select-Object -First 1).FullName
           python scripts/verify_package.py --artifact $artifact --manifest packaging/release-manifest.json

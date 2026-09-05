@@ -11,12 +11,14 @@ include `event_type`, `occurred_at`, `runtime_id`, and `auth_generation`.
 Transition events additionally include `transition_id`.
 
 The `account/login`, `account/authSnapshot/read`, and `account/refresh` methods
-are native-auth seams for the embedded Codex runtime. Login and snapshot read
-return an opaque `auth_json` value only over the authenticated in-process/local
-protocol connection so the controller can place it in its protected vault.
-Refresh accepts the same opaque snapshot and returns only write-back token
-fields. None of these payloads belongs in the controller journal, registry,
-logs, or CLI output.
+are native-auth seams for a compatible installed Codex runtime. Login and
+snapshot read return an opaque `auth_json` value only over the authenticated
+user-scoped local control connection so the companion can place it in its
+protected vault. Refresh accepts the same opaque snapshot and returns only
+write-back token fields. None of these payloads belongs in the controller
+journal, registry, logs, or CLI output. The imported Rust runtime implements
+the same seam for optional protocol development; it is not required by the
+default companion package.
 
 Codext owns the `UsageLimitExceeded` synthetic recovery turn. It emits
 `recovery_parked` with a recovery/thread correlation, and the controller may

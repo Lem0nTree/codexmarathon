@@ -1,122 +1,81 @@
 # Release validation
 
-CodexMarathon is released as one product: a Go controller plus the embedded
-Rust Codex runtime. A user does not install `codex-switch`, `codext`, or a
-second adapter process. The controller's supervisor starts the bundled runtime
-and uses the user-scoped local IPC boundary selected for the platform.
+CodexMarathon's default release is a companion archive containing the Go
+controller and allow-listed metadata. A user installs Codex separately. The
+release process must not silently bundle `codex-app-server`, replace an
+existing `codex` executable, or write user credentials into the archive.
 
-## Evidence vocabulary
-
-Every release report must label the evidence that actually ran:
-
-| Label | Meaning |
-| --- | --- |
-| `static` | Files, schemas, manifests, provenance, and forbidden-content checks ran. |
-| `focused` | A unit or package test ran against a deterministic fixture. |
-| `integration` | Controller and adapter/runtime boundaries ran together in-process or over local IPC. |
-| `live` | The compiled embedded runtime was started and exercised; no donor checkout or mock runtime substituted for it. |
-| `blocked` | The check could not run because a toolchain, platform, credential, or environment was unavailable. |
-| `pending` | The behavior still requires implementation or a controlled acceptance environment. |
-
-`PASS` means only that the named check executed and passed. A static or fake
-runtime result is never reported as live Codex success.
-
-## Required release checks
-
-The Gate 7 scenarios in `PLAN.md` are the release contract:
-
-1. proactive threshold A to B;
-2. hard-limit A to B with exactly-once recovery;
-3. active-turn safe-boundary protection;
-4. lost commit acknowledgement reconciliation;
-5. stale-generation rejection;
-6. exhausted-pool earliest-reset revalidation;
-7. missing-reset bounded waiting;
-8. controller/runtime restart recovery;
-9. refreshed-token write-back;
-10. clean-machine packaging without donor repositories or developer tools.
-
-The current focused Go and Rust tests exercise the controller policy,
-transition, recovery, telemetry, reset, wire, adapter, and bridge seams. The
-`integration` module uses a deterministic fake runtime for those portions; its
-results are `focused`/`integration`, not `live`.
-
-The Linux CI job additionally runs `scripts/live_smoke.py` when the compiled
-embedded app-server exists. That smoke starts the real binary with an isolated
-temporary `CODEX_HOME`, connects to its Unix socket, negotiates protocol v1,
-and reads runtime identity. It does not log in or make a provider request, so
-it proves the packaged local runtime boundary only. A missing binary is
-reported as `blocked` and cannot be promoted to `live`.
-
-Both platform jobs run `scripts/clean_machine_check.py` against the exact
-archive they just assembled. The check extracts into a temporary directory and
-runs the packaged controller's `init`, `status --json`, and empty account-list
-commands with an empty `PATH`, an isolated `CODEX_HOME`, and no repository or
-donor checkout. This is a clean-machine installation check, not a provider
-acceptance test.
-
-## Repeatable commands
+## Required companion checks
 
 From the repository root:
 
-```text
+```bash
 python scripts/verify_provenance.py --root .
-python scripts/verify_package.py --root . --manifest packaging/release-manifest.json
+python scripts/verify_package.py --root .
 python scripts/verify_protocol.py --root .
-
-cd controller
-go test ./...
-cd ../integration
-go test ./...
-cd ../runtime/codex-rs
-cargo test --locked -p codexmarathon-runtime-adapter
-cargo test --locked -p codexmarathon-runtime
-cargo build --locked --release -p codex-app-server
-cd ../..
-python scripts/live_smoke.py --runtime-binary runtime/codex-rs/target/release/codex-app-server
+python scripts/test_package_release.py
+(cd controller && go test ./...)
+(cd integration && go test ./...)
+(cd controller && go vet ./...)
+bash scripts/build-release.sh
+artifact=$(find dist/release -maxdepth 1 -type f -name '*.tar.gz' -print -quit)
+python scripts/verify_package.py --artifact "$artifact"
+python scripts/clean_machine_check.py --artifact "$artifact"
 ```
 
-After an archive is built, exercise its extraction boundary with:
+The package regression test covers both the normal companion archive and the
+explicit opt-in embedded-runtime archive. The clean-machine check extracts
+the exact release, sets an empty `PATH`, uses an isolated `CODEX_HOME`, and
+runs `init`, `status --json`, and an empty account listing. It proves local
+state setup without a repository, toolchain, donor checkout, or bundled
+Codex. It does not prove OAuth or live account switching.
 
-```text
-python scripts/clean_machine_check.py --artifact <path-to-release-archive>
+## Installed-Codex acceptance
+
+The live acceptance environment must provide a real `codex` executable and a
+safe disposable Codex home. Record the exact executable path and version, then
+exercise both supported handoff paths:
+
+1. Start a conversation through CodexMarathon. Exhaust or simulate the active
+   account at a safe turn boundary. Confirm that the companion requests the
+   installed Codex local control interface to reload the target credential,
+   invalidates account-bound transports, and reports the target identity and
+   generation before continuation is released.
+2. Repeat with a Codex version that does not expose the local control
+   capability. Confirm that the companion asks the process to exit cleanly,
+   atomically deploys the target credential, relaunches the same installed
+   executable, resumes the same thread/conversation, and verifies the target
+   identity before releasing recovery.
+
+Both runs must show one continuation in the original conversation. Capture
+process logs only after redaction; never record access or refresh tokens.
+
+The full Gate 7 contract in [`PLAN.md`](../PLAN.md) also covers active-turn
+protection, stale generations, lost acknowledgements, pool exhaustion and
+reset revalidation, refreshed-token write-back, and restart recovery.
+
+## Optional embedded-runtime package
+
+The imported Rust runtime is retained for protocol development and controlled
+offline diagnostics. It is excluded from the default package. Build it only
+with explicit opt-in:
+
+```bash
+CODEXMARATHON_INCLUDE_EMBEDDED_RUNTIME=1 bash scripts/build-release.sh
+python scripts/live_smoke.py \
+  --runtime-binary runtime/codex-rs/target/release/codex-app-server
 ```
 
-Use `scripts/build-release.sh` on Linux or `scripts/build-release.ps1` on
-Windows to build and package the two binaries. The scripts write only below
-`dist/`; generated output is ignored by Git and is independently checked
-before it is archived.
+The generated manifest marks this package
+`companion-with-embedded-runtime`. Its smoke result is evidence about the
+optional binary and cannot be substituted for installed-Codex acceptance.
 
-## Clean-machine check
+## Archive and provenance policy
 
-Extract an artifact into an empty directory that has no repository checkout,
-Cargo target, Go toolchain, donor directory, or developer state. Confirm that
-the two entrypoints and included notices are present, then run:
-
-```text
-codexmarathon init --state-dir <temporary-state>
-codexmarathon status --state-dir <temporary-state> --json
-codexmarathon run --state-dir <temporary-state>
-```
-
-The last command requires the packaged runtime and should be run only in a
-controlled test environment; stop it with the platform interrupt signal. A
-successful extraction or `status` invocation does not prove OAuth, quota
-switching, or continuation. Those require the live acceptance environment and
-must be reported separately.
-
-## Provenance and legal clearance
-
-`runtime/PROVENANCE.md`, `runtime/PATCH_LEDGER.md`, and the generated
-`release-manifest.json` identify the pinned Codext source and local bridge
-patches. The embedded Codex source retains its Apache-2.0 `LICENSE` and
-`NOTICE` files. CodexMarathon adapts implementation ideas and code from the
-public `codex-switch` checkout, but the pinned checkout contains no formal
-license file; its source is therefore not copied into release archives until
-the owner’s redistribution grant is recorded. This check is intentional and
-does not silently convert public availability into a license.
-
-Before a release is published, review the generated manifest, source commit,
-uncommitted changes, archive contents, checksums, and any platform signing
-records. Never put auth files, vault snapshots, tokens, provider headers, or
-local journals in an artifact or release log.
+`scripts/verify_package.py` rejects unsafe paths, duplicate members, missing
+hash records, and obvious credential material. It requires one controller
+entrypoint and rejects an embedded runtime in an archive marked `companion`.
+`runtime/PROVENANCE.md`, `runtime/PATCH_LEDGER.md`, and the Apache-2.0 notices
+remain allow-listed metadata for the optional runtime source. Donor checkouts,
+Cargo targets, auth files, vault snapshots, journals, and developer caches
+are never release inputs.

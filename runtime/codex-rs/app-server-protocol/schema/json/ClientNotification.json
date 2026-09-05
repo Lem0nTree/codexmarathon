@@ -1,5 +1,104 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "CodexMarathonRecoveryLifecycleNotification": {
+      "description": "Lifecycle observation emitted by the embedded Codex TUI for the native Marathon recovery seam. The TUI sends this only after its existing pending synthetic turn is created, dispatched, or completed. It carries metadata, never prompt text or credentials.",
+      "properties": {
+        "errorCode": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "eventType": {
+          "description": "One of `recovery_parked`, `recovery_started`, or `recovery_completed`.",
+          "type": "string"
+        },
+        "outcome": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "recoveryId": {
+          "type": "string"
+        },
+        "sourceAccountId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "threadId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "turnId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "eventType",
+        "recoveryId"
+      ],
+      "type": "object"
+    },
+    "CodexMarathonRecoveryReleaseResultNotification": {
+      "description": "Result sent by the TUI after applying a Marathon release command to the session-owned pending recovery state.\n\nThe result is intentionally string-shaped at this upstream protocol seam; the Marathon adapter maps it to its typed release outcome without making the Codex app-server protocol depend on Marathon crates.",
+      "properties": {
+        "errorCode": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "errorMessage": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "expectedGeneration": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "outcome": {
+          "type": "string"
+        },
+        "recoveryId": {
+          "type": "string"
+        },
+        "threadId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "transitionId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "expectedGeneration",
+        "outcome",
+        "recoveryId",
+        "transitionId"
+      ],
+      "type": "object"
+    }
+  },
   "oneOf": [
     {
       "properties": {
@@ -15,6 +114,48 @@
         "method"
       ],
       "title": "InitializedNotification",
+      "type": "object"
+    },
+    {
+      "description": "Internal lifecycle observation for the embedded Marathon recovery seam.",
+      "properties": {
+        "method": {
+          "enum": [
+            "codexMarathonRecoveryLifecycle"
+          ],
+          "title": "CodexMarathonRecoveryLifecycleNotificationMethod",
+          "type": "string"
+        },
+        "params": {
+          "$ref": "#/definitions/CodexMarathonRecoveryLifecycleNotification"
+        }
+      },
+      "required": [
+        "method",
+        "params"
+      ],
+      "title": "CodexMarathonRecoveryLifecycleNotification",
+      "type": "object"
+    },
+    {
+      "description": "Internal acknowledgement for the embedded Marathon recovery seam.",
+      "properties": {
+        "method": {
+          "enum": [
+            "codexMarathonRecoveryReleaseResult"
+          ],
+          "title": "CodexMarathonRecoveryReleaseResultNotificationMethod",
+          "type": "string"
+        },
+        "params": {
+          "$ref": "#/definitions/CodexMarathonRecoveryReleaseResultNotification"
+        }
+      },
+      "required": [
+        "method",
+        "params"
+      ],
+      "title": "CodexMarathonRecoveryReleaseResultNotification",
       "type": "object"
     }
   ],

@@ -13,7 +13,7 @@ import (
 // example, a stale cached response), so callers must not infer usability from
 // a nil error alone.
 type SnapshotResult struct {
-	Telemetry  AccountTelemetry
+	Telemetry AccountTelemetry
 	// Snapshot is retained as a compatibility alias for callers that use the
 	// protocol vocabulary.  New code should use Telemetry.
 	Snapshot   AccountTelemetry

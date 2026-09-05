@@ -163,8 +163,8 @@ func (c Client) Check(ctx context.Context, tokens Tokens, model string) (Snapsho
 		client = &http.Client{Timeout: defaultRequestTimeout}
 	}
 	requestBody, err := json.Marshal(quotaRequest{
-		Model: model,
-		Input: []quotaMessage{{Role: "user", Content: "hi"}},
+		Model:        model,
+		Input:        []quotaMessage{{Role: "user", Content: "hi"}},
 		Instructions: ".",
 		Store:        false,
 		Stream:       true,
@@ -396,26 +396,26 @@ func SnapshotToTelemetry(accountID string, snapshot Snapshot, observedAt time.Ti
 	primaryReset := resetPointer(snapshot.PrimaryResetAt, snapshot.PrimaryResetAfter, observedAt)
 	secondaryReset := resetPointer(snapshot.SecondaryResetAt, snapshot.SecondaryResetAfter, observedAt)
 	limit := telemetry.LimitTelemetry{
-		LimitID:  "codex",
+		LimitID:   "codex",
 		LimitName: "codex",
-		Windows: []telemetry.WindowTelemetry{},
+		Windows:   []telemetry.WindowTelemetry{},
 	}
 	if snapshot.HasPrimary {
 		limit.Windows = append(limit.Windows, telemetry.WindowTelemetry{
-			Kind:               telemetry.PrimaryWindow,
-			UsedPercent:        snapshot.PrimaryUsedPercent,
-			ResetsAt:           primaryReset,
-			ObservedAt:         observedAt,
-			Freshness:          telemetry.WindowFresh,
+			Kind:        telemetry.PrimaryWindow,
+			UsedPercent: snapshot.PrimaryUsedPercent,
+			ResetsAt:    primaryReset,
+			ObservedAt:  observedAt,
+			Freshness:   telemetry.WindowFresh,
 		})
 	}
 	if snapshot.HasSecondary {
 		limit.Windows = append(limit.Windows, telemetry.WindowTelemetry{
-			Kind:               telemetry.SecondaryWindow,
-			UsedPercent:        snapshot.SecondaryUsedPercent,
-			ResetsAt:           secondaryReset,
-			ObservedAt:         observedAt,
-			Freshness:          telemetry.WindowFresh,
+			Kind:        telemetry.SecondaryWindow,
+			UsedPercent: snapshot.SecondaryUsedPercent,
+			ResetsAt:    secondaryReset,
+			ObservedAt:  observedAt,
+			Freshness:   telemetry.WindowFresh,
 		})
 	}
 	limit.RefreshStaleness(observedAt)

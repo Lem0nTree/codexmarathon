@@ -45,7 +45,7 @@ func TestProactiveThresholdSelectsDeterministicLowerPressureAccount(t *testing.T
 	now := time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC)
 	engine := NewConfiguredEngine(EngineConfig{FreshnessTTL: time.Hour, Cooldown: time.Minute}, nil, func() time.Time { return now })
 	decision := engine.EvaluateThreshold([]telemetry.AccountTelemetry{
-		policyAccountWithWindows("account-z", []float64{20, 35}, now),
+		policyAccountWithWindows("account-z", []float64{80, 90}, now),
 		policyAccountWithWindows("account-b", []float64{20, 10}, now),
 		policyAccountWithWindows("account-a", []float64{20, 10}, now),
 	}, "account-z", Thresholds{PrimaryPercent: 80, SecondaryPercent: 90}, now)
@@ -131,11 +131,11 @@ func TestTransitionCooldownPreventsImmediateLoop(t *testing.T) {
 
 func policyAccount(accountID string, usage float64, resetAt, observedAt time.Time) telemetry.AccountTelemetry {
 	window := telemetry.WindowTelemetry{
-		Kind:       telemetry.PrimaryWindow,
+		Kind:        telemetry.PrimaryWindow,
 		UsedPercent: usage,
-		ResetsAt:   &resetAt,
-		ObservedAt: observedAt,
-		Freshness:  telemetry.WindowFresh,
+		ResetsAt:    &resetAt,
+		ObservedAt:  observedAt,
+		Freshness:   telemetry.WindowFresh,
 	}
 	return telemetry.AccountTelemetry{
 		AccountID:  accountID,

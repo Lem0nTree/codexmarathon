@@ -2035,7 +2035,6 @@ dependencies = [
  "codex-http-client",
  "codex-image-generation-extension",
  "codex-login",
- "codexmarathon-runtime",
  "codex-mcp",
  "codex-mcp-extension",
  "codex-memories-extension",
@@ -2064,6 +2063,8 @@ dependencies = [
  "codex-utils-pty",
  "codex-web-search-extension",
  "codex-windows-sandbox",
+ "codexmarathon-runtime",
+ "codexmarathon-runtime-adapter",
  "core_test_support",
  "flate2",
  "futures",
@@ -2419,7 +2420,6 @@ dependencies = [
  "codex-http-client",
  "codex-install-context",
  "codex-login",
- "codexmarathon-runtime",
  "codex-mcp",
  "codex-mcp-server",
  "codex-memories-write",
@@ -2443,6 +2443,7 @@ dependencies = [
  "codex-utils-cli",
  "codex-utils-path",
  "codex-windows-sandbox",
+ "codexmarathon-runtime",
  "crossterm",
  "futures",
  "http 1.4.0",
@@ -3601,29 +3602,6 @@ dependencies = [
  "urlencoding",
  "webbrowser",
  "wiremock",
-]
-
-[[package]]
-name = "codexmarathon-runtime"
-version = "0.152.0"
-dependencies = [
-	"codex-backend-client",
-	"codex-core",
-	"codex-http-client",
-	"codex-login",
-	"codexmarathon-runtime-adapter",
- "serde_json",
- "tempfile",
- "tokio",
-]
-
-[[package]]
-name = "codexmarathon-runtime-adapter"
-version = "0.1.0"
-dependencies = [
-	"serde",
-	"serde_json",
-	"tokio",
 ]
 
 [[package]]
@@ -4914,6 +4892,31 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+]
+
+[[package]]
+name = "codexmarathon-runtime"
+version = "0.152.0"
+dependencies = [
+ "codex-backend-client",
+ "codex-core",
+ "codex-http-client",
+ "codex-login",
+ "codex-protocol",
+ "codexmarathon-runtime-adapter",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "codexmarathon-runtime-adapter"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

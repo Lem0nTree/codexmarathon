@@ -9,10 +9,15 @@
 
 use crate::{NativeCodexRuntime, NativeRecoveryBridge};
 use codex_backend_client::Client as BackendClient;
+use codex_core::ThreadManager;
+use codex_http_client::{HttpClientFactory, OutboundProxyPolicy};
+use codex_login::auth::AgentIdentityStorage;
 use codex_login::{
-    AuthCredentialsStoreMode, AuthDotJson, AuthKeyringBackendKind, AuthManager,
-    AuthReloadStatus, AuthRouteConfig, CLIENT_ID, ServerOptions, load_auth_dot_json, run_login_server,
-    save_auth,
+    AuthCredentialsStoreMode, AuthDotJson, AuthKeyringBackendKind, AuthManager, AuthReloadStatus,
+    AuthRouteConfig, CLIENT_ID, ServerOptions, load_auth_dot_json, run_login_server, save_auth,
+};
+use codex_protocol::protocol::{
+    RateLimitSnapshot as NativeRateLimitSnapshot, RateLimitWindow as NativeRateLimitWindow,
 };
 use codexmarathon_runtime_adapter::protocol::{
     NativeAuthSnapshotResult, NativeLoginParams, NativeLoginResult, NativeRefreshParams,
@@ -21,9 +26,6 @@ use codexmarathon_runtime_adapter::protocol::{
 use codexmarathon_runtime_adapter::{
     BackendError, BackendIdentity, BackendRateLimits, BackendReload,
 };
-use codex_core::ThreadManager;
-use codex_http_client::{HttpClientFactory, OutboundProxyPolicy};
-use codex_protocol::protocol::{RateLimitSnapshot as NativeRateLimitSnapshot, RateLimitWindow as NativeRateLimitWindow};
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::path::PathBuf;
@@ -225,16 +227,19 @@ impl CodexNativeRuntime {
     fn identity_from_snapshot(auth: &AuthDotJson) -> Option<String> {
         auth.tokens
             .as_ref()
-            .and_then(|tokens| tokens.account_id.clone().or_else(|| {
-                tokens.id_token.chatgpt_account_id.clone()
-            }))
+            .and_then(|tokens| {
+                tokens
+                    .account_id
+                    .clone()
+                    .or_else(|| tokens.id_token.chatgpt_account_id.clone())
+            })
             .or_else(|| {
-                auth.agent_identity.as_ref().and_then(|identity| match identity {
-                    codex_login::AgentIdentityStorage::Jwt(_) => None,
-                    codex_login::AgentIdentityStorage::Record(record) => {
-                        Some(record.account_id.clone())
-                    }
-                })
+                auth.agent_identity
+                    .as_ref()
+                    .and_then(|identity| match identity {
+                        AgentIdentityStorage::Jwt(_) => None,
+                        AgentIdentityStorage::Record(record) => Some(record.account_id.clone()),
+                    })
             })
     }
 
@@ -282,7 +287,9 @@ impl CodexNativeRuntime {
         server
             .block_until_done_with_callback_result()
             .await
-            .map_err(|_| BackendError::new("native_login_failed", "Codex login did not complete"))?;
+            .map_err(|_| {
+                BackendError::new("native_login_failed", "Codex login did not complete")
+            })?;
         let auth = load_auth_dot_json(
             temp_home.path(),
             AuthCredentialsStoreMode::File,
@@ -290,7 +297,10 @@ impl CodexNativeRuntime {
         )
         .map_err(|_| BackendError::new("native_login_failed", "Codex login data was not saved"))?
         .ok_or_else(|| {
-            BackendError::new("native_login_failed", "Codex login returned no auth snapshot")
+            BackendError::new(
+                "native_login_failed",
+                "Codex login returned no auth snapshot",
+            )
         })?;
         let snapshot_account_id = Self::identity_from_snapshot(&auth);
         if let (Some(requested), Some(observed)) =
@@ -303,13 +313,16 @@ impl CodexNativeRuntime {
             ));
         }
         let account_id = snapshot_account_id.or(params.account_id).ok_or_else(|| {
-                BackendError::new(
-                    "native_login_failed",
-                    "Codex login returned no account identity",
-                )
-            })?;
+            BackendError::new(
+                "native_login_failed",
+                "Codex login returned no account identity",
+            )
+        })?;
         let auth_json = serde_json::to_value(&auth).map_err(|_| {
-            BackendError::new("native_login_failed", "Codex auth snapshot could not be encoded")
+            BackendError::new(
+                "native_login_failed",
+                "Codex auth snapshot could not be encoded",
+            )
         })?;
         Ok(NativeLoginResult {
             account_id,
@@ -325,7 +338,10 @@ impl CodexNativeRuntime {
     ) -> Result<NativeRefreshResult, BackendError> {
         let requested_account_id = params.account_id;
         let auth: AuthDotJson = serde_json::from_value(params.auth_json).map_err(|_| {
-            BackendError::new("native_refresh_failed", "auth snapshot is not valid Codex JSON")
+            BackendError::new(
+                "native_refresh_failed",
+                "auth snapshot is not valid Codex JSON",
+            )
         })?;
         if let Some(snapshot_account_id) = Self::identity_from_snapshot(&auth)
             && snapshot_account_id != requested_account_id
@@ -348,7 +364,9 @@ impl CodexNativeRuntime {
             AuthCredentialsStoreMode::File,
             AuthKeyringBackendKind::default(),
         )
-        .map_err(|_| BackendError::new("native_refresh_failed", "auth snapshot could not be staged"))?;
+        .map_err(|_| {
+            BackendError::new("native_refresh_failed", "auth snapshot could not be staged")
+        })?;
 
         let manager = AuthManager::shared(
             temp_home.path().to_path_buf(),
@@ -421,7 +439,11 @@ impl CodexNativeRuntime {
                 )
             })?;
         let account_id = Self::identity_from_snapshot(&auth)
-            .or_else(|| auth_manager.auth_cached().and_then(|auth| auth.get_account_id()))
+            .or_else(|| {
+                auth_manager
+                    .auth_cached()
+                    .and_then(|auth| auth.get_account_id())
+            })
             .ok_or_else(|| {
                 BackendError::new(
                     "auth_snapshot_unavailable",
@@ -496,9 +518,15 @@ impl CodexNativeRuntime {
             .chatgpt_base_url
             .unwrap_or_else(|| "https://chatgpt.com/backend-api".to_string());
         let client = BackendClient::from_auth(base_url, &auth, auth_config.http_client_factory);
-        let response = client.get_rate_limits_with_reset_credits().await.map_err(|error| {
-            BackendError::new("rate_limits_failed", format!("failed to fetch Codex rate limits: {error}"))
-        })?;
+        let response = client
+            .get_rate_limits_with_reset_credits()
+            .await
+            .map_err(|error| {
+                BackendError::new(
+                    "rate_limits_failed",
+                    format!("failed to fetch Codex rate limits: {error}"),
+                )
+            })?;
         let mut snapshots = response.rate_limits.into_iter();
         let first = snapshots.next().ok_or_else(|| {
             BackendError::new(
@@ -572,9 +600,9 @@ impl NativeCodexRuntime for CodexNativeRuntime {
     }
 
     fn read_rate_limits(&mut self) -> Result<BackendRateLimits, BackendError> {
-		let auth_manager = Arc::clone(&self.auth_manager);
-		let config = self.auth_config.clone();
-		self.run_async(Self::read_rate_limits_native(auth_manager, config))
+        let auth_manager = Arc::clone(&self.auth_manager);
+        let config = self.auth_config.clone();
+        self.run_async(Self::read_rate_limits_native(auth_manager, config))
     }
 
     fn read_auth_snapshot(&mut self) -> Result<NativeAuthSnapshotResult, BackendError> {
@@ -618,31 +646,35 @@ impl NativeCodexRuntime for CodexNativeRuntime {
     }
 }
 
-fn map_rate_limit_snapshot(snapshot: NativeRateLimitSnapshot) -> codexmarathon_runtime_adapter::protocol::RateLimitSnapshot {
-	codexmarathon_runtime_adapter::protocol::RateLimitSnapshot {
-		limit_id: snapshot.limit_id,
-		limit_name: None,
-		plan_type: snapshot.plan_type.and_then(|value| enum_label(&value)),
-		rate_limit_reached_type: snapshot
-			.rate_limit_reached_type
-			.and_then(|value| enum_label(&value)),
-		primary: snapshot.primary.map(map_rate_limit_window),
-		secondary: snapshot.secondary.map(map_rate_limit_window),
-	}
+fn map_rate_limit_snapshot(
+    snapshot: NativeRateLimitSnapshot,
+) -> codexmarathon_runtime_adapter::protocol::RateLimitSnapshot {
+    codexmarathon_runtime_adapter::protocol::RateLimitSnapshot {
+        limit_id: snapshot.limit_id,
+        limit_name: None,
+        plan_type: snapshot.plan_type.and_then(|value| enum_label(&value)),
+        rate_limit_reached_type: snapshot
+            .rate_limit_reached_type
+            .and_then(|value| enum_label(&value)),
+        primary: snapshot.primary.map(map_rate_limit_window),
+        secondary: snapshot.secondary.map(map_rate_limit_window),
+    }
 }
 
-fn map_rate_limit_window(window: NativeRateLimitWindow) -> codexmarathon_runtime_adapter::protocol::RateLimitWindow {
-	codexmarathon_runtime_adapter::protocol::RateLimitWindow {
-		used_percent: window.used_percent,
-		window_duration_mins: window
-			.window_minutes
-			.and_then(|value| u64::try_from(value).ok()),
-		resets_at: window.resets_at.and_then(|value| u64::try_from(value).ok()),
-	}
+fn map_rate_limit_window(
+    window: NativeRateLimitWindow,
+) -> codexmarathon_runtime_adapter::protocol::RateLimitWindow {
+    codexmarathon_runtime_adapter::protocol::RateLimitWindow {
+        used_percent: window.used_percent,
+        window_duration_mins: window
+            .window_minutes
+            .and_then(|value| u64::try_from(value).ok()),
+        resets_at: window.resets_at.and_then(|value| u64::try_from(value).ok()),
+    }
 }
 
 fn enum_label<T: serde::Serialize>(value: &T) -> Option<String> {
-	serde_json::to_value(value)
-		.ok()
-		.and_then(|value| value.as_str().map(str::to_string))
+    serde_json::to_value(value)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
 }

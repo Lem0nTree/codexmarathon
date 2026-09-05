@@ -9,9 +9,11 @@
 use crate::adapter::{CodextBackend, RuntimeAdapter};
 use crate::error::AdapterError;
 use std::io;
-use std::path::PathBuf;
+#[cfg(unix)]
+use std::os::unix::fs::FileTypeExt;
 #[cfg(unix)]
 use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
@@ -71,8 +73,8 @@ impl<B: CodextBackend + Send + 'static> RuntimeServer<B> {
     /// Request a graceful listener shutdown.  The current client session is
     /// allowed to flush its response before the accept loop exits.
     pub fn shutdown(&self) {
-		self.shutdown_requested.store(true, Ordering::Release);
-		self.shutdown.notify_waiters();
+        self.shutdown_requested.store(true, Ordering::Release);
+        self.shutdown.notify_waiters();
     }
 
     fn is_shutdown_requested(&self) -> bool {
@@ -279,7 +281,10 @@ fn adapter_error_to_io(error: AdapterError) -> io::Error {
 #[cfg(unix)]
 fn prepare_unix_socket(path: &Path) -> io::Result<()> {
     let parent = path.parent().ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidInput, "Unix socket has no parent directory")
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Unix socket has no parent directory",
+        )
     })?;
     std::fs::create_dir_all(parent)?;
     use std::os::unix::fs::PermissionsExt;
@@ -298,7 +303,10 @@ fn prepare_unix_socket(path: &Path) -> io::Result<()> {
                     if matches!(
                         error.kind(),
                         io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
-                    ) => std::fs::remove_file(path),
+                    ) =>
+                {
+                    std::fs::remove_file(path)
+                }
                 Err(error) => Err(error),
             }
         }

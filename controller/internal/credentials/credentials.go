@@ -53,8 +53,8 @@ type Tokens = TokenSet
 // to the account's stored snapshot. RefreshedAt is optional; a zero value is
 // replaced by the vault clock.
 type TokenWriteBackRequest struct {
-	AccountID  string
-	Tokens     TokenSet
+	AccountID   string
+	Tokens      TokenSet
 	RefreshedAt time.Time
 }
 
@@ -162,7 +162,7 @@ func (v *FileVault) Save(accountID string, raw []byte) error {
 	if err := v.ensureDir(); err != nil {
 		return err
 	}
-	return writeFileAtomically(v.pathUnchecked(accountID), canonical, 0o600)
+	return WriteAtomically(v.pathUnchecked(accountID), canonical)
 }
 
 // Put is a compatibility spelling for Save.
@@ -336,7 +336,7 @@ func (v *FileVault) WriteBack(request TokenWriteBackRequest) error {
 	if err != nil {
 		return err
 	}
-	return writeFileAtomically(path, updated, 0o600)
+	return WriteAtomically(path, updated)
 }
 
 // WriteBackTokens is a convenience method for callers that already have the

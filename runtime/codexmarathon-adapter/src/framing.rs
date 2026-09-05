@@ -1,7 +1,7 @@
 //! Newline-delimited JSON framing used by the local Marathon IPC seam.
 
-use serde::de::DeserializeOwned;
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 use std::io::{BufRead, Write};
 
 pub const DEFAULT_MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
@@ -67,10 +67,7 @@ impl JsonLineCodec {
     /// Reads one non-empty line.  The delimiter is included in the size
     /// limit, and a final unterminated line is accepted for test pipes and
     /// graceful EOF handling.
-    pub fn read_frame<R: BufRead>(
-        &self,
-        reader: &mut R,
-    ) -> Result<Option<Vec<u8>>, FramingError> {
+    pub fn read_frame<R: BufRead>(&self, reader: &mut R) -> Result<Option<Vec<u8>>, FramingError> {
         loop {
             let mut frame = Vec::new();
             let mut found_delimiter = false;

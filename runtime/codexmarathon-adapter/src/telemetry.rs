@@ -6,8 +6,8 @@
 //! connection and preserves the upstream camelCase payload members.
 
 use crate::protocol::{
-    EventBase, RateLimitSnapshot, RateLimitsSnapshotPayload, RateLimitsUpdatedPayload,
-    RuntimeEvent, EVENT_RATE_LIMITS_SNAPSHOT, EVENT_RATE_LIMITS_UPDATED,
+    EVENT_RATE_LIMITS_SNAPSHOT, EVENT_RATE_LIMITS_UPDATED, EventBase, RateLimitSnapshot,
+    RateLimitsSnapshotPayload, RateLimitsUpdatedPayload, RuntimeEvent,
 };
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -19,9 +19,7 @@ impl TelemetryForwarder {
         base: EventBase,
         account_id: Option<String>,
         rate_limits: RateLimitSnapshot,
-        rate_limits_by_limit_id: Option<
-            std::collections::BTreeMap<String, RateLimitSnapshot>,
-        >,
+        rate_limits_by_limit_id: Option<std::collections::BTreeMap<String, RateLimitSnapshot>>,
     ) -> Result<RuntimeEvent, serde_json::Error> {
         RuntimeEvent::new(
             EventBase {
@@ -54,4 +52,3 @@ impl TelemetryForwarder {
         )
     }
 }
-

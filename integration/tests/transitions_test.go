@@ -7,17 +7,17 @@ import (
 	"testing"
 	"time"
 
+	fakeruntime "codexmarathon/controller/integration/fake-runtime"
 	"codexmarathon/controller/internal/credentials"
 	"codexmarathon/controller/internal/runtime"
 	"codexmarathon/controller/internal/transitions"
-	fakeruntime "codexmarathon/controller/integration/fake-runtime"
 )
 
 type memoryDeployer struct {
-	mu       sync.Mutex
-	disk     string
-	deploys  []string
-	err      error
+	mu      sync.Mutex
+	disk    string
+	deploys []string
+	err     error
 }
 
 func (d *memoryDeployer) Deploy(accountID string) (credentials.DeploymentResult, error) {
@@ -48,9 +48,9 @@ func TestSafeTransitionDefersUntilTurnBoundary(t *testing.T) {
 	rt.SetActiveTurnCount(1)
 	deployer := &memoryDeployer{disk: "account-a"}
 	coordinator := transitions.NewCoordinator(transitions.Config{
-		Runtime: rt,
-		Deployer: deployer,
-		Disk: transitions.DiskIdentityFunc(func() (string, error) { return deployer.Disk(), nil }),
+		Runtime:              rt,
+		Deployer:             deployer,
+		Disk:                 transitions.DiskIdentityFunc(func() (string, error) { return deployer.Disk(), nil }),
 		BoundaryPollInterval: 5 * time.Millisecond,
 	})
 
@@ -113,9 +113,9 @@ func TestLostCommitAckReconcilesCommittedState(t *testing.T) {
 	rt := fakeruntime.New("account-a", 7)
 	deployer := &memoryDeployer{disk: "account-a"}
 	coordinator := transitions.NewCoordinator(transitions.Config{
-		Runtime: rt,
+		Runtime:  rt,
 		Deployer: deployer,
-		Disk: transitions.DiskIdentityFunc(func() (string, error) { return deployer.Disk(), nil }),
+		Disk:     transitions.DiskIdentityFunc(func() (string, error) { return deployer.Disk(), nil }),
 	})
 	rt.DropNextCommitAck()
 	result, err := coordinator.RequestTransition(context.Background(), "account-b")

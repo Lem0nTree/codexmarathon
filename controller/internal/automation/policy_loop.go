@@ -34,9 +34,9 @@ const (
 // Event is intentionally secret-free. EventID should be the runtime's stable
 // notification ID when available; duplicate IDs are suppressed by policy.
 type Event struct {
-	ID        string
-	Type      EventType
-	AccountID string
+	ID         string
+	Type       EventType
+	AccountID  string
 	OccurredAt time.Time
 }
 
@@ -57,19 +57,19 @@ type TransitionFunc func(context.Context, string) error
 // conservative bounded wake-up; server reset timestamps remain the preferred
 // wake-up and are never treated as proof of restored quota.
 type Config struct {
-	Router         *telemetry.MultiAccountUsageRouter
-	Policy         *policy.Engine
-	Accounts       AccountSource
-	Transition     TransitionFunc
-	Thresholds     policy.Thresholds
-	FreshnessTTL   time.Duration
-	PollInterval   time.Duration
-	MaxWaitSlice   time.Duration
-	Now            func() time.Time
+	Router       *telemetry.MultiAccountUsageRouter
+	Policy       *policy.Engine
+	Accounts     AccountSource
+	Transition   TransitionFunc
+	Thresholds   policy.Thresholds
+	FreshnessTTL time.Duration
+	PollInterval time.Duration
+	MaxWaitSlice time.Duration
+	Now          func() time.Time
 	// OnError receives a non-fatal observation/transition error. The loop
 	// keeps running and schedules a bounded retry; a transient provider or
 	// runtime failure must not silently disable automatic account switching.
-	OnError        func(error)
+	OnError func(error)
 }
 
 // ObservationResult is returned for operator diagnostics and tests. Each
@@ -239,7 +239,10 @@ func (l *Loop) Run(ctx context.Context, events <-chan Event) error {
 			timer = time.NewTimer(delay)
 		} else {
 			if !timer.Stop() {
-				select { case <-timer.C: default: }
+				select {
+				case <-timer.C:
+				default:
+				}
 			}
 			timer.Reset(delay)
 		}

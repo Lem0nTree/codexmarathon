@@ -69,4 +69,3 @@ impl From<std::io::Error> for AdapterError {
         Self::Io(error)
     }
 }
-

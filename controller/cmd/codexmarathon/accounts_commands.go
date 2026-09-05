@@ -51,7 +51,7 @@ Usage:
   codexmarathon accounts refresh <account-id> --runtime <endpoint> [options]
   codexmarathon accounts remove <account-id> [options]
 
-` 
+`
 
 func runAccountsLogin(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("accounts login", flag.ContinueOnError)

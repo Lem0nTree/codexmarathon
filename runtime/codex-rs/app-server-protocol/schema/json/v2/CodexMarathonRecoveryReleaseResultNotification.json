@@ -1,0 +1,46 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "Result sent by the TUI after applying a Marathon release command to the session-owned pending recovery state.\n\nThe result is intentionally string-shaped at this upstream protocol seam; the Marathon adapter maps it to its typed release outcome without making the Codex app-server protocol depend on Marathon crates.",
+  "properties": {
+    "errorCode": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "errorMessage": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "expectedGeneration": {
+      "format": "uint64",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "outcome": {
+      "type": "string"
+    },
+    "recoveryId": {
+      "type": "string"
+    },
+    "threadId": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "transitionId": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "expectedGeneration",
+    "outcome",
+    "recoveryId",
+    "transitionId"
+  ],
+  "title": "CodexMarathonRecoveryReleaseResultNotification",
+  "type": "object"
+}

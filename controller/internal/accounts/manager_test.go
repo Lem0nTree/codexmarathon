@@ -14,7 +14,7 @@ import (
 )
 
 type fakeAuthService struct {
-	loginResults   []LoginResult
+	loginResults  []LoginResult
 	loginErr      error
 	refreshTokens credentials.TokenSet
 	refreshErr    error
@@ -61,7 +61,7 @@ func (d failingDeployer) Deploy(accountID string) (credentials.DeploymentResult,
 	return credentials.DeploymentResult{AccountID: accountID, Path: d.authPath}, nil
 }
 
-func newManagerFixture(t *testing.T, auth AuthService, deployer credentials.CredentialDeployer) (*Manager, *FileVault, *FileRegistry, string) {
+func newManagerFixture(t *testing.T, auth AuthService, deployer credentials.CredentialDeployer) (*Manager, *credentials.FileVault, *FileRegistry, string) {
 	t.Helper()
 	root := t.TempDir()
 	vault := credentials.NewFileVault(filepath.Join(root, "credentials"))

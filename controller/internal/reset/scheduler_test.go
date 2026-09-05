@@ -136,11 +136,11 @@ func TestSchedulerIncludesEarliestResetAccountInRevalidation(t *testing.T) {
 
 func exhaustedAccount(accountID, limitID string, resetAt, observedAt time.Time) telemetry.AccountTelemetry {
 	window := telemetry.WindowTelemetry{
-		Kind:       telemetry.PrimaryWindow,
+		Kind:        telemetry.PrimaryWindow,
 		UsedPercent: 100,
-		ResetsAt:   &resetAt,
-		ObservedAt: observedAt,
-		Freshness:  telemetry.WindowFresh,
+		ResetsAt:    &resetAt,
+		ObservedAt:  observedAt,
+		Freshness:   telemetry.WindowFresh,
 	}
 	return telemetry.AccountTelemetry{
 		AccountID:  accountID,

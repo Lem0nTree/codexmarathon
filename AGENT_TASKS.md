@@ -1,135 +1,116 @@
-# CodexMarathon feature-agent assignments
+# CodexMarathon companion-agent assignments
 
-These are feature-sized assignments. Each agent owns an end-to-end capability,
-including donor-code import, integration, tests, documentation, and a reviewable
-handoff. Agents must preserve unrelated work and may not declare success from
-static inspection alone when a compiler or live runtime is required.
+These assignments describe the installed-Codex companion product. Agents own
+the implementation, focused tests, documentation, and evidence for their
+area. They must preserve unrelated work and report compiler/live checks as
+passed, blocked, or failed from observed output.
 
-## Agent 1 — Runtime product baseline
+## Agent 1 — Installed-Codex discovery and command wrapper
 
-Create the in-repository CodexMarathon runtime from the pinned Codext source.
-Preserve Apache-2.0 attribution, retain the normal Codex CLI/TUI behavior, add
-the existing Marathon adapter as an internal crate/module, and expose native
-AuthManager, identity, turn-state, telemetry, transport-invalidation, and
-recovery seams. Establish the upstream patch/provenance ledger and a focused
-build that does not require the donor checkout.
+Implement executable discovery through an explicit `--codex` path,
+configuration, or `PATH`; version/capability probing; actionable `doctor`
+output; argument forwarding; and launch identity capture. The wrapper must
+never search donor trees or start the optional embedded app-server.
 
 Acceptance:
 
-- CodexMarathon's tracked runtime builds and launches as a Codex-compatible CLI.
-- No separate Codext installation or process started by the user is required.
-- Existing Codext continuity behavior remains covered by imported/adapted tests.
-- All copied paths and commits appear in the provenance manifest.
+- A clean machine with `codex` installed is detected without reading secrets.
+- Missing/incompatible Codex versions produce actionable diagnostics.
+- Normal Codex arguments and conversation/thread identity survive wrapper
+  launch.
 
-## Agent 2 — Native multi-account login and credential lifecycle
+## Agent 2 — Multi-account login and credential lifecycle
 
-Deliver the complete account-manager experience. Reuse codex-switch profile,
-auth-refresh, switching, and relevant CLI code; replace its shell-out login
-with direct use of the integrated Codex login crate. Implement account login,
-list, status, rename, activate, refresh, and safe removal. Integrate secure
-credential storage, atomic active-auth deployment, and refreshed-token
-write-back to the correct account.
+Implement login/add, list/status, activate/use, rename, refresh, and remove
+through the supported installed-Codex interface. Store opaque snapshots in the
+protected vault, preserve refreshed fields, and keep tokens out of metadata,
+logs, journals, diagnostics, and output.
 
 Acceptance:
 
-- A user can log into at least two accounts using only `codexmarathon`.
-- No token appears in registry metadata, logs, journal, or normal CLI output.
-- Manual A -> B -> A switching preserves refreshed credentials.
-- Failure/cancellation leaves the previous active account intact.
+- Two profiles can be created and switched without manual `auth.json` copying.
+- Failed or canceled activation leaves the previous profile intact.
+- Refreshed credentials return to the correct profile.
 
-## Agent 3 — Quota intelligence and automatic account policy
+## Agent 3 — Quota and account policy
 
-Deliver active and inactive account quota observation and the automatic policy
-engine. Reuse codex-switch quota, cache, retry, watcher/candidate, threshold,
-and cooldown code, then adapt it to CodexMarathon's multi-bucket telemetry,
-freshness, and runtime event model. Implement proactive thresholds,
-`UsageLimitExceeded`, loop prevention, deterministic account ranking, complete
-pool exhaustion, earliest-reset selection, bounded waiting, and mandatory
-post-reset revalidation.
+Implement active/inactive quota observation, fresh telemetry, threshold and
+`UsageLimitExceeded` decisions, candidate ranking, cooldowns, exhausted-pool
+waiting, reset scheduling, and mandatory post-reset revalidation.
 
 Acceptance:
 
-- Both proactive threshold and hard-limit events produce a deterministic next
-  action from fresh telemetry.
-- Stale/ambiguous data never authorizes a switch.
-- All-exhausted pools wait without busy polling and never infer restored quota.
-- Tests cover multiple buckets, partial updates, errors, cooldowns, and resets.
+- Focused tests cover multi-bucket, stale/partial, error, reset, and pool
+  exhaustion cases.
+- No stale or ambiguous observation authorizes an account transition.
 
-## Agent 4 — Transactional live account switching
+## Agent 4 — Preferred live control transition
 
-Integrate the Go transition model with the embedded runtime's native mechanics.
-Implement safe-boundary waiting, Account A token synchronization, atomic
-Account B deployment, correlated reload, transport invalidation, identity
-refresh, TransitionID/AuthGeneration validation, and three-way reconciliation
-of controller intent, disk identity, and runtime identity.
+Integrate the installed Codex supported local control interface. Negotiate
+capabilities, wait for Codex's safe boundary, preserve Account A refreshes,
+atomically deploy Account B, request native reload and transport invalidation,
+and verify account/generation identity before commit.
 
 Acceptance:
 
-- Authentication never changes during an active turn.
-- A committed transition proves that disk and runtime both use Account B at the
-  expected generation.
-- Lost acknowledgements, disconnects, reload failures, and stale commands have
-  deterministic recoverable outcomes.
-- The first post-transition model request cannot reuse Account A's transport.
+- A compatible running Codex process switches without losing its conversation.
+- Active turns prevent credential mutation.
+- Lost acknowledgements and stale generations reconcile by the same transition
+  ID.
 
-## Agent 5 — Exactly-once interrupted-task recovery
+## Agent 5 — Controlled restart and resume fallback
 
-Connect automatic policy decisions to Codext's existing parked recovery turn.
-Reuse Codext's `UsageLimitExceeded` recovery queue and configured resume prompt;
-do not create a controller-owned continuation. Keep recovery parked while the
-pool is exhausted, release it only after a verified identity-changing reload,
-and persist sufficient metadata to survive controller/runtime restarts without
-losing or duplicating the continuation.
+Implement the fallback for Codex versions without live control. Ask the same
+Codex process to exit cleanly, confirm exit, deploy credentials atomically,
+relaunch the same executable, resume the same conversation/thread, and verify
+the target identity.
 
 Acceptance:
 
-- A failed Account A request resumes once in the same thread on Account B.
-- User-queued input and synthetic recovery retain the intended ordering.
-- Pool-exhaustion waiting does not discard or submit recovery early.
-- Crash/restart tests at every transition phase produce zero duplicate turns.
+- Deployment never occurs before process exit.
+- Resume uses an exact thread ID or Codex's `--last` selection and preserves
+  original arguments.
+- Partial restart failures remain durable and reconcilable.
 
-## Agent 6 — Unified launcher, IPC, and operational lifecycle
+## Agent 6 — Exactly-once recovery and restart durability
 
-Make CodexMarathon a one-command product. Choose and implement either a direct
-single-process integration or automatically managed bundled processes. If IPC
-remains, provide authenticated user-scoped Unix sockets and Windows named
-pipes, protocol compatibility checks, startup readiness, health monitoring,
-reconnect, graceful shutdown, and diagnostics. The user must never configure
-or launch an adapter or donor executable.
+Connect policy decisions to Codex's existing parked recovery turn. Keep it
+parked through exhaustion/reset waiting, release it only after a verified live
+reload or controlled resume, and persist transition/recovery intent across
+companion or Codex process restarts.
 
 Acceptance:
 
-- `codexmarathon` starts every required internal component.
-- Component version mismatch fails safely with an actionable error.
-- Runtime crashes and reconnects preserve or reconcile in-flight state.
-- No unauthenticated TCP listener is part of the default product.
+- The interrupted task resumes once in the same conversation.
+- Crash, reconnect, duplicate-event, and lost-response cases produce zero
+  duplicate continuations.
 
-## Agent 7 — Release validation and packaging
+## Agent 7 — Companion packaging and release evidence
 
-Build the release evidence and distribution pipeline. Add live end-to-end
-fixtures, Linux and Windows CI, clean-machine installation tests, upgrade and
-rollback checks, license/provenance validation, release artifacts, and concise
-operator documentation. Exercise real integrated runtime paths, not only the
-fake runtime.
+Build the Go-only default archive and clean-machine checks. Keep the imported
+Rust runtime behind explicit opt-in, validate the archive distribution marker,
+and document installed-Codex acceptance for both live reload and controlled
+restart/resume. Do not replace missing live evidence with embedded-runtime or
+fake-runtime smoke results.
 
 Acceptance:
 
-- All ten scenarios in `PLAN.md` Gate 7 pass in CI.
-- A clean supported machine installs and runs without donor repositories or
-  developer toolchains.
-- Release artifacts contain required licenses/notices and no credentials.
-- Published checks clearly separate simulated, integration, and live evidence.
+- Linux companion artifact contains one `codexmarathon` entrypoint and no
+  `codex-app-server`.
+- Optional embedded-runtime artifacts require an explicit flag and are marked
+  separately.
+- Static, focused, integration, optional-runtime, and live installed-Codex
+  evidence are clearly distinguished.
 
 ## Dependency order and orchestration
 
-1. Agent 1 establishes the runtime baseline.
-2. Agents 2 and 3 can proceed in parallel against that pinned baseline.
-3. Agent 4 consumes the reviewed outputs of Agents 1–3.
-4. Agent 5 consumes the live transition path from Agent 4.
-5. Agent 6 owns final process integration after the runtime boundary stabilizes.
-6. Agent 7 validates the whole product and is not permitted to replace missing
-   live evidence with mocks.
+1. Agent 1 establishes installed-Codex discovery and wrapper behavior.
+2. Agents 2 and 3 can proceed in parallel against that boundary.
+3. Agent 4 consumes Agents 1–3 for live reload.
+4. Agent 5 provides the fallback process boundary and resume identity.
+5. Agent 6 connects both transition paths to recovery and restart replay.
+6. Agent 7 packages and validates the resulting companion release.
 
-After each assignment, the orchestrator reviews provenance, scope, security,
-tests, and behavior before unlocking dependent work. Rejected work returns as
-one coherent feature correction, not a collection of microtasks.
+The orchestrator should assign independent tasks to Luna Max agents where
+slots permit, review shared-worktree diffs after each handoff, and run the
+full companion verification before calling the product complete.

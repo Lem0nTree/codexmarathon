@@ -14,9 +14,9 @@ import (
 )
 
 const (
-	defaultEventBuffer   = 32
-	defaultErrorBuffer   = 4
-	defaultMaxLineBytes  = 4 << 20
+	defaultEventBuffer  = 32
+	defaultErrorBuffer  = 4
+	defaultMaxLineBytes = 4 << 20
 )
 
 var (
@@ -88,16 +88,16 @@ func WithErrorBuffer(size int) ClientOption {
 type RequestID string
 
 type requestEnvelope struct {
-	JSONRPC string `json:"jsonrpc"`
+	JSONRPC string    `json:"jsonrpc"`
 	ID      RequestID `json:"id"`
-	Method  Method `json:"method"`
-	Params  any `json:"params,omitempty"`
+	Method  Method    `json:"method"`
+	Params  any       `json:"params,omitempty"`
 }
 
 type notificationEnvelope struct {
 	JSONRPC string `json:"jsonrpc"`
 	Method  Method `json:"method"`
-	Params  any `json:"params"`
+	Params  any    `json:"params"`
 }
 
 type rawEnvelope struct {
@@ -120,17 +120,17 @@ type callResponse struct {
 type Client struct {
 	conn io.ReadWriteCloser
 
-	writeMu sync.Mutex
-	stateMu sync.Mutex
+	writeMu   sync.Mutex
+	stateMu   sync.Mutex
 	channelMu sync.Mutex
-	closed  bool
-	pending map[RequestID]chan callResponse
+	closed    bool
+	pending   map[RequestID]chan callResponse
 
-	sequence atomic.Uint64
-	done     chan struct{}
+	sequence  atomic.Uint64
+	done      chan struct{}
 	closeOnce sync.Once
-	events   chan Event
-	errors   chan error
+	events    chan Event
+	errors    chan error
 
 	maxLineBytes int
 }
@@ -569,10 +569,17 @@ func (c *Client) handleMessage(line []byte) error {
 		return fmt.Errorf("%w: response id %q is not pending", ErrInvalidMessage, id)
 	}
 	select {
-	case responseCh <- callResponse{result: envelope.Result, err: envelope.Error}:
+	case responseCh <- callResponse{result: envelope.Result, err: responseError(envelope.Error)}:
 	case <-c.done:
 	}
 	return nil
+}
+
+func responseError(err *RPCError) error {
+	if err == nil {
+		return nil
+	}
+	return err
 }
 
 func (c *Client) reportError(err error) {

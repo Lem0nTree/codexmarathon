@@ -124,15 +124,15 @@ func (UnavailableAuthService) Refresh(context.Context, RefreshRequest) (credenti
 // SavedAt is the vault file modification time, not a claim that the provider
 // tokens are currently valid.
 type ProfileStatus struct {
-	AccountID        string                `json:"account_id"`
-	Alias            string                `json:"alias,omitempty"`
-	CredentialRef    string                `json:"credential_ref,omitempty"`
-	Active           bool                  `json:"active"`
-	CredentialPresent bool                 `json:"credential_present"`
-	CredentialHealth CredentialHealth       `json:"credential_health"`
-	SavedAt          *time.Time             `json:"saved_at,omitempty"`
-	LastTelemetryAt  *time.Time             `json:"last_telemetry_at,omitempty"`
-	TelemetrySource  string                `json:"telemetry_source,omitempty"`
+	AccountID         string           `json:"account_id"`
+	Alias             string           `json:"alias,omitempty"`
+	CredentialRef     string           `json:"credential_ref,omitempty"`
+	Active            bool             `json:"active"`
+	CredentialPresent bool             `json:"credential_present"`
+	CredentialHealth  CredentialHealth `json:"credential_health"`
+	SavedAt           *time.Time       `json:"saved_at,omitempty"`
+	LastTelemetryAt   *time.Time       `json:"last_telemetry_at,omitempty"`
+	TelemetrySource   string           `json:"telemetry_source,omitempty"`
 }
 
 // LoginOutcome reports non-secret evidence of a completed profile save.
@@ -152,21 +152,21 @@ type ActivationOutcome struct {
 // RefreshOutcome reports successful token write-back without exposing the
 // returned token set.
 type RefreshOutcome struct {
-	AccountID  string    `json:"account_id"`
+	AccountID   string    `json:"account_id"`
 	RefreshedAt time.Time `json:"refreshed_at"`
-	Activated  bool      `json:"activated"`
+	Activated   bool      `json:"activated"`
 }
 
 // ManagerConfig wires durable account state to a native runtime auth service.
 // Registry and Vault are required. Deployer/AuthPath are needed for login
 // activation, explicit activation, and refresh of the active profile.
 type ManagerConfig struct {
-	Registry   *FileRegistry
-	Vault      credentials.Vault
-	Deployer   credentials.CredentialDeployer
-	AuthPath   string
+	Registry    *FileRegistry
+	Vault       credentials.Vault
+	Deployer    credentials.CredentialDeployer
+	AuthPath    string
 	AuthService AuthService
-	Now        func() time.Time
+	Now         func() time.Time
 }
 
 // Manager owns serialized profile lifecycle mutations.  It does not own the
@@ -562,12 +562,12 @@ func (m *Manager) List() ([]ProfileStatus, error) {
 
 func (m *Manager) statusLocked(account Account, active bool) (ProfileStatus, error) {
 	status := ProfileStatus{
-		AccountID:         account.ID,
-		Alias:             account.Alias,
-		CredentialRef:     account.CredentialRef,
-		Active:            active,
-		CredentialHealth:  account.CredentialHealth,
-		TelemetrySource:   account.TelemetrySource,
+		AccountID:        account.ID,
+		Alias:            account.Alias,
+		CredentialRef:    account.CredentialRef,
+		Active:           active,
+		CredentialHealth: account.CredentialHealth,
+		TelemetrySource:  account.TelemetrySource,
 	}
 	if account.LastTelemetryAt != nil {
 		at := account.LastTelemetryAt.UTC()
@@ -611,7 +611,7 @@ func (m *Manager) activateLocked(ctx context.Context, accountID string) (Activat
 	if err != nil {
 		return ActivationOutcome{}, err
 	}
-	if err := m.deployer.Deploy(accountID); err != nil {
+	if _, err := m.deployer.Deploy(accountID); err != nil {
 		return ActivationOutcome{}, err
 	}
 	rollback := func(cause error) (ActivationOutcome, error) {

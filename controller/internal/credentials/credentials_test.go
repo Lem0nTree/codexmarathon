@@ -71,8 +71,8 @@ func TestFileVaultWriteBackPreservesUnknownFieldsAndSupportsPartialTokens(t *tes
 	}
 	refreshed := time.Date(2026, 9, 4, 10, 11, 12, 345678000, time.FixedZone("UTC+2", 2*60*60))
 	if err := vault.WriteBack(TokenWriteBackRequest{
-		AccountID:  "acct-1",
-		Tokens:     TokenSet{AccessToken: "new-access"},
+		AccountID:   "acct-1",
+		Tokens:      TokenSet{AccessToken: "new-access"},
 		RefreshedAt: refreshed,
 	}); err != nil {
 		t.Fatalf("WriteBack() error = %v", err)

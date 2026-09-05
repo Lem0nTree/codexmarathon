@@ -57,12 +57,12 @@ var (
 // of Config so constructing a controller remains side-effect free; use
 // ConnectRuntime for a live peer.
 type Config struct {
-	StateDir      string
-	RegistryPath  string
-	VaultDir      string
-	AuthPath      string
-	JournalPath   string
-	TelemetryTTL  time.Duration
+	StateDir     string
+	RegistryPath string
+	VaultDir     string
+	AuthPath     string
+	JournalPath  string
+	TelemetryTTL time.Duration
 }
 
 // DefaultConfig returns paths suitable for the current user. It does not
@@ -134,31 +134,31 @@ func (c Config) withDefaults() (Config, error) {
 type Controller struct {
 	config Config
 
-	registry *accounts.FileRegistry
-	vault    *credentials.FileVault
+	registry       *accounts.FileRegistry
+	vault          *credentials.FileVault
 	accountManager *accounts.Manager
-	journal  *journal.FileJournal
-	store    *telemetry.StateStore
-	cache    *telemetry.SnapshotCache
-	router   *telemetry.MultiAccountUsageRouter
-	scheduler *reset.Scheduler
-	policy   *policy.Engine
-	recovery *recovery.Manager
+	journal        *journal.FileJournal
+	store          *telemetry.StateStore
+	cache          *telemetry.SnapshotCache
+	router         *telemetry.MultiAccountUsageRouter
+	scheduler      *reset.Scheduler
+	policy         *policy.Engine
+	recovery       *recovery.Manager
 
-	mu            sync.RWMutex
-	runtime      *runtime.Client
-	runtimeFacade *clientRuntime
-	coordinator   *transitions.Coordinator
-	runtimeID    string
+	mu              sync.RWMutex
+	runtime         *runtime.Client
+	runtimeFacade   *clientRuntime
+	coordinator     *transitions.Coordinator
+	runtimeID       string
 	protocolVersion int
 
-	eventCancel context.CancelFunc
-	eventDone   chan struct{}
-	eventErrors chan error
+	eventCancel      context.CancelFunc
+	eventDone        chan struct{}
+	eventErrors      chan error
 	automationCancel context.CancelFunc
-	automationDone chan struct{}
+	automationDone   chan struct{}
 	automationEvents chan automation.Event
-	closeOnce   sync.Once
+	closeOnce        sync.Once
 }
 
 // New composes all controller domains without opening files or connecting to
@@ -185,18 +185,18 @@ func New(config Config) (*Controller, error) {
 	router := telemetry.NewMultiAccountUsageRouter(cache, store)
 	scheduler := reset.NewScheduler()
 	return &Controller{
-		config:      config,
-		registry:    registry,
-		vault:       vault,
+		config:         config,
+		registry:       registry,
+		vault:          vault,
 		accountManager: accountManager,
-		journal:     fileJournal,
-		store:       store,
-		cache:       cache,
-		router:      router,
-		scheduler:   scheduler,
-		policy:      policy.NewEngine(scheduler),
-		recovery:    recoveryManager,
-		eventErrors: make(chan error, 32),
+		journal:        fileJournal,
+		store:          store,
+		cache:          cache,
+		router:         router,
+		scheduler:      scheduler,
+		policy:         policy.NewEngine(scheduler),
+		recovery:       recoveryManager,
+		eventErrors:    make(chan error, 32),
 	}, nil
 }
 
@@ -458,10 +458,10 @@ func (c *Controller) ConnectRuntime(ctx context.Context, conn io.ReadWriteCloser
 		c.recovery.SetRuntime(client)
 	}
 	if err := c.journal.Append(journal.Event{
-		Type:       journal.RuntimeConnected,
-		RuntimeID:  state.Identity.RuntimeID,
-		AccountID:  optionalAccountID(state.Identity.AccountID),
-		Reason:     fmt.Sprintf("protocol v%d negotiated", negotiated.ProtocolVersion),
+		Type:      journal.RuntimeConnected,
+		RuntimeID: state.Identity.RuntimeID,
+		AccountID: optionalAccountID(state.Identity.AccountID),
+		Reason:    fmt.Sprintf("protocol v%d negotiated", negotiated.ProtocolVersion),
 	}); err != nil {
 		return fmt.Errorf("journal runtime connection: %w", err)
 	}
@@ -842,7 +842,7 @@ func (c *Controller) HandleRuntimeEvent(event runtime.Event) error {
 			return nil
 		}
 		observedAt := eventTime(event.OccurredAt)
-		snapshot := telemetry.NormalizeSnapshot(accountID, payload.RateLimits, payload.RateLimitsByID, observedAt)
+		snapshot := normalizeRuntimeSnapshot(accountID, payload.RateLimits, payload.RateLimitsByID, observedAt)
 		c.router.IngestFull(accountID, snapshot)
 		_ = c.router.Register(accountID, snapshotProvider{store: c.store})
 		if err := c.markTelemetry(accountID, observedAt); err != nil {
@@ -865,7 +865,7 @@ func (c *Controller) HandleRuntimeEvent(event runtime.Event) error {
 			return nil
 		}
 		result := c.router.IngestSparse(accountID, telemetry.AccountRateLimitsUpdatedWire{
-			RateLimits: payload.RateLimits,
+			RateLimits: convertRuntimeSnapshot(payload.RateLimits),
 		})
 		if result.RefetchRequired {
 			return fmt.Errorf("%w for account %q: %s", ErrTelemetryRefetchRequired, accountID, result.Reason)
@@ -1013,12 +1013,12 @@ func (c *Controller) RequestTransition(ctx context.Context, accountID string) (*
 		}
 		if c.recovery != nil && result.TransitionID != "" {
 			if releaseErr := c.recovery.OnTransitionCommitted(ctx, recovery.TransitionCommit{
-			TransitionID:       result.TransitionID,
-			RuntimeID:          result.RuntimeID,
-			TargetAccountID:    result.TargetAccountID,
-			ExpectedGeneration: result.ExpectedGeneration,
-			FinalGeneration:    result.FinalGeneration,
-			Outcome:            string(result.Outcome),
+				TransitionID:       result.TransitionID,
+				RuntimeID:          result.RuntimeID,
+				TargetAccountID:    result.TargetAccountID,
+				ExpectedGeneration: result.ExpectedGeneration,
+				FinalGeneration:    result.FinalGeneration,
+				Outcome:            string(result.Outcome),
 			}); releaseErr != nil {
 				return result, releaseErr
 			}
@@ -1045,12 +1045,12 @@ func (c *Controller) Reconcile(ctx context.Context, transitionID string) (*trans
 		}
 		if c.recovery != nil && result.TransitionID != "" {
 			if releaseErr := c.recovery.OnTransitionCommitted(ctx, recovery.TransitionCommit{
-			TransitionID:       result.TransitionID,
-			RuntimeID:          result.RuntimeID,
-			TargetAccountID:    result.TargetAccountID,
-			ExpectedGeneration: result.ExpectedGeneration,
-			FinalGeneration:    result.FinalGeneration,
-			Outcome:            string(result.Outcome),
+				TransitionID:       result.TransitionID,
+				RuntimeID:          result.RuntimeID,
+				TargetAccountID:    result.TargetAccountID,
+				ExpectedGeneration: result.ExpectedGeneration,
+				FinalGeneration:    result.FinalGeneration,
+				Outcome:            string(result.Outcome),
 			}); releaseErr != nil {
 				return result, releaseErr
 			}

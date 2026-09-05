@@ -29,13 +29,13 @@ func TestEvaluateRefreshesInactiveAccountsAndRunsOneTransition(t *testing.T) {
 		Router: router,
 		Policy: policy.NewConfiguredEngine(policy.EngineConfig{FreshnessTTL: time.Hour}, nil, func() time.Time { return now }),
 		Accounts: AccountSource{
-			IDs: func() ([]string, error) { return []string{"account-b", "account-a"}, nil },
+			IDs:    func() ([]string, error) { return []string{"account-b", "account-a"}, nil },
 			Active: func() (string, error) { return "account-a", nil },
 		},
-		Transition: func(context.Context, string) error { transitions++; return nil },
-		Thresholds: policy.Thresholds{PrimaryPercent: 80, SecondaryPercent: 90},
+		Transition:   func(context.Context, string) error { transitions++; return nil },
+		Thresholds:   policy.Thresholds{PrimaryPercent: 80, SecondaryPercent: 90},
 		FreshnessTTL: time.Hour,
-		Now: func() time.Time { return now },
+		Now:          func() time.Time { return now },
 	})
 	result, err := loop.Evaluate(context.Background(), Event{ID: "threshold-1", Type: EventThresholdReached, OccurredAt: now})
 	if err != nil {
@@ -60,11 +60,11 @@ func TestEvaluateDoesNotSwitchWhenProviderFails(t *testing.T) {
 		Router: router,
 		Policy: policy.NewEngine(nil, func() time.Time { return now }),
 		Accounts: AccountSource{
-			IDs: func() ([]string, error) { return []string{"account-a", "account-b"}, nil },
+			IDs:    func() ([]string, error) { return []string{"account-a", "account-b"}, nil },
 			Active: func() (string, error) { return "account-a", nil },
 		},
 		Transition: func(context.Context, string) error { transitions++; return nil },
-		Now: func() time.Time { return now },
+		Now:        func() time.Time { return now },
 	})
 	result, err := loop.Evaluate(context.Background(), Event{Type: EventUsageLimitExceeded, OccurredAt: now})
 	if err != nil {
@@ -85,10 +85,10 @@ func TestRunReturnsOnCancellationWhileWaiting(t *testing.T) {
 		Router: router,
 		Policy: policy.NewEngine(nil),
 		Accounts: AccountSource{
-			IDs: func() ([]string, error) { return []string{"account-a"}, nil },
+			IDs:    func() ([]string, error) { return []string{"account-a"}, nil },
 			Active: func() (string, error) { return "account-a", nil },
 		},
-		Now: func() time.Time { return now },
+		Now:          func() time.Time { return now },
 		PollInterval: time.Hour,
 		MaxWaitSlice: time.Millisecond,
 	})

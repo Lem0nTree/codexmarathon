@@ -1,12 +1,13 @@
 # Telemetry and reset decisions
 
-Runtime rate-limit observations are the active-account authority. The adapter
-forwards a complete `rate_limits_snapshot` and sparse
-`rate_limits_updated` event; the controller normalizes the upstream
-camelCase window fields into a multi-bucket domain model.
+Installed Codex rate-limit observations are the active-account authority when
+the supported local control interface is available. The optional adapter
+forwards a complete `rate_limits_snapshot` and sparse `rate_limits_updated`
+event; the controller normalizes the upstream camelCase window fields into a
+multi-bucket domain model.
 
 ```text
-runtime event
+installed Codex event
     -> NormalizeSnapshot
     -> StateStore (sparse merge authority)
     -> SnapshotCache (deep-copy TTL cache)
@@ -47,13 +48,14 @@ returns `wait_for_reset` when a future server reset is trustworthy, otherwise
 hint. At that boundary the controller must refresh telemetry and reevaluate;
 it must not transition merely because the timestamp elapsed.
 
-The default runtime provider is event-driven. Inactive-profile providers are
-pluggable through `telemetry.UsageProvider`; `internal/quota.Provider` adapts
+The preferred provider is event-driven from the installed Codex process.
+Inactive-profile providers are pluggable through `telemetry.UsageProvider`;
+`internal/quota.Provider` adapts
 the donor `codex-switch/internal/quota` calibration request and retry/header
 rules to that interface. `app.NewAutomationLoop` installs that provider for
 stored accounts that do not already have an active runtime snapshot provider,
-so inactive profiles are checked without invoking a second Codex executable.
-The active runtime provider remains the event/state-store authority and
+so inactive profiles are checked without starting a second Codex process. The
+active installed-Codex provider remains the event/state-store authority and
 replaces the fallback when its authoritative snapshot event arrives.
 
 ## Automatic policy

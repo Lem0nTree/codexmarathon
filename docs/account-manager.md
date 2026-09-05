@@ -12,19 +12,19 @@ The implementation is adapted from the pinned read-only checkout at
 | Donor path | CodexMarathon adaptation |
 | --- | --- |
 | `internal/profile/profile.go` | `controller/internal/credentials` opaque snapshots plus `accounts.Manager` profile lifecycle |
-| `internal/auth/refresh.go` | `accounts.AuthService.Refresh`; the embedded Codex login/AuthManager performs provider refresh |
+| `internal/auth/refresh.go` | `accounts.AuthService.Refresh`; the installed Codex login/AuthManager performs provider refresh when its supported local interface is available |
 | `internal/switcher/switcher.go` | `credentials.AtomicDeployer` and `accounts.Manager.Activate` with rollback |
 | `internal/cli/auth.go` | `accounts login/add` commands through the native runtime service; no shell-out login |
 | `internal/cli/list.go` and `profile_rows.go` | secret-free account list/status views backed by registry and vault metadata |
 | `internal/cli/remove.go` | active-profile protection and explicit force removal |
 | `internal/cli/use.go` | `accounts activate/use` commands |
 
-The account manager also consumes the pinned Codext checkout as the native
-authentication authority. Its login service is a direct boundary for the
-Codext `codex_login` crate/AuthManager (source commit
-`10c0989f282050b8617103d904788d994de8c971`), rather than a Go reimplementation
-of OAuth or a shell command. The runtime owns browser/device login, token
-parsing, provider refresh, and runtime auth reload.
+The account manager also consumes the installed Codex CLI as the native
+authentication authority when it exposes the supported local control
+interface. Its login service is a direct boundary rather than a Go
+reimplementation of OAuth or a shell command. The imported Codex-derived
+runtime under `runtime/codex-rs` implements the same seam for optional
+development and diagnostics.
 
 ## Storage and mutation rules
 
@@ -48,9 +48,9 @@ parsing, provider refresh, and runtime auth reload.
 
 ## Runtime boundary
 
-`controller/app.RuntimeAuthService` maps the manager to the internal JSON-RPC
-methods `account/login` and `account/refresh`. The runtime response carries an
-opaque snapshot only in memory; it must travel over the authenticated local
-runtime boundary and must never be logged or journalled. The runtime lifecycle
-task is responsible for embedding Codext and protecting that transport.
-
+`controller/app.RuntimeAuthService` maps the manager to the local-control
+methods `account/login` and `account/refresh`. The response carries an opaque
+snapshot only in memory; it must travel over the authenticated user-scoped
+boundary and must never be logged or journalled. If the installed Codex does
+not expose the live interface, the controlled restart path must stop the same
+Codex executable before deploying the snapshot and resuming its conversation.

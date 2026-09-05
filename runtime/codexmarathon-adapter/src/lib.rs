@@ -13,8 +13,7 @@ pub mod server;
 pub mod telemetry;
 
 pub use adapter::{
-    AdapterConfig, BackendIdentity, BackendRateLimits, BackendReload, CodextBackend,
-    RuntimeAdapter,
+    AdapterConfig, BackendIdentity, BackendRateLimits, BackendReload, CodextBackend, RuntimeAdapter,
 };
 pub use error::{AdapterError, BackendError};
 pub use server::{RuntimeServer, ServerConfig};
@@ -24,7 +23,7 @@ mod tests {
     use super::*;
     use crate::framing::JsonLineCodec;
     use crate::protocol::*;
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
     use std::collections::{BTreeMap, VecDeque};
     use std::io::Cursor;
     use std::sync::{Arc, Mutex};
@@ -89,9 +88,9 @@ mod tests {
             &mut self,
             _params: NativeLoginParams,
         ) -> Result<NativeLoginResult, BackendError> {
-            self.login.clone().ok_or_else(|| {
-                BackendError::new("missing_login", "test login is not configured")
-            })?
+            self.login
+                .clone()
+                .ok_or_else(|| BackendError::new("missing_login", "test login is not configured"))?
         }
 
         fn refresh_account(
@@ -103,9 +102,7 @@ mod tests {
             })?
         }
 
-        fn read_auth_snapshot(
-            &mut self,
-        ) -> Result<NativeAuthSnapshotResult, BackendError> {
+        fn read_auth_snapshot(&mut self) -> Result<NativeAuthSnapshotResult, BackendError> {
             self.auth_snapshot.clone().ok_or_else(|| {
                 BackendError::new("missing_snapshot", "test snapshot is not configured")
             })?
@@ -119,15 +116,16 @@ mod tests {
                 .recovery_release_calls
                 .lock()
                 .expect("test mutex poisoned") += 1;
-            self.recovery_release
-                .clone()
-                .ok_or_else(|| BackendError::new("missing_recovery_release", "test recovery release is not configured"))
-                .map(|mut result| {
-                    if result.recovery_id.is_empty() {
-                        result.recovery_id = params.recovery_id;
-                    }
-                    result
-                })
+            let mut result = self.recovery_release.clone().ok_or_else(|| {
+                BackendError::new(
+                    "missing_recovery_release",
+                    "test recovery release is not configured",
+                )
+            })??;
+            if result.recovery_id.is_empty() {
+                result.recovery_id = params.recovery_id;
+            }
+            Ok(result)
         }
 
         fn drain_recovery_events(&mut self) -> Vec<RecoveryLifecycleEvent> {
@@ -188,11 +186,7 @@ mod tests {
     #[test]
     fn negotiation_is_required_and_emits_runtime_ready() {
         let mut adapter = adapter(FakeBackend::new("account-a", 0));
-        let before = adapter.handle_request(RpcRequest::new(
-            "one",
-            METHOD_GET_IDENTITY,
-            json!({}),
-        ));
+        let before = adapter.handle_request(RpcRequest::new("one", METHOD_GET_IDENTITY, json!({})));
         assert_eq!(before.error.expect("error").code, -32000);
 
         let response = adapter.handle_request(RpcRequest::new(
@@ -201,10 +195,13 @@ mod tests {
             json!({"supported_versions": [1]}),
         ));
         assert_eq!(response.error, None);
-        assert_eq!(response.result, Some(json!({
-            "protocol_version": 1,
-            "server_versions": [1]
-        })));
+        assert_eq!(
+            response.result,
+            Some(json!({
+                "protocol_version": 1,
+                "server_versions": [1]
+            }))
+        );
         let events = adapter.drain_events();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].base.event_type, EVENT_RUNTIME_READY);
@@ -246,7 +243,10 @@ mod tests {
         assert_eq!(login.error, None);
         let login_result = login.result.expect("login result");
         assert_eq!(login_result["account_id"], "account-b");
-        assert_eq!(login_result["auth_json"]["tokens"]["access_token"], "opaque-test-value");
+        assert_eq!(
+            login_result["auth_json"]["tokens"]["access_token"],
+            "opaque-test-value"
+        );
 
         let refresh = adapter.handle_request(RpcRequest::new(
             "refresh",
@@ -257,7 +257,10 @@ mod tests {
             }),
         ));
         assert_eq!(refresh.error, None);
-        assert_eq!(refresh.result.expect("refresh result")["account_id"], "account-b");
+        assert_eq!(
+            refresh.result.expect("refresh result")["account_id"],
+            "account-b"
+        );
     }
 
     #[test]
@@ -334,7 +337,7 @@ mod tests {
 
         adapter.backend_mut().active_turn_count = 0;
         assert!(adapter.observe_turn_count().expect("boundary poll"));
-        assert_eq!(adapter.observe_turn_count().expect("duplicate poll"), false);
+        assert!(!adapter.observe_turn_count().expect("duplicate poll"));
         let events = adapter.drain_events();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].base.event_type, EVENT_SAFE_BOUNDARY_REACHED);
@@ -381,7 +384,10 @@ mod tests {
             .commit(transition("tx-2", "account-b", 2))
             .expect("wrong id commit");
         assert_eq!(wrong_id.outcome, TransitionOutcome::Rejected);
-        assert_eq!(wrong_id.error_code.as_deref(), Some("transition_id_mismatch"));
+        assert_eq!(
+            wrong_id.error_code.as_deref(),
+            Some("transition_id_mismatch")
+        );
         assert_eq!(*calls.lock().expect("test mutex poisoned"), 0);
         assert!(adapter.pending_transition().is_some());
     }
@@ -462,18 +468,26 @@ mod tests {
     #[test]
     fn recovery_observations_are_forwarded_once_per_stage() {
         let mut adapter = adapter(FakeBackend::new("account-a", 0));
-        assert!(adapter
-            .forward_recovery_parked("recovery-1", "unauthorized")
-            .expect("parked"));
-        assert!(!adapter
-            .forward_recovery_parked("recovery-1", "duplicate")
-            .expect("duplicate parked"));
-        assert!(adapter
-            .forward_recovery_started("recovery-1")
-            .expect("started"));
-        assert!(adapter
-            .forward_recovery_completed("recovery-1", "completed", None)
-            .expect("completed"));
+        assert!(
+            adapter
+                .forward_recovery_parked("recovery-1", "unauthorized")
+                .expect("parked")
+        );
+        assert!(
+            !adapter
+                .forward_recovery_parked("recovery-1", "duplicate")
+                .expect("duplicate parked")
+        );
+        assert!(
+            adapter
+                .forward_recovery_started("recovery-1")
+                .expect("started")
+        );
+        assert!(
+            adapter
+                .forward_recovery_completed("recovery-1", "completed", None)
+                .expect("completed")
+        );
         assert_eq!(adapter.drain_events().len(), 3);
     }
 
@@ -489,27 +503,36 @@ mod tests {
         }));
         let calls = Arc::clone(&backend.recovery_release_calls);
         let mut adapter = adapter(backend);
-        assert!(adapter
-            .forward_recovery_parked_with_context(
-                "recovery-1",
-                "usage_limit_exceeded",
-                Some("thread-1".to_string()),
-                Some("turn-1".to_string()),
-                Some("account-a".to_string()),
-            )
-            .expect("parked"));
+        assert!(
+            adapter
+                .forward_recovery_parked_with_context(
+                    "recovery-1",
+                    "usage_limit_exceeded",
+                    Some("thread-1".to_string()),
+                    Some("turn-1".to_string()),
+                    Some("account-a".to_string()),
+                )
+                .expect("parked")
+        );
         let params = RecoveryReleaseParams {
             recovery_id: "recovery-1".to_string(),
             thread_id: Some("thread-1".to_string()),
             transition_id: "tx-1".to_string(),
             expected_generation: 1,
         };
-        let first = adapter.release_recovery(params.clone()).expect("first release");
+        let first = adapter
+            .release_recovery(params.clone())
+            .expect("first release");
         assert_eq!(first.outcome, RecoveryReleaseOutcome::Released);
-        let second = adapter.release_recovery(params).expect("idempotent release");
+        let second = adapter
+            .release_recovery(params)
+            .expect("idempotent release");
         assert_eq!(second.outcome, RecoveryReleaseOutcome::Released);
         assert_eq!(*calls.lock().expect("test mutex poisoned"), 1);
-        assert!(adapter.drain_events().len() == 1, "release creates no synthetic event");
+        assert!(
+            adapter.drain_events().len() == 1,
+            "release creates no synthetic event"
+        );
     }
 
     #[test]
@@ -535,13 +558,14 @@ mod tests {
             }));
         let mut adapter = adapter(backend);
 
-        assert_eq!(adapter.drain_native_recovery_events().expect("parked drain"), 1);
         assert_eq!(
             adapter
-                .runtime_state()
-                .expect("runtime state")
-                .recoveries[0]
-                .phase,
+                .drain_native_recovery_events()
+                .expect("parked drain"),
+            1
+        );
+        assert_eq!(
+            adapter.runtime_state().expect("runtime state").recoveries[0].phase,
             RecoveryPhase::Parked
         );
         let parked = adapter.drain_events();
@@ -581,7 +605,10 @@ mod tests {
                     turn_id: None,
                 }),
             ]);
-        assert_eq!(adapter.drain_native_recovery_events().expect("later drain"), 2);
+        assert_eq!(
+            adapter.drain_native_recovery_events().expect("later drain"),
+            2
+        );
         let events = adapter.drain_events();
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].base.event_type, EVENT_RECOVERY_STARTED);

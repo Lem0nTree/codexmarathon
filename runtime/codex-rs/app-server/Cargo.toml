@@ -69,6 +69,7 @@ codex-file-search = { workspace = true }
 codex-chatgpt = { workspace = true }
 codex-login = { workspace = true }
 codexmarathon-runtime = { workspace = true }
+codexmarathon-runtime-adapter = { workspace = true }
 codex-image-generation-extension = { workspace = true }
 codex-memories-extension = { workspace = true }
 codex-web-search-extension = { workspace = true }

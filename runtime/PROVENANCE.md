@@ -1,8 +1,10 @@
-# Embedded runtime provenance
+# Optional runtime provenance
 
-CodexMarathon embeds the Rust Codex runtime so the installed product does not
-depend on a separately installed Codext executable or on the local `donor/`
-checkouts. The imported source is a pinned snapshot of the public
+CodexMarathon retains this Rust Codex runtime source for the compatible local
+control implementation, protocol development, and an explicitly opt-in
+self-contained diagnostic package. The normal companion release uses the
+user's separately installed Codex executable. The imported source is a pinned
+snapshot of the public
 `Loongphy/codext` repository:
 
 - Repository: <https://github.com/Loongphy/codext>
@@ -34,7 +36,7 @@ The runtime-baseline integration additions are:
    recovery authorities to the existing Marathon adapter.
 2. The adapter and bridge as members of the embedded Cargo workspace.
 3. `codex-cli::codexmarathon`, a public re-export of the in-process bridge for
-   the bundled CLI.
+   the optional runtime compatibility build.
 4. `codexmarathon-runtime::CodexNativeRuntime`, which directly composes the
    imported `AuthManager`, shared running-turn watch, shared auth-transition
    lock, and `ThreadManager::invalidate_model_transport_caches`. Its native

@@ -144,12 +144,12 @@ func (c SupervisorConfig) withDefaults(controller *Controller) (SupervisorConfig
 type LifecycleState string
 
 const (
-	LifecycleStopped   LifecycleState = "stopped"
-	LifecycleStarting  LifecycleState = "starting"
-	LifecycleReady     LifecycleState = "ready"
-	LifecycleDegraded  LifecycleState = "degraded"
-	LifecycleStopping  LifecycleState = "stopping"
-	LifecycleFailed    LifecycleState = "failed"
+	LifecycleStopped  LifecycleState = "stopped"
+	LifecycleStarting LifecycleState = "starting"
+	LifecycleReady    LifecycleState = "ready"
+	LifecycleDegraded LifecycleState = "degraded"
+	LifecycleStopping LifecycleState = "stopping"
+	LifecycleFailed   LifecycleState = "failed"
 )
 
 // LifecycleStatus is safe to serialize: it contains no auth material, token,
@@ -177,7 +177,7 @@ type LifecycleStatus struct {
 // Status and WriteDiagnostics while Start/monitor/reconnect are in progress.
 type RuntimeSupervisor struct {
 	controller *Controller
-	config    SupervisorConfig
+	config     SupervisorConfig
 
 	mu            sync.RWMutex
 	status        LifecycleStatus
@@ -202,7 +202,7 @@ func NewRuntimeSupervisor(controller *Controller, config SupervisorConfig) (*Run
 	}
 	return &RuntimeSupervisor{
 		controller: controller,
-		config:    normalized,
+		config:     normalized,
 		status: LifecycleStatus{
 			State:    LifecycleStopped,
 			Endpoint: normalized.Endpoint,

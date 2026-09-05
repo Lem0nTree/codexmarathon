@@ -34,6 +34,7 @@ func (c *Coordinator) Restore(events []journal.Event) error {
 	if c.boundary == nil {
 		c.boundary = make(map[string]chan struct{})
 	}
+	var latest *transitionRecord
 	for _, event := range events {
 		if !isTransitionJournalEvent(event.Type) {
 			continue
@@ -87,6 +88,7 @@ func (c *Coordinator) Restore(events []journal.Event) error {
 			} else if err := validateReplayCreated(record, event); err != nil {
 				return err
 			}
+			latest = record
 			continue
 		}
 		if record == nil {
@@ -96,6 +98,7 @@ func (c *Coordinator) Restore(events []journal.Event) error {
 			return err
 		}
 		applyReplayEvent(record, event)
+		latest = record
 	}
 
 	var unresolved *transitionRecord
@@ -111,7 +114,11 @@ func (c *Coordinator) Restore(events []journal.Event) error {
 		}
 		unresolved = record
 	}
-	c.current = cloneRecordState(unresolved)
+	if unresolved != nil {
+		c.current = cloneRecordState(unresolved)
+	} else {
+		c.current = cloneRecordState(latest)
+	}
 	return nil
 }
 

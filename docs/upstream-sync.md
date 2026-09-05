@@ -22,7 +22,7 @@ an external Codex installation.
 2. Re-run the source audit for AuthManager reload, running-turn guard,
    transport invalidation, rate-limit notifications, and recovery ordering.
 3. Re-check protocol payloads against the current runtime schema.
-4. Update the embedded runtime provenance, adapter patch ledger, and focused
+4. Update the optional runtime provenance, adapter patch ledger, and focused
    Rust tests.
 5. Run `verify.ps1`, Go tests, Rust tests, and the integration module.
 6. Review the diff to confirm no donor file changed and no credential value

@@ -4,9 +4,10 @@ param(
     [switch]$SkipRust
 )
 
-# One Windows-friendly verification entry point. It deliberately keeps going
-# after a missing toolchain so the report separates observed checks from
-# checks blocked by the host environment.
+# One Windows-friendly verification entry point. The default release is a Go
+# companion for an installed Codex CLI; Rust checks cover only the optional
+# local-control/runtime source. It deliberately keeps going after a missing
+# toolchain so the report separates observed checks from blocked evidence.
 $ErrorActionPreference = 'Continue'
 $repo = (Resolve-Path (Join-Path $PSScriptRoot '.')).Path
 $failures = [System.Collections.Generic.List[string]]::new()
@@ -87,6 +88,7 @@ foreach ($required in @(
     'scripts/verify_package.py',
     'scripts/verify_protocol.py',
     'scripts/package_release.py',
+    'scripts/test_package_release.py',
     'scripts/live_smoke.py',
     'docs/release.md'
 )) {
@@ -125,6 +127,12 @@ if (Test-Path -LiteralPath $versionPath -PathType Leaf) {
     }
 }
 
+if (Get-Command python -ErrorAction SilentlyContinue) {
+    [void](Invoke-Tool 'companion packaging mode tests' 'python' $repo @('scripts/test_package_release.py'))
+} else {
+    Blocked 'companion packaging mode tests' 'python not found; install Python 3.12 or newer'
+}
+
 if (-not $SkipGo) {
     $controllerDir = Join-Path $repo 'controller'
     $integrationDir = Join-Path $repo 'integration'
@@ -143,8 +151,8 @@ if (-not $SkipRust) {
     $embeddedRuntimeDir = Join-Path $repo 'runtime/codex-rs'
     if (Get-Command cargo -ErrorAction SilentlyContinue) {
         [void](Invoke-Tool 'Rust adapter tests' 'cargo' $runtimeDir @('test'))
-        [void](Invoke-Tool 'embedded runtime bridge tests' 'cargo' $embeddedRuntimeDir @('test', '-p', 'codexmarathon-runtime'))
-        [void](Invoke-Tool 'embedded Codex CLI build' 'cargo' $embeddedRuntimeDir @('build', '-p', 'codex-cli'))
+        [void](Invoke-Tool 'optional runtime bridge tests' 'cargo' $embeddedRuntimeDir @('test', '-p', 'codexmarathon-runtime'))
+        [void](Invoke-Tool 'optional Codex CLI build' 'cargo' $embeddedRuntimeDir @('build', '-p', 'codex-cli'))
     } else {
         Blocked 'Rust runtime checks' 'cargo.exe not found; install Rust/Cargo'
     }

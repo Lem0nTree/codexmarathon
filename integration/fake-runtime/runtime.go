@@ -34,19 +34,19 @@ type Runtime struct {
 	events chan runtime.Event
 	closed bool
 
-	disconnected bool
-	prepareErr   error
-	commitErr    error
-	reloadErr    error
+	disconnected   bool
+	prepareErr     error
+	commitErr      error
+	reloadErr      error
 	reloadFailures int
-	dropNextAck  bool
-	reloadCount  int
+	dropNextAck    bool
+	reloadCount    int
 
-	prepareCalls []runtime.AuthTransitionParams
-	commitCalls  []runtime.AuthTransitionParams
-	cancelCalls  []runtime.CancelAuthTransitionParams
+	prepareCalls         []runtime.AuthTransitionParams
+	commitCalls          []runtime.AuthTransitionParams
+	cancelCalls          []runtime.CancelAuthTransitionParams
 	recoveryReleaseCalls []runtime.RecoveryReleaseParams
-	dropNextRecoveryAck bool
+	dropNextRecoveryAck  bool
 }
 
 // New creates a fake runtime with a stable runtime ID and the supplied
@@ -58,9 +58,9 @@ func New(accountID string, generation uint64) *Runtime {
 		account = &copy
 	}
 	return &Runtime{
-		identity:  runtime.Identity{RuntimeID: "fake-runtime", AccountID: account, AuthGeneration: generation},
-		events:    make(chan runtime.Event, 64),
-		completed: make(map[string]runtime.TransitionResult),
+		identity:   runtime.Identity{RuntimeID: "fake-runtime", AccountID: account, AuthGeneration: generation},
+		events:     make(chan runtime.Event, 64),
+		completed:  make(map[string]runtime.TransitionResult),
 		recoveries: make(map[string]runtime.RecoveryState),
 	}
 }
@@ -329,11 +329,11 @@ func (f *Runtime) FinishTurn(turnID string) {
 	}, Payload: mustJSON(runtime.TurnCompletedEvent{TurnID: turnID, Outcome: "completed"})})
 	if zero && pending != nil {
 		f.emit(runtime.Event{EventBase: runtime.EventBase{
-			EventType:       runtime.EventSafeBoundaryReached,
-			OccurredAt:      time.Now().Unix(),
-			RuntimeID:       identity.RuntimeID,
-			AuthGeneration:  identity.AuthGeneration,
-			TransitionID:    pending.TransitionID,
+			EventType:      runtime.EventSafeBoundaryReached,
+			OccurredAt:     time.Now().Unix(),
+			RuntimeID:      identity.RuntimeID,
+			AuthGeneration: identity.AuthGeneration,
+			TransitionID:   pending.TransitionID,
 		}, Payload: mustJSON(runtime.SafeBoundaryReachedEvent{Reason: "running turn count reached zero"})})
 	}
 }
@@ -517,7 +517,7 @@ func (f *Runtime) PrepareAuthTransition(ctx context.Context, params runtime.Auth
 		return runtime.TransitionResult{}, err
 	}
 	if params.ExpectedGeneration != f.identity.AuthGeneration+1 {
-		return f.rejectedLocked(params, "stale_generation", "expected generation is not newer than runtime") , nil
+		return f.rejectedLocked(params, "stale_generation", "expected generation is not newer than runtime"), nil
 	}
 	if f.pending != nil {
 		if f.pending.TransitionID == params.TransitionID && f.pending.TargetAccountID == params.TargetAccountID && f.pending.ExpectedGeneration == params.ExpectedGeneration {

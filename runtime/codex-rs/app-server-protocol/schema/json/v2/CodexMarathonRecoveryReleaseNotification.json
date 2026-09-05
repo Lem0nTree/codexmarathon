@@ -1,0 +1,30 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "Internal command from the embedded Marathon authority to the Codex TUI.\n\nThe TUI already owns the parked `UsageLimitExceeded` continuation.  This notification is only an authorization hand-off; it does not carry prompt text and must never be interpreted as a request to create another turn.",
+  "properties": {
+    "expectedGeneration": {
+      "format": "uint64",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "recoveryId": {
+      "type": "string"
+    },
+    "threadId": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "transitionId": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "expectedGeneration",
+    "recoveryId",
+    "transitionId"
+  ],
+  "title": "CodexMarathonRecoveryReleaseNotification",
+  "type": "object"
+}
