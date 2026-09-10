@@ -226,7 +226,7 @@ fn validate_metadata_entry(key: &str, value: &str) -> DomainResult<()> {
 }
 
 /// Serializable registry state.
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RegistryState {
     /// Persisted schema version.
     #[serde(default = "default_registry_version")]
@@ -235,9 +235,9 @@ pub struct RegistryState {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub active_account_id: String,
     /// Whether the native Marathon service may perform account transitions.
-    /// Defaults to disabled for existing registries so adding the service is
-    /// behavior preserving until an operator explicitly enables it.
-    #[serde(default)]
+    /// New registries enable account management; an explicitly persisted value
+    /// continues to win when an existing registry is loaded.
+    #[serde(default = "default_registry_enabled")]
     pub enabled: bool,
     /// Records keyed by stable account ID.
     #[serde(default)]
@@ -246,6 +246,21 @@ pub struct RegistryState {
 
 fn default_registry_version() -> u32 {
     REGISTRY_VERSION
+}
+
+fn default_registry_enabled() -> bool {
+    true
+}
+
+impl Default for RegistryState {
+    fn default() -> Self {
+        Self {
+            version: REGISTRY_VERSION,
+            active_account_id: String::new(),
+            enabled: default_registry_enabled(),
+            accounts: BTreeMap::new(),
+        }
+    }
 }
 
 /// Storage-neutral account registry surface.

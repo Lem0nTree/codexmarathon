@@ -524,9 +524,9 @@ mod tests {
     fn enabled_state_is_persisted_without_auth_material() {
         let directory = tempdir().expect("tempdir");
         let registry = FileAccountRegistry::new(directory.path().join("accounts.json"));
-        assert!(!registry.enabled().expect("default state"));
-        registry.set_enabled(true).expect("enable");
-        assert!(registry.enabled().expect("persisted state"));
+        assert!(registry.enabled().expect("default state"));
+        registry.set_enabled(false).expect("disable");
+        assert!(!registry.enabled().expect("persisted state"));
         let contents = std::fs::read_to_string(registry.path()).expect("registry");
         assert!(!contents.contains("access_token"));
         assert!(!contents.contains("refresh_token"));
