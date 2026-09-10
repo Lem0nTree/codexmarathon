@@ -149,13 +149,6 @@ cargo check -p codex-tui
 cargo check -p codex-cli
 ```
 
-## Legacy companion
-
-Earlier repository versions used a separate Go `codexmarathon` controller.
-It remains in the source tree for compatibility and migration work, but the
-supported user workflow is the native `codex marathon` and `/marathon`
-interface described above.
-
 ## Documentation
 
 - [Features and usage](docs/features-and-usage.md)

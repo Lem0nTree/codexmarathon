@@ -1,34 +1,26 @@
-# Optional Codex runtime and local-control adapter
+# Native Codex runtime
 
-`runtime/codex-rs` is the tracked, pinned Codex-derived source used to develop
-and test CodexMarathon's supported local-control protocol. It is retained for
-provenance and for an explicitly opt-in self-contained diagnostic package.
-The normal CodexMarathon release is a Go companion and uses the user's
-separately installed `codex` executable.
+`runtime/codex-rs` is the tracked Codex Rust workspace used to build the
+custom CLI. Marathon is compiled into the same `codex` executable and uses the
+native app-server, AuthManager, turn manager, transport invalidation, and
+recovery authorities.
 
-`codexmarathon-adapter` is the narrow protocol seam, and
-`codexmarathon-runtime` is the in-process bridge to Codex's native AuthManager,
-turn state, telemetry, transport invalidation, and recovery authorities. The
-adapter does not read the companion vault, refresh tokens independently,
-create a second turn counter, invalidate transports itself, or create a
-second recovery prompt.
+`codexmarathon-runtime` contains the account registry, opaque snapshot vault,
+transition journal, quota policy, automatic-reset state, and native authority
+bridge. `codexmarathon-adapter` contains the typed internal bridge interfaces
+used by the app-server composition. Neither crate starts a second Codex
+process or prints credentials.
 
-Build this tree only when working on the optional runtime path:
+Build the CLI from the Rust workspace:
 
-```text
+```bash
 cd runtime/codex-rs
+cargo fmt --all -- --check
 cargo test --locked -p codexmarathon-runtime
-cargo build --locked --release -p codex-app-server
+cargo build --locked --release -p codex-cli
 ```
 
-The resulting app-server is never packaged by default. Use
-`--include-embedded-runtime` or `CODEXMARATHON_INCLUDE_EMBEDDED_RUNTIME=1`
-only for controlled protocol diagnostics. No donor path appears in the Cargo
-workspace.
-
-## Native Marathon user flow
-
-The integrated Codex build exposes Marathon from the `codex` executable itself:
+The resulting executable is `target/release/codex`. It provides:
 
 ```text
 codex marathon status
@@ -36,9 +28,6 @@ codex marathon login work --device-code
 codex marathon switch work
 ```
 
-`codex marathon login ALIAS` prompts in an interactive terminal to choose a
-browser link or device/auth-code login. Use `--browser` or `--device-code` for
-scripted or headless use. Inside the TUI, `/marathon` shows the current status
-and help, and `/marathon login ALIAS` opens the same choice. Device-code login
-prints a verification URL and one-time code that can be completed from another
-machine; the account is imported automatically after native auth reloads.
+The interactive TUI provides the matching `/marathon` commands and status-line
+items. Automatic quota reset remains disabled by default and is tested with
+mocks only.
