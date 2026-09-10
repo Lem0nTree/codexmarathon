@@ -1228,7 +1228,7 @@ impl ChatWidget {
         };
         self.add_info_message(
             format!(
-                "Native Marathon is built into Codex.\n{current}\n\nCommands:\n  /marathon on | off\n  /marathon status\n  /marathon auto-reset on | off | status\n  /marathon login <alias>   (choose browser link or device code)\n  /marathon import <alias>\n  /marathon switch <alias>\n\nAutomatic reset uses a provider-supported reset action only after every eligible managed account reports zero weekly quota. It never guesses a reset time. For a headless server, choose device code and finish sign-in from another machine. No separate codexmarathon command is required."
+                "Native Marathon is built into Codex.\n{current}\n\nCommands:\n  /marathon on (enable account switching)\n  /marathon off (disable account switching)\n  /marathon status (show accounts and active account)\n  /marathon auto-reset on | off | status (configure automatic quota reset)\n  /marathon login <alias> (choose browser link or device code)\n  /marathon import <alias> (save the current account under an alias)\n  /marathon switch <alias> (switch to a saved account)\n\nStart by importing your current account with /marathon import <alias>. For a headless server, choose device code and finish sign-in from another machine. No separate codexmarathon command is required."
             ),
             Some("Use ↑ to recall this help".to_string()),
         );
