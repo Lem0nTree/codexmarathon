@@ -73,6 +73,31 @@ observations are not treated as proof of available quota.
 The archive contains the companion and its documentation. It never contains
 your `auth.json`, credential snapshots, journals, or controller state.
 
+## Use the native Codex integration
+
+The embedded Codex build also exposes Marathon directly. These commands run
+inside the single `codex` executable and use its native app-server service:
+
+```bash
+codex marathon status
+codex marathon on
+codex marathon off
+codex marathon import personal
+codex marathon login work
+codex marathon switch work
+```
+
+Inside an interactive Codex session, the same operations are available as
+`/marathon status`, `/marathon on`, `/marathon off`, `/marathon import ALIAS`,
+`/marathon login ALIAS`, and `/marathon switch ALIAS_OR_ID`.
+
+`login` starts Codex's normal browser login flow, prints the URL, waits for
+Codex to report that login completed, and then stores the resulting native
+credential under the alias. It never asks you to paste a token. If the
+browser does not open automatically, open the printed URL yourself. `import`
+captures the currently authenticated Codex identity after a normal `codex login`;
+it does not accept credential text.
+
 ## Install CodexMarathon
 
 Install and authenticate Codex using its normal distribution first:
@@ -189,6 +214,23 @@ word `work` is an example alias, not a special built-in account.
 
 ## Add or refresh credentials
 
+If Codex is already authenticated through a normal stock Codex CLI install,
+bootstrap the first profile by importing its active `auth.json` snapshot:
+
+```bash
+codexmarathon accounts import \
+  --auth "$HOME/.codex/auth.json" \
+  --name personal \
+  --activate
+```
+
+The import reads the existing file, keeps the authentication document opaque,
+and stores it in CodexMarathon's owner-only vault. It reports only the account
+ID and alias; token values are never printed or written to the registry. Use
+`--from-auth <path>` when the source file differs from the `--auth` deployment
+path. If the snapshot does not contain an `account_id`, supply a stable value
+with `--id <account-id>`.
+
 The account login and refresh commands use the Codex authentication service
 through a compatible Marathon runtime endpoint:
 
@@ -205,8 +247,7 @@ codexmarathon accounts refresh \
 The endpoint is a local IPC endpoint, not a public network service. Do not
 place token values in `--runtime` or any other command argument. If your
 installed Codex release does not expose the compatible login endpoint, use its
-normal `codex login` flow and follow the repository's current onboarding
-instructions before adding the resulting profile.
+normal `codex login` flow, then run `accounts import` as shown above.
 
 ## Switch accounts
 

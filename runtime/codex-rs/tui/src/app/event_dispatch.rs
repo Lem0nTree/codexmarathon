@@ -8,8 +8,9 @@ use super::rate_limit_refresh::RateLimitRefreshOutcome;
 use super::resize_reflow::trailing_run_start;
 use super::session_lifecycle::ThreadAttachPresentation;
 use super::*;
-use crate::app_event::RecapTrigger;
 use crate::app_event::CodexMarathonRecoveryLifecycle;
+use crate::app_event::MarathonLoginMode;
+use crate::app_event::RecapTrigger;
 use crate::app_event::ThreadTitleDestination;
 use crate::app_server_session::ForkGoalContinuation;
 use crate::app_server_session::UnsupportedLegacyPermissionProfile;
@@ -1284,6 +1285,159 @@ impl App {
             AppEvent::CodexMarathonRecoveryLifecycle { event } => {
                 self.pending_codexmarathon_recovery_events.push_back(event);
                 self.flush_codexmarathon_recovery_events(app_server).await;
+            }
+            AppEvent::MarathonStatusRequest => {
+                let request_id = app_server.next_request_id();
+                let request_handle = app_server.request_handle();
+                let app_event_tx = self.app_event_tx.clone();
+                tokio::spawn(async move {
+                    let result = request_handle
+                        .request_typed::<codex_app_server_protocol::MarathonStatusResponse>(
+                            ClientRequest::MarathonStatus {
+                                request_id,
+                                params: None,
+                            },
+                        )
+                        .await
+                        .map_err(|error| error.to_string());
+                    app_event_tx.send(AppEvent::MarathonStatusResult { result });
+                });
+            }
+            AppEvent::MarathonEnabledSetRequest { enabled } => {
+                let request_id = app_server.next_request_id();
+                let request_handle = app_server.request_handle();
+                let app_event_tx = self.app_event_tx.clone();
+                tokio::spawn(async move {
+                    let result = request_handle
+                        .request_typed::<codex_app_server_protocol::MarathonEnabledSetResponse>(
+                            ClientRequest::MarathonEnabledSet {
+                                request_id,
+                                params: codex_app_server_protocol::MarathonEnabledSetParams {
+                                    enabled,
+                                },
+                            },
+                        )
+                        .await
+                        .map_err(|error| error.to_string());
+                    app_event_tx.send(AppEvent::MarathonEnabledSetResult { enabled, result });
+                });
+            }
+            AppEvent::MarathonAutoResetSetRequest { enabled } => {
+                let request_id = app_server.next_request_id();
+                let request_handle = app_server.request_handle();
+                let app_event_tx = self.app_event_tx.clone();
+                tokio::spawn(async move {
+                    let result = request_handle
+                        .request_typed::<codex_app_server_protocol::MarathonAutoResetSetResponse>(
+                            ClientRequest::MarathonAutoResetSet {
+                                request_id,
+                                params: codex_app_server_protocol::MarathonAutoResetSetParams {
+                                    enabled,
+                                },
+                            },
+                        )
+                        .await
+                        .map_err(|error| error.to_string());
+                    app_event_tx.send(AppEvent::MarathonAutoResetSetResult { enabled, result });
+                });
+            }
+            AppEvent::MarathonSwitchRequest { target } => {
+                let request_id = app_server.next_request_id();
+                let request_handle = app_server.request_handle();
+                let app_event_tx = self.app_event_tx.clone();
+                let request_target = target.clone();
+                tokio::spawn(async move {
+                    let result = request_handle
+                        .request_typed::<codex_app_server_protocol::MarathonSwitchResponse>(
+                            ClientRequest::MarathonSwitch {
+                                request_id,
+                                params: codex_app_server_protocol::MarathonSwitchParams {
+                                    target: request_target,
+                                },
+                            },
+                        )
+                        .await
+                        .map_err(|error| error.to_string());
+                    app_event_tx.send(AppEvent::MarathonSwitchResult { target, result });
+                });
+            }
+            AppEvent::MarathonImportRequest { alias } => {
+                let request_id = app_server.next_request_id();
+                let request_handle = app_server.request_handle();
+                let app_event_tx = self.app_event_tx.clone();
+                let request_alias = alias.clone();
+                tokio::spawn(async move {
+                    let result = request_handle
+                        .request_typed::<codex_app_server_protocol::MarathonImportResponse>(
+                            ClientRequest::MarathonImport {
+                                request_id,
+                                params: codex_app_server_protocol::MarathonImportParams {
+                                    alias: request_alias,
+                                },
+                            },
+                        )
+                        .await
+                        .map_err(|error| error.to_string());
+                    app_event_tx.send(AppEvent::MarathonImportResult { alias, result });
+                });
+            }
+            AppEvent::MarathonLoginRequest { alias, mode } => {
+                let request_id = app_server.next_request_id();
+                let request_handle = app_server.request_handle();
+                let app_event_tx = self.app_event_tx.clone();
+                tokio::spawn(async move {
+                    let params = match mode {
+                        MarathonLoginMode::Browser => {
+                            codex_app_server_protocol::LoginAccountParams::Chatgpt {
+                                codex_streamlined_login: false,
+                                use_hosted_login_success_page: false,
+                                app_brand: None,
+                            }
+                        }
+                        MarathonLoginMode::DeviceCode => {
+                            codex_app_server_protocol::LoginAccountParams::ChatgptDeviceCode
+                        }
+                    };
+                    let result = request_handle
+                        .request_typed::<codex_app_server_protocol::LoginAccountResponse>(
+                            ClientRequest::LoginAccount {
+                                request_id,
+                                params,
+                            },
+                        )
+                        .await
+                        .map_err(|error| error.to_string());
+                    if let Ok(codex_app_server_protocol::LoginAccountResponse::Chatgpt {
+                        auth_url,
+                        ..
+                    }) = &result
+                    {
+                        if let Err(error) = webbrowser::open(auth_url) {
+                            tracing::debug!(%error, "could not open Marathon login URL in browser");
+                        }
+                    }
+                    app_event_tx.send(AppEvent::MarathonLoginResult { alias, result });
+                });
+            }
+            AppEvent::MarathonStatusResult { result } => {
+                self.chat_widget.on_marathon_status_result(result);
+            }
+            AppEvent::MarathonEnabledSetResult { enabled, result } => {
+                self.chat_widget
+                    .on_marathon_enabled_set_result(enabled, result);
+            }
+            AppEvent::MarathonAutoResetSetResult { enabled, result } => {
+                self.chat_widget
+                    .on_marathon_auto_reset_set_result(enabled, result);
+            }
+            AppEvent::MarathonSwitchResult { target, result } => {
+                self.chat_widget.on_marathon_switch_result(target, result);
+            }
+            AppEvent::MarathonImportResult { alias, result } => {
+                self.chat_widget.on_marathon_import_result(alias, result);
+            }
+            AppEvent::MarathonLoginResult { alias, result } => {
+                self.chat_widget.on_marathon_login_result(alias, result);
             }
             AppEvent::TaskSearchResult {
                 thread_id,

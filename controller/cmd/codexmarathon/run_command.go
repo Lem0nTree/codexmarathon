@@ -81,11 +81,19 @@ func runManagedRuntimeCommand(args []string, stdout, stderr io.Writer) int {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
+	controlServer, err := app.NewControllerControlServer(controller, app.ControllerControlServerConfig{})
+	if err != nil {
+		return printError(stderr, err)
+	}
+	if err := controlServer.Start(ctx); err != nil {
+		return printError(stderr, err)
+	}
+	defer func() { _ = controlServer.Close() }()
 	if err := supervisor.Start(ctx); err != nil {
 		return printError(stderr, err)
 	}
 	status := supervisor.Status()
-	_, _ = fmt.Fprintf(stdout, "codexmarathon runtime ready: endpoint=%s protocol=%d pid=%d\n", status.Endpoint, status.ProtocolVersion, status.PID)
+	_, _ = fmt.Fprintf(stdout, "codexmarathon runtime ready: endpoint=%s protocol=%d pid=%d control=%s\n", status.Endpoint, status.ProtocolVersion, status.PID, controlServer.Endpoint())
 	monitorDone := make(chan struct{})
 	go func() {
 		_ = supervisor.Wait()
@@ -172,7 +180,14 @@ func runInstalledCompanionCommand(args []string, stdout, stderr io.Writer) int {
 	command := []string{installation.Executable}
 	command = append(command, codexArgs...)
 	command = append(command, fs.Args()...)
-	environment := []string{"CODEX_HOME=" + installation.CodexHome}
+	controlEndpointHint, err := app.DefaultControllerControlEndpoint(controller.Config().StateDir)
+	if err != nil {
+		return printError(stderr, err)
+	}
+	environment := []string{
+		"CODEX_HOME=" + installation.CodexHome,
+		app.ControllerControlEnv + "=" + controlEndpointHint,
+	}
 	supervisor, err := app.NewCompanionSupervisor(app.CompanionConfig{
 		Command:         command,
 		WorkingDir:      *workingDir,
@@ -240,41 +255,65 @@ func runInstalledCompanionSession(ctx context.Context, controller *app.Controlle
 	// end of the user-facing command, so an intentional fallback restart cannot
 	// race the old process's Wait result.
 	var transitionMu sync.Mutex
-	transition := func(transitionCtx context.Context, accountID string) error {
+	switchTarget := func(transitionCtx context.Context, accountID string) (app.ControlSwitchResult, error) {
 		transitionMu.Lock()
 		defer transitionMu.Unlock()
 		threadID := holder.ThreadID()
 		resume := app.CompanionResumeTarget{ThreadID: threadID, Last: threadID == ""}
 		result, err := controller.TransitionInstalledOrRestart(transitionCtx, holder.Client(), supervisor, accountID, resume)
 		if err != nil {
-			return err
+			return app.ControlSwitchResult{}, err
 		}
 		if err := controller.RegisterUsageProvider(accountID, provider); err != nil {
-			return err
+			return app.ControlSwitchResult{}, err
 		}
 		if cache := controller.Cache(); cache != nil {
 			cache.Invalidate(accountID)
 		}
+		controlResult := app.ControlSwitchResult{
+			AccountID:        result.AccountID,
+			Outcome:          "committed",
+			Mode:             string(result.Mode),
+			RuntimeID:        "installed-codex",
+			IdentityVerified: result.IdentityVerified,
+		}
 		if result.Mode != app.InstalledTransitionRestart {
-			return nil
+			return controlResult, nil
 		}
 
 		connectCtx, cancel := context.WithTimeout(transitionCtx, connectTimeout)
 		next, connectErr := connectInstalledUntil(connectCtx, installation, endpoint)
 		cancel()
 		if connectErr != nil {
-			return fmt.Errorf("reconnect installed Codex app-server after restart: %w", connectErr)
+			return app.ControlSwitchResult{}, fmt.Errorf("reconnect installed Codex app-server after restart: %w", connectErr)
 		}
 		// The initialize handshake proves the control endpoint is alive. Read
 		// and compare the deployed auth identity before replacing the
 		// provider's connection or confirming the policy transition.
 		if _, verifyErr := controller.VerifyInstalledIdentity(transitionCtx, next, accountID); verifyErr != nil {
 			_ = next.Close()
-			return fmt.Errorf("verify resumed installed Codex identity: %w", verifyErr)
+			return app.ControlSwitchResult{}, fmt.Errorf("verify resumed installed Codex identity: %w", verifyErr)
 		}
 		holder.SetClient(next)
-		return nil
+		controlResult.IdentityVerified = true
+		return controlResult, nil
 	}
+	transition := func(transitionCtx context.Context, accountID string) error {
+		_, err := switchTarget(transitionCtx, accountID)
+		return err
+	}
+
+	controlServer, err := app.NewControllerControlServer(controller, app.ControllerControlServerConfig{
+		Switch: switchTarget,
+	})
+	if err != nil {
+		return printError(stderr, err)
+	}
+	if err := controlServer.Start(ctx); err != nil {
+		return printError(stderr, err)
+	}
+	defer func() { _ = controlServer.Close() }()
+	_, _ = fmt.Fprintf(stdout, "codexmarathon controller control ready: endpoint=%s\n", controlServer.Endpoint())
 
 	loop, err := controller.NewAutomationLoopWithTransition(transition)
 	if err != nil {

@@ -2,6 +2,7 @@ use super::*;
 use crate::auth::storage::FileAuthStorage;
 use crate::auth::storage::get_auth_file;
 use crate::token_data::IdTokenInfo;
+use crate::token_data::TokenData;
 use codex_protocol::account::PlanType as AccountPlanType;
 use codex_protocol::auth::AuthMode;
 use codex_protocol::auth::KnownPlan as InternalKnownPlan;
@@ -1825,6 +1826,191 @@ fn fake_jwt_for_auth_file_params(params: &AuthFileParams) -> std::io::Result<Str
     let payload_b64 = b64(&serde_json::to_vec(&payload)?);
     let signature_b64 = b64(b"sig");
     Ok(format!("{header_b64}.{payload_b64}.{signature_b64}"))
+}
+
+fn transition_auth(account_id: &str, access_token: &str) -> AuthDotJson {
+    let id_token = crate::token_data::parse_chatgpt_jwt_claims(
+        &fake_jwt_for_auth_file_params(&AuthFileParams {
+            openai_api_key: None,
+            chatgpt_plan_type: Some("pro".to_string()),
+            chatgpt_account_id: Some(account_id.to_string()),
+        })
+        .expect("transition test JWT should be valid"),
+    )
+    .expect("transition test JWT claims should parse");
+    AuthDotJson {
+        auth_mode: Some(AuthMode::Chatgpt),
+        openai_api_key: None,
+        tokens: Some(TokenData {
+            id_token,
+            access_token: access_token.to_string(),
+            refresh_token: format!("refresh-{account_id}"),
+            account_id: Some(account_id.to_string()),
+        }),
+        last_refresh: Some(Utc::now()),
+        agent_identity: None,
+        personal_access_token: None,
+        bedrock_api_key: None,
+        bedrock_access_keys: None,
+    }
+}
+
+#[test]
+fn transition_snapshot_rejects_unsupported_auth_modes_without_debug_secrets() {
+    let api_key = AuthDotJson {
+        auth_mode: Some(AuthMode::ApiKey),
+        openai_api_key: Some("api-key-secret".to_string()),
+        tokens: None,
+        last_refresh: None,
+        agent_identity: None,
+        personal_access_token: None,
+        bedrock_api_key: None,
+        bedrock_access_keys: None,
+    };
+
+    let error = AuthTransitionSnapshot::from_auth_dot_json(api_key)
+        .expect_err("API key auth cannot be transferred by Marathon");
+    assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+    assert!(!error.to_string().contains("api-key-secret"));
+
+    let mut conflicting = transition_auth("account-a", "access-token-secret");
+    conflicting
+        .tokens
+        .as_mut()
+        .expect("transition test tokens")
+        .id_token
+        .chatgpt_account_id = Some("different-account".to_string());
+    let error = AuthTransitionSnapshot::from_auth_dot_json(conflicting)
+        .expect_err("conflicting provider identities must be rejected");
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+
+    let snapshot = AuthTransitionSnapshot::from_auth_dot_json(transition_auth(
+        "account-a",
+        "access-token-secret",
+    ))
+    .expect("managed snapshot");
+    let debug = format!("{snapshot:?}");
+    assert!(!debug.contains("access-token-secret"));
+    assert_eq!(snapshot.account_id(), "account-a");
+}
+
+#[tokio::test]
+async fn auth_manager_transition_round_trip_updates_storage_then_cache() -> anyhow::Result<()> {
+    let codex_home = tempdir()?;
+    let storage = FileAuthStorage::new(codex_home.path().to_path_buf());
+    let source = transition_auth("account-a", "access-a");
+    storage.save(&source)?;
+    let current_auth = CodexAuth::from_auth_dot_json(
+        codex_home.path(),
+        source.clone(),
+        AuthCredentialsStoreMode::File,
+        None,
+        AuthKeyringBackendKind::Direct,
+        None,
+        &crate::test_support::transport_default_auth_route_config(),
+    )
+    .await?;
+    let manager =
+        AuthManager::from_auth_for_testing_with_home(current_auth, codex_home.path().to_path_buf());
+
+    let captured = manager.snapshot_for_transition("account-a").await?;
+    assert_eq!(captured.account_id(), "account-a");
+    let target =
+        AuthTransitionSnapshot::from_auth_dot_json(transition_auth("account-b", "access-b"))?;
+    let status = manager
+        .install_snapshot_for_transition(target, "account-a")
+        .await?;
+    assert_eq!(status, AuthReloadStatus::Reloaded { changed: true });
+    assert_eq!(
+        manager.auth_cached().and_then(|auth| auth.get_account_id()),
+        Some("account-b".to_string())
+    );
+    assert_eq!(
+        storage
+            .load()?
+            .and_then(|auth| auth.tokens)
+            .and_then(|tokens| tokens.account_id),
+        Some("account-b".to_string())
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn auth_manager_transition_rejects_source_mismatch_and_preserves_state() -> anyhow::Result<()>
+{
+    let codex_home = tempdir()?;
+    let storage = FileAuthStorage::new(codex_home.path().to_path_buf());
+    let source = transition_auth("account-a", "access-a");
+    storage.save(&source)?;
+    let current_auth = CodexAuth::from_auth_dot_json(
+        codex_home.path(),
+        source.clone(),
+        AuthCredentialsStoreMode::File,
+        None,
+        AuthKeyringBackendKind::Direct,
+        None,
+        &crate::test_support::transport_default_auth_route_config(),
+    )
+    .await?;
+    let manager =
+        AuthManager::from_auth_for_testing_with_home(current_auth, codex_home.path().to_path_buf());
+    let target =
+        AuthTransitionSnapshot::from_auth_dot_json(transition_auth("account-b", "access-b"))?;
+
+    let error = manager
+        .install_snapshot_for_transition(target, "account-b")
+        .await
+        .expect_err("source identity must be checked before persistence");
+    assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+    assert!(!error.to_string().contains("access-a"));
+    assert_eq!(
+        manager.auth_cached().and_then(|auth| auth.get_account_id()),
+        Some("account-a".to_string())
+    );
+    assert_eq!(storage.load()?, Some(source));
+    Ok(())
+}
+
+#[tokio::test]
+async fn auth_manager_transition_write_failure_preserves_file_and_cached_auth() -> anyhow::Result<()>
+{
+    let codex_home = tempdir()?;
+    let storage = FileAuthStorage::new(codex_home.path().to_path_buf());
+    let source = transition_auth("account-a", "access-a");
+    storage.save(&source)?;
+    let current_auth = CodexAuth::from_auth_dot_json(
+        codex_home.path(),
+        source.clone(),
+        AuthCredentialsStoreMode::File,
+        None,
+        AuthKeyringBackendKind::Direct,
+        None,
+        &crate::test_support::transport_default_auth_route_config(),
+    )
+    .await?;
+    let manager =
+        AuthManager::from_auth_for_testing_with_home(current_auth, codex_home.path().to_path_buf());
+    let target =
+        AuthTransitionSnapshot::from_auth_dot_json(transition_auth("account-b", "access-b"))?;
+
+    let original_permissions = std::fs::metadata(codex_home.path())?.permissions();
+    let mut read_only_permissions = original_permissions.clone();
+    read_only_permissions.set_readonly(true);
+    std::fs::set_permissions(codex_home.path(), read_only_permissions)?;
+    let result = manager
+        .install_snapshot_for_transition(target, "account-a")
+        .await;
+    std::fs::set_permissions(codex_home.path(), original_permissions)?;
+
+    let error = result.expect_err("read-only auth home must reject the write");
+    assert_eq!(error.kind(), std::io::ErrorKind::Other);
+    assert!(!error.to_string().contains("access-b"));
+    assert_eq!(
+        manager.auth_cached().and_then(|auth| auth.get_account_id()),
+        Some("account-a".to_string())
+    );
+    assert_eq!(storage.load()?, Some(source));
+    Ok(())
 }
 
 async fn build_config(

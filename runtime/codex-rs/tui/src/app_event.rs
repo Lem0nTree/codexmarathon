@@ -19,6 +19,12 @@ use codex_app_server_protocol::ConsumeAccountRateLimitResetCreditResponse;
 use codex_app_server_protocol::DynamicToolCallResponse;
 use codex_app_server_protocol::GetAccountRateLimitsResponse;
 use codex_app_server_protocol::GetAccountTokenUsageResponse;
+use codex_app_server_protocol::LoginAccountResponse;
+use codex_app_server_protocol::MarathonAutoResetSetResponse;
+use codex_app_server_protocol::MarathonEnabledSetResponse;
+use codex_app_server_protocol::MarathonImportResponse;
+use codex_app_server_protocol::MarathonStatusResponse;
+use codex_app_server_protocol::MarathonSwitchResponse;
 use codex_app_server_protocol::MarketplaceAddResponse;
 use codex_app_server_protocol::MarketplaceRemoveResponse;
 use codex_app_server_protocol::MarketplaceUpgradeResponse;
@@ -204,6 +210,17 @@ pub(crate) enum CodexMarathonRecoveryLifecycle {
         outcome: String,
         error_code: Option<String>,
     },
+}
+
+/// Selects how a native Marathon account login is completed.
+///
+/// Browser login is convenient on a local machine. Device-code login keeps
+/// the Codex process headless so the URL and one-time code can be completed
+/// from another machine, such as an AWS instance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MarathonLoginMode {
+    Browser,
+    DeviceCode,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -529,11 +546,78 @@ pub(crate) enum AppEvent {
     /// `CODEX_HOME/auth.json` changed on disk; reload auth from storage.
     AuthFileChanged,
     /// Retry a deferred auth reload after a previous attempt failed.
-    AuthFileChangedRetry { attempt: u8 },
+    AuthFileChangedRetry {
+        attempt: u8,
+    },
 
     /// Forward one native recovery lifecycle observation to app-server.
     CodexMarathonRecoveryLifecycle {
         event: CodexMarathonRecoveryLifecycle,
+    },
+
+    /// Request native Marathon status through the in-process app-server.
+    MarathonStatusRequest,
+
+    /// Set the native Marathon enabled state through the in-process app-server.
+    MarathonEnabledSetRequest {
+        enabled: bool,
+    },
+
+    /// Set whether Marathon may consume a provider-supported immediate quota
+    /// reset action after all eligible accounts reach zero weekly quota.
+    MarathonAutoResetSetRequest {
+        enabled: bool,
+    },
+
+    /// Switch the native Codex auth identity at an idle boundary.
+    MarathonSwitchRequest {
+        target: String,
+    },
+
+    /// Capture the currently authenticated native identity under an alias.
+    MarathonImportRequest {
+        alias: String,
+    },
+
+    /// Start the existing native Codex login flow for a future Marathon account.
+    MarathonLoginRequest {
+        alias: String,
+        mode: MarathonLoginMode,
+    },
+
+    /// Result of reading native Marathon status.
+    MarathonStatusResult {
+        result: Result<MarathonStatusResponse, String>,
+    },
+
+    /// Result of changing native Marathon's enabled state.
+    MarathonEnabledSetResult {
+        enabled: bool,
+        result: Result<MarathonEnabledSetResponse, String>,
+    },
+
+    /// Result of changing native Marathon automatic reset-action enablement.
+    MarathonAutoResetSetResult {
+        enabled: bool,
+        result: Result<MarathonAutoResetSetResponse, String>,
+    },
+
+    /// Result of requesting a native account transition.
+    MarathonSwitchResult {
+        target: String,
+        result: Result<MarathonSwitchResponse, String>,
+    },
+
+    /// Result of importing the current native account into Marathon.
+    MarathonImportResult {
+        alias: String,
+        result: Result<MarathonImportResponse, String>,
+    },
+
+    /// Result of starting the native Codex login flow.
+    MarathonLoginResult {
+        alias: String,
+        result: Result<LoginAccountResponse, String>,
     },
 
     /// Background Git-status poller for the status header produced a new summary.

@@ -188,6 +188,51 @@ func TestManagerLoginSwitchRefreshAndRenameLifecycle(t *testing.T) {
 	}
 }
 
+func TestManagerImportExistingSnapshotWithoutAuthService(t *testing.T) {
+	manager, vault, registry, authPath := newManagerFixture(t, nil, nil)
+	raw := loginSnapshot("stock-account", "stock-token")
+
+	outcome, err := manager.Import(context.Background(), ImportRequest{
+		AuthJSON: raw,
+		Alias:    "personal",
+	})
+	if err != nil {
+		t.Fatalf("Import() error = %v", err)
+	}
+	if !outcome.Activated || outcome.AccountID != "stock-account" || outcome.Alias != "personal" {
+		t.Fatalf("Import() = %#v, want activated stock-account/personal", outcome)
+	}
+	stored, err := vault.Load("stock-account")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(stored) != string(raw) {
+		t.Fatalf("stored snapshot changed during import: got %s want %s", stored, raw)
+	}
+	deployed := mustReadFile(t, authPath)
+	if string(deployed) != string(raw) {
+		t.Fatalf("deployed snapshot changed during import: got %s want %s", deployed, raw)
+	}
+	account, err := registry.Get("stock-account")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if account.Alias != "personal" || account.CredentialRef != "stock-account" {
+		t.Fatalf("imported account = %#v", account)
+	}
+}
+
+func TestManagerImportRejectsSnapshotIdentityMismatch(t *testing.T) {
+	manager, _, _, _ := newManagerFixture(t, nil, nil)
+	_, err := manager.Import(context.Background(), ImportRequest{
+		AccountID: "requested-account",
+		AuthJSON:  loginSnapshot("snapshot-account", "stock-token"),
+	})
+	if !errors.Is(err, ErrLoginIdentityMismatch) {
+		t.Fatalf("Import() error = %v, want ErrLoginIdentityMismatch", err)
+	}
+}
+
 func TestManagerOverwriteOfActiveProfileRedeploysNewSnapshot(t *testing.T) {
 	service := &fakeAuthService{
 		loginResults: []LoginResult{

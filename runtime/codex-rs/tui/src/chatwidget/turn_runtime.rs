@@ -391,9 +391,8 @@ impl ChatWidget {
             return;
         };
         self.server_overloaded_resume_attempts = next_attempt;
-        self.server_overloaded_resume_generation = self
-            .server_overloaded_resume_generation
-            .wrapping_add(1);
+        self.server_overloaded_resume_generation =
+            self.server_overloaded_resume_generation.wrapping_add(1);
         let generation = self.server_overloaded_resume_generation;
         self.pending_server_overloaded_resume_turn =
             Some(UserMessage::from(DEFAULT_SERVER_OVERLOADED_RESUME_PROMPT));
@@ -479,15 +478,16 @@ impl ChatWidget {
                 if self.marathon_recovery_controller_enabled
                     && let Some(recovery_id) = recovery_id
                 {
-                    self.app_event_tx.send(AppEvent::CodexMarathonRecoveryLifecycle {
-                        event: crate::app_event::CodexMarathonRecoveryLifecycle::Parked {
-                            recovery_id,
-                            thread_id,
-                            turn_id,
-                            source_account_id: None,
-                            reason: "usage_limit_exceeded".to_string(),
-                        },
-                    });
+                    self.app_event_tx
+                        .send(AppEvent::CodexMarathonRecoveryLifecycle {
+                            event: crate::app_event::CodexMarathonRecoveryLifecycle::Parked {
+                                recovery_id,
+                                thread_id,
+                                turn_id,
+                                source_account_id: None,
+                                reason: "usage_limit_exceeded".to_string(),
+                            },
+                        });
                 }
             }
         }

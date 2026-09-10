@@ -20,6 +20,33 @@ journal, registry, logs, or CLI output. The imported Rust runtime implements
 the same seam for optional protocol development; it is not required by the
 default companion package.
 
+## TUI to controller control socket
+
+When `codexmarathon run` owns the Codex session it also exposes a separate
+user-scoped local socket for TUI commands. The default Unix endpoint is
+`unix://<state-dir>/controller.sock`; a launched Codex process receives the
+same value in `CODEXMARATHON_CONTROL`. This endpoint is distinct from the
+runtime socket because it can initiate a credential transition.
+
+The client first sends the same `protocol/negotiate` request with
+`supported_versions: [1]`. The controller then accepts these secret-free
+requests:
+
+* `marathon/status` with `{}` returns the registered account aliases, active
+  marker, runtime identity/turn count when a Marathon runtime is attached,
+  and any controller transition metadata.
+* `marathon/switch` with
+  `{"target":"<account-id-or-alias>","timeout_ms":120000}` resolves the
+  alias in the controller and runs the complete controller-owned transition.
+  The request path is `prepare -> wait for the runtime's safe boundary ->
+  atomically deploy the selected snapshot -> commit/reload -> verify identity`;
+  the TUI never edits `auth.json`.
+
+The switch result contains only account ID/alias, outcome, mode, generation,
+transition ID, and a redacted reason. A `committed` result is safe to display
+as the new active identity. An `uncertain` result carries the transition ID
+for controller reconciliation and must not be treated as a successful switch.
+
 Codext owns the `UsageLimitExceeded` synthetic recovery turn. It emits
 `recovery_parked` with a recovery/thread correlation, and the controller may
 send `recovery/release` only after a committed identity-changing transition.

@@ -50,6 +50,7 @@ mod cloud_config;
 mod desktop_app;
 mod doctor;
 mod exec_server_telemetry;
+mod marathon;
 mod marketplace_cmd;
 mod mcp_cmd;
 mod migrate_rollouts;
@@ -151,6 +152,9 @@ enum Subcommand {
 
     /// Manage Codex plugins.
     Plugin(PluginCli),
+
+    /// Manage native CodexMarathon accounts and switching.
+    Marathon(marathon::MarathonCommand),
 
     /// Start Codex as an MCP server (stdio).
     McpServer(McpServerCommand),
@@ -1242,6 +1246,23 @@ async fn cli_main(
                 }
             }
         }
+        Some(Subcommand::Marathon(marathon_cli)) => {
+            reject_remote_mode_for_subcommand(
+                root_remote.as_deref(),
+                root_remote_auth_token_env.as_deref(),
+                "marathon",
+            )?;
+            let loader_overrides =
+                loader_overrides_for_profile(interactive.config_profile_v2.as_ref())?;
+            marathon::run(
+                marathon_cli,
+                &root_config_overrides,
+                root_strict_config,
+                arg0_paths.clone(),
+                loader_overrides,
+            )
+            .await?;
+        }
         Some(Subcommand::AppServer(app_server_cli)) => {
             let AppServerCommand {
                 subcommand,
@@ -1840,6 +1861,7 @@ fn profile_v2_for_subcommand<'a>(
         | Subcommand::Unarchive(_)
         | Subcommand::Fork(_)
         | Subcommand::Mcp(_)
+        | Subcommand::Marathon(_)
         | Subcommand::Sandbox(_)
         | Subcommand::Debug(DebugCommand {
             subcommand: DebugSubcommand::PromptInput(_),
@@ -2422,6 +2444,7 @@ fn unsupported_subcommand_name_for_strict_config(
         | Some(Subcommand::Delete(_))
         | Some(Subcommand::Unarchive(_))
         | Some(Subcommand::Fork(_))
+        | Some(Subcommand::Marathon(_))
         | Some(Subcommand::Doctor(_)) => None,
         Some(Subcommand::AppServer(app_server)) if app_server.subcommand.is_none() => None,
         Some(Subcommand::AppServer(app_server)) => {

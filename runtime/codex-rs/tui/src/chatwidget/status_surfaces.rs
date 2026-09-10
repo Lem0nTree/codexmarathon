@@ -9,6 +9,7 @@ use crate::branch_summary;
 use crate::chatwidget::limit_label_for_window;
 use crate::chatwidget::rate_limits::get_limits_duration;
 use crate::legacy_core::config::Config;
+use crate::status::format_account_label;
 use crate::status::format_credit_micros;
 use crate::status::format_estimated_usd_micros;
 use crate::status::format_tokens_compact;
@@ -785,7 +786,27 @@ impl ChatWidget {
                 },
             ),
             StatusLineItem::WorkspaceHeadline => self.status_line_workspace_headline.clone(),
+            StatusLineItem::Account => {
+                format_account_label(self.status_account_display(), self.current_plan_type())
+            }
+            StatusLineItem::Marathon => Some(self.marathon_status_line_value()),
+            StatusLineItem::ManagedAccounts => Some(self.marathon_accounts_line_value()),
             StatusLineItem::TaskProgress => self.terminal_title_task_progress(),
+        }
+    }
+
+    fn marathon_status_line_value(&self) -> String {
+        match self.marathon_controller_status.as_ref() {
+            Some(status) if status.enabled => "Marathon enabled".to_string(),
+            Some(_) => "Marathon disabled".to_string(),
+            None => "Marathon disabled".to_string(),
+        }
+    }
+
+    fn marathon_accounts_line_value(&self) -> String {
+        match self.marathon_controller_status.as_ref() {
+            Some(status) => format!("Accounts {}", status.accounts.len()),
+            None => "Accounts disabled".to_string(),
         }
     }
 
@@ -829,6 +850,9 @@ impl ChatWidget {
             StatusSurfacePreviewItem::FastMode => StatusLineItem::FastMode,
             StatusSurfacePreviewItem::RawOutput => StatusLineItem::RawOutput,
             StatusSurfacePreviewItem::WorkspaceHeadline => StatusLineItem::WorkspaceHeadline,
+            StatusSurfacePreviewItem::Account => StatusLineItem::Account,
+            StatusSurfacePreviewItem::Marathon => StatusLineItem::Marathon,
+            StatusSurfacePreviewItem::ManagedAccounts => StatusLineItem::ManagedAccounts,
             StatusSurfacePreviewItem::Model => StatusLineItem::ModelName,
             StatusSurfacePreviewItem::ModelWithReasoning => StatusLineItem::ModelWithReasoning,
             StatusSurfacePreviewItem::Reasoning => StatusLineItem::Reasoning,

@@ -121,6 +121,7 @@ mod mcp_refresh;
 mod message_processor;
 mod models;
 mod models_refresh_worker;
+mod marathon_service;
 mod notification_media;
 mod otel_reloader;
 mod outgoing_message;

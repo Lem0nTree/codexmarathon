@@ -1078,6 +1078,37 @@ client_request_definitions! {
         serialization: global_shared_read("remote-control"),
         response: v2::RemoteControlStatusReadResponse,
     },
+    /// Read secret-free state from the native Marathon service.
+    MarathonStatus => "marathon/status" {
+        params: #[ts(type = "undefined")] #[serde(skip_serializing_if = "Option::is_none")] Option<()>,
+        serialization: global_shared_read("marathon"),
+        response: v2::MarathonStatusResponse,
+    },
+    /// Enable or disable the native Marathon service.
+    MarathonEnabledSet => "marathon/enabled/set" {
+        params: v2::MarathonEnabledSetParams,
+        serialization: global("marathon"),
+        response: v2::MarathonEnabledSetResponse,
+    },
+    /// Enable or disable automatic use of a provider-supported quota reset
+    /// action after every eligible managed account reaches zero weekly quota.
+    MarathonAutoResetSet => "marathon/autoReset/set" {
+        params: v2::MarathonAutoResetSetParams,
+        serialization: global("marathon"),
+        response: v2::MarathonAutoResetSetResponse,
+    },
+    /// Manually switch the native Codex auth identity at an idle boundary.
+    MarathonSwitch => "marathon/switch" {
+        params: v2::MarathonSwitchParams,
+        serialization: global("marathon"),
+        response: v2::MarathonSwitchResponse,
+    },
+    /// Store the currently authenticated native Codex account under a Marathon alias.
+    MarathonImport => "marathon/import" {
+        params: v2::MarathonImportParams,
+        serialization: global("marathon"),
+        response: v2::MarathonImportResponse,
+    },
     #[experimental("remoteControl/pairing/start")]
     RemoteControlPairingStart => "remoteControl/pairing/start" {
         params: v2::RemoteControlPairingStartParams,

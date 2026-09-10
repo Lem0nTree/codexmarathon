@@ -65,6 +65,58 @@ async fn file_storage_save_persists_auth_dot_json() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[test]
+fn file_storage_replacement_is_durable_and_leaves_no_partial_temp_file() -> anyhow::Result<()> {
+    let codex_home = tempdir()?;
+    let storage = FileAuthStorage::new(codex_home.path().to_path_buf());
+    let first = AuthDotJson {
+        auth_mode: Some(AuthMode::Chatgpt),
+        openai_api_key: None,
+        tokens: Some(TokenData {
+            id_token: id_token_with_prefix("atomic-first"),
+            access_token: "first-access".to_string(),
+            refresh_token: "first-refresh".to_string(),
+            account_id: Some("account-a".to_string()),
+        }),
+        last_refresh: Some(Utc::now()),
+        agent_identity: None,
+        personal_access_token: None,
+        bedrock_api_key: None,
+        bedrock_access_keys: None,
+    };
+    let second = AuthDotJson {
+        tokens: Some(TokenData {
+            id_token: id_token_with_prefix("atomic-second"),
+            access_token: "second-access".to_string(),
+            refresh_token: "second-refresh".to_string(),
+            account_id: Some("account-b".to_string()),
+        }),
+        ..first.clone()
+    };
+
+    storage.save(&first)?;
+    storage.save(&second)?;
+
+    assert_eq!(storage.load()?, Some(second));
+    let temporary_files = std::fs::read_dir(codex_home.path())?
+        .map(|entry| entry.map(|entry| entry.file_name()))
+        .collect::<Result<Vec<_>, _>>()?;
+    assert!(
+        temporary_files
+            .iter()
+            .all(|name| { !name.to_string_lossy().starts_with(".auth.json.tmp-") })
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(get_auth_file(codex_home.path()))?
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn file_storage_round_trips_agent_identity_auth() -> anyhow::Result<()> {
     let codex_home = tempdir()?;

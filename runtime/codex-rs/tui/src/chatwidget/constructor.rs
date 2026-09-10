@@ -125,6 +125,8 @@ impl ChatWidget {
             session_header: SessionHeader::new(header_model),
             initial_user_message,
             status_account_display,
+            marathon_controller_status: None,
+            pending_marathon_login: None,
             runtime_model_provider_base_url,
             remote_connection: None,
             token_info: None,

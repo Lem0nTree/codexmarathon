@@ -275,6 +275,9 @@ impl App {
                         .is_some_and(AuthMode::has_chatgpt_account),
                     has_codex_backend_auth,
                 );
+                // Marathon login snapshots the new identity only after this
+                // notification, which is emitted after AuthManager reload.
+                self.chat_widget.on_marathon_account_updated();
                 return;
             }
             ServerNotification::ExternalAgentConfigImportCompleted(notification) => {

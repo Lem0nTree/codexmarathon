@@ -2398,6 +2398,7 @@ dependencies = [
  "clap_complete",
  "codex-api",
  "codex-app-server",
+ "codex-app-server-client",
  "codex-app-server-daemon",
  "codex-app-server-protocol",
  "codex-app-server-test-client",
@@ -2413,6 +2414,7 @@ dependencies = [
  "codex-execpolicy",
  "codex-extension-api",
  "codex-features",
+ "codex-feedback",
  "codex-git-attribution",
  "codex-git-utils",
  "codex-history",
@@ -3601,6 +3603,7 @@ dependencies = [
  "url",
  "urlencoding",
  "webbrowser",
+ "windows-sys 0.52.0",
  "wiremock",
 ]
 
@@ -4898,6 +4901,7 @@ dependencies = [
 name = "codexmarathon-runtime"
 version = "0.152.0"
 dependencies = [
+ "chrono",
  "codex-backend-client",
  "codex-core",
  "codex-http-client",
@@ -4907,6 +4911,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "thiserror 2.0.18",
  "tokio",
 ]
 

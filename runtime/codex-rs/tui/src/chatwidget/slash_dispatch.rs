@@ -6,6 +6,7 @@
 //! slash-command recall follows the same submitted-input rule as ordinary text.
 
 use super::*;
+use crate::app_event::MarathonLoginMode;
 use crate::app_event::ThreadGoalSetMode;
 use crate::bottom_pane::prompt_args::parse_slash_name;
 use crate::bottom_pane::slash_commands::BuiltinCommandFlags;
@@ -475,6 +476,10 @@ impl ChatWidget {
                     );
                 }
             }
+            SlashCommand::Marathon => {
+                self.show_marathon_help();
+                self.request_marathon_status();
+            }
             SlashCommand::Cd => {
                 self.dispatch_command_with_args(SlashCommand::Cd, "~".to_string(), Vec::new());
             }
@@ -732,6 +737,83 @@ impl ChatWidget {
                             "Usage: /usage [daily|weekly|cumulative]".to_string(),
                         ),
                     }
+                }
+            }
+            SlashCommand::Marathon => {
+                let (subcommand, rest) = trimmed
+                    .split_once(char::is_whitespace)
+                    .unwrap_or((trimmed, ""));
+                match subcommand.to_ascii_lowercase().as_str() {
+                    "" => {
+                        self.show_marathon_help();
+                        self.request_marathon_status();
+                    }
+                    "status" if rest.trim().is_empty() => self.request_marathon_status(),
+                    "on" | "enable" if rest.trim().is_empty() => {
+                        self.request_marathon_enabled_set(true)
+                    }
+                    "off" | "disable" if rest.trim().is_empty() => {
+                        self.request_marathon_enabled_set(false)
+                    }
+                    "auto-reset" | "autoreset" => match rest.trim().to_ascii_lowercase().as_str() {
+                        "on" | "enable" => self.request_marathon_auto_reset_set(true),
+                        "off" | "disable" => self.request_marathon_auto_reset_set(false),
+                        "status" | "" => self.request_marathon_status(),
+                        _ => self.add_error_message(
+                            "Usage: /marathon auto-reset [on|off|status]".to_string(),
+                        ),
+                    },
+                    "import" => {
+                        let alias = rest.trim();
+                        if alias.is_empty() {
+                            self.add_error_message("Usage: /marathon import <alias>".to_string());
+                        } else {
+                            self.request_marathon_import(alias.to_string());
+                        }
+                    }
+                    "login" => {
+                        let mut parts = rest.split_whitespace();
+                        let alias = parts.next().unwrap_or_default();
+                        let mode = parts.next().map(str::to_ascii_lowercase);
+                        let extra = parts.next();
+                        if alias.is_empty() {
+                            self.add_error_message(
+                                "Usage: /marathon login <alias> [browser|device-code]".to_string(),
+                            );
+                        } else if extra.is_some() {
+                            self.add_error_message(
+                                "Usage: /marathon login <alias> [browser|device-code]".to_string(),
+                            );
+                        } else {
+                            match mode.as_deref() {
+                                None => self.request_marathon_login(alias.to_string()),
+                                Some("browser" | "link") => self.request_marathon_login_with_mode(
+                                    alias.to_string(),
+                                    MarathonLoginMode::Browser,
+                                ),
+                                Some("device-code" | "device" | "auth-code") => self
+                                    .request_marathon_login_with_mode(
+                                        alias.to_string(),
+                                        MarathonLoginMode::DeviceCode,
+                                    ),
+                                Some(_) => self.add_error_message(
+                                    "Usage: /marathon login <alias> [browser|device-code]"
+                                        .to_string(),
+                                ),
+                            }
+                        }
+                    }
+                    "switch" => {
+                        let target = rest.trim();
+                        if target.is_empty() {
+                            self.add_error_message(
+                                "Usage: /marathon switch <account-id-or-alias>".to_string(),
+                            );
+                        } else {
+                            self.request_marathon_switch(target.to_string());
+                        }
+                    }
+                    _ => self.show_marathon_help(),
                 }
             }
             SlashCommand::Ide => {
@@ -1120,6 +1202,422 @@ impl ChatWidget {
         }
     }
 
+    fn request_marathon_status(&mut self) {
+        self.app_event_tx.send(AppEvent::MarathonStatusRequest);
+    }
+
+    fn show_marathon_help(&mut self) {
+        let current = match self.marathon_controller_status.as_ref() {
+            Some(status) => {
+                let state = if status.enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                };
+                let active = status
+                    .active_account_id
+                    .as_deref()
+                    .or(status.current_account_id.as_deref())
+                    .unwrap_or("none");
+                format!(
+                    "Current: {state} · active account: {active} · accounts: {}",
+                    status.accounts.len()
+                )
+            }
+            None => "Current: checking native Marathon status…".to_string(),
+        };
+        self.add_info_message(
+            format!(
+                "Native Marathon is built into Codex.\n{current}\n\nCommands:\n  /marathon on | off\n  /marathon status\n  /marathon auto-reset on | off | status\n  /marathon login <alias>   (choose browser link or device code)\n  /marathon import <alias>\n  /marathon switch <alias>\n\nAutomatic reset uses a provider-supported reset action only after every eligible managed account reports zero weekly quota. It never guesses a reset time. For a headless server, choose device code and finish sign-in from another machine. No separate codexmarathon command is required."
+            ),
+            Some("Use ↑ to recall this help".to_string()),
+        );
+    }
+
+    fn request_marathon_enabled_set(&mut self, enabled: bool) {
+        self.app_event_tx
+            .send(AppEvent::MarathonEnabledSetRequest { enabled });
+    }
+
+    fn request_marathon_auto_reset_set(&mut self, enabled: bool) {
+        self.add_info_message(
+            format!(
+                "Native Marathon automatic provider quota reset {}…",
+                if enabled { "enabled" } else { "disabled" }
+            ),
+            /*hint*/ None,
+        );
+        self.app_event_tx
+            .send(AppEvent::MarathonAutoResetSetRequest { enabled });
+    }
+
+    fn request_marathon_import(&mut self, alias: String) {
+        self.add_info_message(
+            format!("CodexMarathon: saving the current account as {alias}…"),
+            /*hint*/ None,
+        );
+        self.app_event_tx
+            .send(AppEvent::MarathonImportRequest { alias });
+    }
+
+    fn request_marathon_login(&mut self, alias: String) {
+        let browser_alias = alias.clone();
+        let device_alias = alias.clone();
+        self.bottom_pane.show_selection_view(SelectionViewParams {
+            title: Some(format!("Login Marathon account `{alias}`")),
+            subtitle: Some(
+                "Choose how to complete ChatGPT sign-in. Device code works on headless servers."
+                    .to_string(),
+            ),
+            footer_hint: Some(standard_popup_hint_line()),
+            initial_selected_idx: Some(0),
+            items: vec![
+                SelectionItem {
+                    name: "Browser link".to_string(),
+                    description: Some(
+                        "Open the sign-in link in a browser on this machine".to_string(),
+                    ),
+                    actions: vec![Box::new(move |tx| {
+                        tx.send(AppEvent::MarathonLoginRequest {
+                            alias: browser_alias.clone(),
+                            mode: MarathonLoginMode::Browser,
+                        });
+                    })],
+                    dismiss_on_select: true,
+                    ..Default::default()
+                },
+                SelectionItem {
+                    name: "Device / auth code".to_string(),
+                    description: Some(
+                        "Show a URL and one-time code for another machine to complete".to_string(),
+                    ),
+                    actions: vec![Box::new(move |tx| {
+                        tx.send(AppEvent::MarathonLoginRequest {
+                            alias: device_alias.clone(),
+                            mode: MarathonLoginMode::DeviceCode,
+                        });
+                    })],
+                    dismiss_on_select: true,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        });
+    }
+
+    fn request_marathon_login_with_mode(&mut self, alias: String, mode: MarathonLoginMode) {
+        self.add_info_message(
+            format!("Native Marathon login starting for `{alias}`…"),
+            /*hint*/ None,
+        );
+        self.app_event_tx
+            .send(AppEvent::MarathonLoginRequest { alias, mode });
+    }
+
+    fn request_marathon_switch(&mut self, target: String) {
+        self.add_info_message(
+            format!("CodexMarathon: requesting switch to {target}…"),
+            /*hint*/ None,
+        );
+        self.app_event_tx
+            .send(AppEvent::MarathonSwitchRequest { target });
+    }
+
+    pub(crate) fn on_marathon_status_result(
+        &mut self,
+        result: Result<crate::marathon_control::MarathonStatus, String>,
+    ) {
+        match result {
+            Ok(status) => {
+                self.marathon_controller_status = Some(status.clone());
+                self.refresh_status_line();
+                self.add_marathon_controller_status(status);
+            }
+            Err(error) => {
+                self.marathon_controller_status = None;
+                self.refresh_status_line();
+                self.add_error_message(format!("CodexMarathon native service unavailable: {error}"))
+            }
+        }
+    }
+
+    pub(crate) fn on_marathon_enabled_set_result(
+        &mut self,
+        enabled: bool,
+        result: Result<crate::marathon_control::MarathonEnabledSetResult, String>,
+    ) {
+        match result {
+            Ok(response) => {
+                if let Some(status) = self.marathon_controller_status.as_mut() {
+                    status.enabled = response.enabled;
+                }
+                self.refresh_status_line();
+                self.add_info_message(
+                    format!(
+                        "CodexMarathon: {}.",
+                        if response.enabled {
+                            "enabled"
+                        } else {
+                            "disabled"
+                        }
+                    ),
+                    /*hint*/ None,
+                );
+            }
+            Err(error) => self.add_error_message(format!(
+                "CodexMarathon: could not {} service: {error}",
+                if enabled { "enable" } else { "disable" }
+            )),
+        }
+    }
+
+    pub(crate) fn on_marathon_auto_reset_set_result(
+        &mut self,
+        enabled: bool,
+        result: Result<codex_app_server_protocol::MarathonAutoResetSetResponse, String>,
+    ) {
+        match result {
+            Ok(response) => {
+                if let Some(status) = self.marathon_controller_status.as_mut() {
+                    status.auto_reset_enabled = response.enabled;
+                    status.auto_reset_phase = response.phase.clone();
+                    status.auto_reset_last_error = None;
+                }
+                self.refresh_status_line();
+                self.add_info_message(
+                    format!(
+                        "Native Marathon automatic provider quota reset is {} (phase: {}).",
+                        if response.enabled {
+                            "enabled"
+                        } else {
+                            "disabled"
+                        },
+                        response.phase
+                    ),
+                    /*hint*/ None,
+                );
+            }
+            Err(error) => self.add_error_message(format!(
+                "Native Marathon automatic quota reset could not be {}: {error}",
+                if enabled { "enabled" } else { "disabled" }
+            )),
+        }
+    }
+
+    pub(crate) fn on_marathon_switch_result(
+        &mut self,
+        target: String,
+        result: Result<crate::marathon_control::MarathonSwitchResult, String>,
+    ) {
+        match result {
+            Ok(result)
+                if result.outcome
+                    == codex_app_server_protocol::MarathonSwitchOutcome::Committed =>
+            {
+                let account = result.account_id.unwrap_or(target.clone());
+                self.add_info_message(
+                    format!("CodexMarathon: switched to {account}."),
+                    /*hint*/ None,
+                );
+            }
+            Ok(result) => {
+                let outcome = match result.outcome {
+                    codex_app_server_protocol::MarathonSwitchOutcome::Rejected => "was rejected",
+                    codex_app_server_protocol::MarathonSwitchOutcome::Deferred => {
+                        "is waiting for active turns to finish"
+                    }
+                    codex_app_server_protocol::MarathonSwitchOutcome::Committed => "completed",
+                };
+                let reason = result
+                    .reason
+                    .map(|reason| format!(": {reason}"))
+                    .unwrap_or_default();
+                self.add_error_message(format!(
+                    "CodexMarathon: switch to {target} {outcome}{reason}."
+                ));
+            }
+            Err(error) => {
+                self.add_error_message(format!("CodexMarathon: switch to {target} failed: {error}"))
+            }
+        }
+    }
+
+    pub(crate) fn on_marathon_import_result(
+        &mut self,
+        alias: String,
+        result: Result<crate::marathon_control::MarathonImportResult, String>,
+    ) {
+        match result {
+            Ok(result) => {
+                self.add_info_message(
+                    format!(
+                        "CodexMarathon: imported {alias} ({}) as the active account.",
+                        result.account_id
+                    ),
+                    /*hint*/ None,
+                );
+                self.request_marathon_status();
+            }
+            Err(error) => {
+                self.add_error_message(format!("CodexMarathon: import of {alias} failed: {error}"))
+            }
+        }
+    }
+
+    pub(crate) fn on_marathon_login_result(
+        &mut self,
+        alias: String,
+        result: Result<codex_app_server_protocol::LoginAccountResponse, String>,
+    ) {
+        match result {
+            Ok(codex_app_server_protocol::LoginAccountResponse::Chatgpt { login_id, auth_url }) => {
+                self.pending_marathon_login = Some(PendingMarathonLogin {
+                    login_id,
+                    alias: alias.clone(),
+                    completed: false,
+                });
+                self.add_info_message(
+                    format!(
+                        "Native Marathon login for `{alias}`: finish sign-in at this browser link. The account will be saved automatically when login completes.\n{auth_url}"
+                    ),
+                    /*hint*/ None,
+                );
+            }
+            Ok(codex_app_server_protocol::LoginAccountResponse::ChatgptDeviceCode {
+                login_id,
+                verification_url,
+                user_code,
+            }) => {
+                self.pending_marathon_login = Some(PendingMarathonLogin {
+                    login_id,
+                    alias: alias.clone(),
+                    completed: false,
+                });
+                self.add_info_message(
+                    format!(
+                        "Native Marathon login for `{alias}`: open {verification_url} on another machine and enter one-time code {user_code}. The account will be saved automatically when login completes."
+                    ),
+                    /*hint*/ None,
+                );
+            }
+            Ok(_) => self.add_info_message(
+                format!("Native Marathon login completed for `{alias}`; saving the account…"),
+                /*hint*/ None,
+            ),
+            Err(error) => {
+                self.add_error_message(format!("CodexMarathon: login for {alias} failed: {error}"))
+            }
+        }
+    }
+
+    pub(crate) fn on_marathon_login_completed(
+        &mut self,
+        notification: codex_app_server_protocol::AccountLoginCompletedNotification,
+    ) {
+        let Some(pending) = self.pending_marathon_login.as_mut() else {
+            return;
+        };
+        if notification.login_id.as_deref() != Some(pending.login_id.as_str()) {
+            return;
+        }
+        if notification.success {
+            pending.completed = true;
+        } else {
+            let alias = pending.alias.clone();
+            self.pending_marathon_login = None;
+            self.add_error_message(format!(
+                "Native Marathon login for `{alias}` failed{}.",
+                notification
+                    .error
+                    .map(|error| format!(": {error}"))
+                    .unwrap_or_default()
+            ));
+        }
+    }
+
+    /// The app-server emits AccountUpdated after AuthManager reloads the new
+    /// credentials. Only then is it safe to snapshot the identity under the
+    /// requested Marathon alias.
+    pub(crate) fn on_marathon_account_updated(&mut self) {
+        let Some(pending) = self.pending_marathon_login.as_ref() else {
+            return;
+        };
+        if !pending.completed {
+            return;
+        }
+        let alias = pending.alias.clone();
+        self.pending_marathon_login = None;
+        self.add_info_message(
+            format!("Native Marathon login completed for `{alias}`; saving account…"),
+            /*hint*/ None,
+        );
+        self.app_event_tx
+            .send(AppEvent::MarathonImportRequest { alias });
+    }
+
+    fn add_marathon_controller_status(&mut self, status: crate::marathon_control::MarathonStatus) {
+        let service_state = if status.enabled {
+            "enabled"
+        } else {
+            "disabled"
+        };
+        let active = status
+            .active_account_id
+            .as_deref()
+            .or(status.current_account_id.as_deref())
+            .unwrap_or("none")
+            .to_string();
+        let mut lines = vec![
+            Line::from(format!("• CodexMarathon: {service_state}")),
+            Line::from(format!("  Active account: {active}")),
+            Line::from(format!(
+                "  Automatic provider quota reset: {} (phase: {})",
+                if status.auto_reset_enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                },
+                status.auto_reset_phase
+            )),
+        ];
+        if let Some(error) = status.auto_reset_last_error.as_deref() {
+            lines.push(Line::from(format!("  Last reset result: {error}")));
+        }
+        if status.accounts.is_empty() {
+            lines.push(Line::from("  Accounts: none configured"));
+        } else {
+            lines.push(Line::from("  Accounts:"));
+            for account in status.accounts {
+                let name = if account.alias.is_empty() {
+                    account.account_id.clone()
+                } else if account.account_id.is_empty() {
+                    account.alias.clone()
+                } else {
+                    format!("{} ({})", account.alias, account.account_id)
+                };
+                let state = if account.active { "active" } else { "inactive" };
+                let health = if account.credential_health.is_empty() {
+                    "health unknown"
+                } else {
+                    account.credential_health.as_str()
+                };
+                lines.push(Line::from(format!(
+                    "    - {name}: {state}, {health}{}",
+                    if account.credential_present {
+                        ""
+                    } else {
+                        ", credential missing"
+                    }
+                )));
+            }
+        }
+        lines.push(Line::from(format!(
+            "  Active turns: {}, auth generation {}",
+            status.active_turn_count, status.auth_generation
+        )));
+        self.add_plain_history_lines(lines);
+    }
+
     fn ensure_usage_command_available(&mut self) -> bool {
         if self.has_codex_backend_auth {
             return true;
@@ -1135,6 +1633,7 @@ impl ChatWidget {
         match cmd {
             SlashCommand::Ide
             | SlashCommand::Status
+            | SlashCommand::Marathon
             | SlashCommand::Pwd
             | SlashCommand::Usage
             | SlashCommand::DebugConfig

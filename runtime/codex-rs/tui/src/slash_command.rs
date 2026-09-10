@@ -50,6 +50,7 @@ pub enum SlashCommand {
     Diff,
     Mention,
     Status,
+    Marathon,
     Cd,
     #[strum(to_string = "pwd", serialize = "cwd")]
     Pwd,
@@ -110,6 +111,7 @@ impl SlashCommand {
             SlashCommand::Import => "import setup, this project, and recent chats from Claude Code",
             SlashCommand::Hooks => "view and manage lifecycle hooks",
             SlashCommand::Status => "show current session configuration and token usage",
+            SlashCommand::Marathon => "manage native CodexMarathon accounts and switching",
             SlashCommand::Cd => "change the current working directory",
             SlashCommand::Pwd => "show the current working directory",
             SlashCommand::Usage => "view account usage or use a usage limit reset",
@@ -178,6 +180,7 @@ impl SlashCommand {
                 | SlashCommand::Cd
                 | SlashCommand::Pwd
                 | SlashCommand::Usage
+                | SlashCommand::Marathon
                 | SlashCommand::Pets
                 | SlashCommand::Side
                 | SlashCommand::Btw
@@ -197,6 +200,7 @@ impl SlashCommand {
                 | SlashCommand::Diff
                 | SlashCommand::Mention
                 | SlashCommand::Status
+                | SlashCommand::Marathon
                 | SlashCommand::Pwd
                 | SlashCommand::Usage
                 | SlashCommand::Ide
@@ -240,6 +244,7 @@ impl SlashCommand {
             | SlashCommand::Skills
             | SlashCommand::Hooks
             | SlashCommand::Status
+            | SlashCommand::Marathon
             | SlashCommand::Pwd
             | SlashCommand::Usage
             | SlashCommand::DebugConfig
@@ -298,6 +303,20 @@ mod tests {
     }
 
     #[test]
+    fn marathon_command_is_registered_and_parses() {
+        assert_eq!(SlashCommand::Marathon.command(), "marathon");
+        assert_eq!(
+            SlashCommand::from_str("marathon"),
+            Ok(SlashCommand::Marathon)
+        );
+        assert!(
+            built_in_slash_commands()
+                .iter()
+                .any(|(name, command)| *name == "marathon" && *command == SlashCommand::Marathon)
+        );
+    }
+
+    #[test]
     fn clean_alias_parses_to_stop_command() {
         assert_eq!(SlashCommand::from_str("clean"), Ok(SlashCommand::Stop));
     }
@@ -318,6 +337,9 @@ mod tests {
         assert!(SlashCommand::Raw.available_in_side_conversation());
         assert!(SlashCommand::Raw.supports_inline_args());
         assert!(SlashCommand::App.available_during_task());
+        assert!(SlashCommand::Marathon.supports_inline_args());
+        assert!(SlashCommand::Marathon.available_in_side_conversation());
+        assert!(SlashCommand::Marathon.available_during_task());
     }
 
     #[test]

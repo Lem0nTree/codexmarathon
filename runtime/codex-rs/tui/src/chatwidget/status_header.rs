@@ -1,14 +1,12 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use codex_protocol::account::PlanType;
 use ratatui::style::Stylize;
 use ratatui::text::Line;
 use ratatui::text::Span;
 use ratatui::widgets::Widget;
 use unicode_width::UnicodeWidthStr;
 
-use crate::status::StatusAccountDisplay;
 use crate::ui_consts::LIVE_PREFIX_COLS;
 
 use super::*;
@@ -115,7 +113,7 @@ impl StatusHeader {
             directory: crate::status::format_directory_display(widget.status_line_cwd(), None),
             git: widget.status_header_git_status.clone(),
             rate_limit,
-            account: account_label(
+            account: crate::status::format_account_label(
                 widget.status_account_display(),
                 widget.current_plan_type(),
             ),
@@ -142,7 +140,9 @@ impl StatusHeader {
             push(vec!["\u{ee9c} ".cyan(), Span::from(model.clone()).cyan()]);
         }
         if !self.directory.is_empty() {
-            let available = width.saturating_sub(UnicodeWidthStr::width("\u{f07c} ")).max(8);
+            let available = width
+                .saturating_sub(UnicodeWidthStr::width("\u{f07c} "))
+                .max(8);
             let directory =
                 crate::text_formatting::center_truncate_path(&self.directory, available);
             push(vec!["\u{f07c} ".yellow(), Span::from(directory).yellow()]);
@@ -164,7 +164,10 @@ impl StatusHeader {
             push(segment);
         }
         if let Some(rate_limit) = &self.rate_limit {
-            push(vec!["\u{f464} ".cyan(), Span::from(rate_limit.clone()).cyan()]);
+            push(vec![
+                "\u{f464} ".cyan(),
+                Span::from(rate_limit.clone()).cyan(),
+            ]);
         }
         if let Some(account) = &self.account {
             push(vec![Span::from(account.clone()).cyan()]);
@@ -180,25 +183,6 @@ impl Renderable for StatusHeader {
 
     fn desired_height(&self, _width: u16) -> u16 {
         u16::from(self.has_content())
-    }
-}
-
-/// Renders the account segment: `user@example.com(Pro)` for ChatGPT accounts.
-fn account_label(
-    account: Option<&StatusAccountDisplay>,
-    plan_type: Option<PlanType>,
-) -> Option<String> {
-    match account {
-        Some(StatusAccountDisplay::ChatGpt { email, plan }) => match (email, plan) {
-            (Some(email), Some(plan)) => Some(format!("{email}({plan})")),
-            (Some(email), None) => Some(format!(
-                "{email}({})",
-                plan_type.map(crate::status::plan_type_display_name)?
-            )),
-            _ => None,
-        },
-        Some(StatusAccountDisplay::ApiKey) => Some("API key".to_string()),
-        None => None,
     }
 }
 
