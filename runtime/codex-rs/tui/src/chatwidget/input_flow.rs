@@ -197,13 +197,14 @@ impl ChatWidget {
                     self.active_usage_limit_resume_thread_id = recovery_thread_id.clone();
                     self.active_usage_limit_resume_turn_id = recovery_turn_id.clone();
                     self.active_usage_limit_resume_dispatch_turn_id = None;
-                    self.app_event_tx.send(AppEvent::CodexMarathonRecoveryLifecycle {
-                        event: crate::app_event::CodexMarathonRecoveryLifecycle::Started {
-                            recovery_id,
-                            thread_id: recovery_thread_id,
-                            turn_id: recovery_turn_id,
-                        },
-                    });
+                    self.app_event_tx
+                        .send(AppEvent::CodexMarathonRecoveryLifecycle {
+                            event: crate::app_event::CodexMarathonRecoveryLifecycle::Started {
+                                recovery_id,
+                                thread_id: recovery_thread_id,
+                                turn_id: recovery_turn_id,
+                            },
+                        });
                 }
             } else {
                 // A transient submission rejection must not lose Codext's

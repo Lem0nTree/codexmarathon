@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"os"
 	"strings"
 	"time"
 
@@ -23,6 +24,8 @@ func runAccounts(args []string, stdout, stderr io.Writer) int {
 		return runAccountsList(args[1:], stdout, stderr)
 	case "login", "add":
 		return runAccountsLogin(args[1:], stdout, stderr)
+	case "import":
+		return runAccountsImport(args[1:], stdout, stderr)
 	case "status":
 		return runAccountsStatus(args[1:], stdout, stderr)
 	case "rename":
@@ -44,6 +47,7 @@ Usage:
   codexmarathon accounts list [options]
   codexmarathon accounts login [options]
   codexmarathon accounts add [options]
+  codexmarathon accounts import [options]
   codexmarathon accounts status [account-id] [options]
   codexmarathon accounts rename --name <alias> <account-id> [options]
   codexmarathon accounts activate <account-id> [options]
@@ -52,6 +56,57 @@ Usage:
   codexmarathon accounts remove <account-id> [options]
 
 `
+
+func runAccountsImport(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("accounts import", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	var paths pathFlags
+	paths.bind(fs)
+	fromAuth := fs.String("from-auth", "", "existing Codex auth.json to import (default: --auth path)")
+	accountID := fs.String("id", "", "optional stable account ID when the auth snapshot has no account_id")
+	alias := fs.String("name", "", "local profile alias")
+	activate := fs.Bool("activate", false, "make this profile active after import")
+	overwrite := fs.Bool("overwrite", false, "replace an existing profile with the same account ID")
+	jsonOutput := fs.Bool("json", false, "print machine-readable JSON")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if fs.NArg() != 0 {
+		return usageError(stderr, "accounts import does not accept positional arguments; use --from-auth, --id, and --name")
+	}
+	source := strings.TrimSpace(*fromAuth)
+	if source == "" {
+		source = paths.authPath
+	}
+	raw, err := os.ReadFile(source)
+	if err != nil {
+		return printError(stderr, fmt.Errorf("read auth snapshot %q: %w", source, err))
+	}
+	controller, err := app.New(paths.config())
+	if err != nil {
+		return printError(stderr, err)
+	}
+	defer func() { _ = controller.Close() }()
+	outcome, err := controller.AccountManager().Import(context.Background(), accounts.ImportRequest{
+		AccountID: *accountID,
+		Alias:     *alias,
+		AuthJSON:  raw,
+		Activate:  *activate,
+		Overwrite: *overwrite,
+	})
+	if err != nil {
+		return printError(stderr, err)
+	}
+	if *jsonOutput {
+		return writeJSON(stdout, outcome)
+	}
+	if outcome.Activated {
+		_, _ = fmt.Fprintf(stdout, "imported and activated account: %s\n", outcome.AccountID)
+	} else {
+		_, _ = fmt.Fprintf(stdout, "imported account: %s\n", outcome.AccountID)
+	}
+	return 0
+}
 
 func runAccountsLogin(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("accounts login", flag.ContinueOnError)

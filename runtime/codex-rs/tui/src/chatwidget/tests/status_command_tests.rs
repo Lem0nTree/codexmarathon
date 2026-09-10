@@ -32,6 +32,140 @@ async fn status_command_renders_immediately_and_refreshes_rate_limits_for_chatgp
 }
 
 #[tokio::test]
+async fn marathon_status_displays_current_account_state() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.dispatch_command_with_args(SlashCommand::Marathon, "status".to_string(), Vec::new());
+
+    assert_matches!(rx.try_recv(), Ok(AppEvent::MarathonStatusRequest));
+}
+
+#[tokio::test]
+async fn marathon_account_commands_use_native_app_server_events() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+
+    chat.dispatch_command_with_args(SlashCommand::Marathon, "on".to_string(), Vec::new());
+    assert_matches!(
+        rx.try_recv(),
+        Ok(AppEvent::MarathonEnabledSetRequest { enabled: true })
+    );
+
+    chat.dispatch_command_with_args(
+        SlashCommand::Marathon,
+        "import work".to_string(),
+        Vec::new(),
+    );
+    assert_matches!(rx.try_recv(), Ok(AppEvent::InsertHistoryCell(_)));
+    assert_matches!(
+        rx.try_recv(),
+        Ok(AppEvent::MarathonImportRequest { alias }) if alias == "work"
+    );
+
+    chat.dispatch_command_with_args(
+        SlashCommand::Marathon,
+        "login personal device-code".to_string(),
+        Vec::new(),
+    );
+    assert_matches!(rx.try_recv(), Ok(AppEvent::InsertHistoryCell(_)));
+    assert_matches!(
+        rx.try_recv(),
+        Ok(AppEvent::MarathonLoginRequest { alias, mode })
+            if alias == "personal"
+                && mode == crate::app_event::MarathonLoginMode::DeviceCode
+    );
+}
+
+#[tokio::test]
+async fn bare_marathon_command_shows_native_help_and_refreshes_status() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+
+    chat.dispatch_command(SlashCommand::Marathon);
+
+    let help = match rx.try_recv() {
+        Ok(AppEvent::InsertHistoryCell(cell)) => {
+            lines_to_single_string(&cell.display_lines(/*width*/ 120))
+        }
+        other => panic!("expected Marathon help output, got {other:?}"),
+    };
+    assert!(help.contains("built into Codex"));
+    assert!(help.contains("device code"));
+    assert!(help.contains("No separate codexmarathon command"));
+    assert_matches!(rx.try_recv(), Ok(AppEvent::MarathonStatusRequest));
+}
+
+#[tokio::test]
+async fn marathon_switch_result_reports_success_and_failure() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+
+    chat.on_marathon_switch_result(
+        "work".to_string(),
+        Ok(crate::marathon_control::MarathonSwitchResult {
+            account_id: Some("acct-work".to_string()),
+            outcome: codex_app_server_protocol::MarathonSwitchOutcome::Committed,
+            auth_generation: 1,
+            active_turn_count: 0,
+            reason: None,
+        }),
+    );
+    let success = match rx.try_recv() {
+        Ok(AppEvent::InsertHistoryCell(cell)) => {
+            lines_to_single_string(&cell.display_lines(/*width*/ 100))
+        }
+        other => panic!("expected switch success output, got {other:?}"),
+    };
+    assert!(success.contains("switched to acct-work"));
+
+    chat.on_marathon_switch_result(
+        "missing".to_string(),
+        Err("account was not found".to_string()),
+    );
+    let failure = match rx.try_recv() {
+        Ok(AppEvent::InsertHistoryCell(cell)) => {
+            lines_to_single_string(&cell.display_lines(/*width*/ 100))
+        }
+        other => panic!("expected switch failure output, got {other:?}"),
+    };
+    assert!(failure.contains("switch to missing failed"));
+    assert!(failure.contains("account was not found"));
+}
+
+#[tokio::test]
+async fn marathon_controller_status_updates_configured_status_line_items() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.config.tui_status_line =
+        Some(vec!["marathon".to_string(), "managed-accounts".to_string()]);
+
+    chat.on_marathon_status_result(Ok(crate::marathon_control::MarathonStatus {
+        enabled: true,
+        active_account_id: Some("acct-work".to_string()),
+        current_account_id: Some("acct-work".to_string()),
+        auth_generation: 1,
+        active_turn_count: 0,
+        accounts: vec![
+            codex_app_server_protocol::MarathonAccount {
+                account_id: "acct-a".to_string(),
+                alias: "a".to_string(),
+                active: true,
+                credential_present: true,
+                credential_health: "healthy".to_string(),
+            },
+            codex_app_server_protocol::MarathonAccount {
+                account_id: "acct-b".to_string(),
+                alias: "b".to_string(),
+                active: false,
+                credential_present: true,
+                credential_health: "healthy".to_string(),
+            },
+        ],
+    }));
+
+    assert_eq!(
+        chat.status_line_text(),
+        Some("Marathon enabled · Accounts 2".to_string())
+    );
+    assert!(matches!(rx.try_recv(), Ok(AppEvent::InsertHistoryCell(_))));
+}
+
+#[tokio::test]
 async fn status_command_refresh_updates_cached_limits_for_future_status_outputs() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     set_chatgpt_auth(&mut chat);

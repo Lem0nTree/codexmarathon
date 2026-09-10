@@ -486,6 +486,11 @@ func (s *RuntimeSupervisor) startManagedProcess(_ context.Context) error {
 	// flag to a Codex binary that does not know that flag; the supervisor owns
 	// the integration boundary and the runtime remains a normal Codex binary.
 	env = append(env, "CODEXMARATHON_LISTEN="+endpoint)
+	controlEndpoint, err := DefaultControllerControlEndpoint(s.controller.Config().StateDir)
+	if err != nil {
+		return fmt.Errorf("resolve controller control endpoint: %w", err)
+	}
+	env = append(env, ControllerControlEnv+"="+controlEndpoint)
 	if isCodexAppServer(command[0]) && !hasFlag(args, "--listen") {
 		// The supervisor owns the process over local IPC.  Inheriting the
 		// app-server's stdio transport would make it exit when the child has no

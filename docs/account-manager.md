@@ -26,6 +26,11 @@ reimplementation of OAuth or a shell command. The imported Codex-derived
 runtime under `runtime/codex-rs` implements the same seam for optional
 development and diagnostics.
 
+For a stock Codex installation that is already authenticated, `accounts
+import` reads the configured `auth.json`, validates only its JSON object and
+optional account identity, and stores the document as an opaque snapshot. It
+does not require a runtime endpoint or expose token fields.
+
 ## Storage and mutation rules
 
 * `accounts.json` stores only stable IDs, aliases, telemetry markers, and a
@@ -34,6 +39,8 @@ development and diagnostics.
   account ID with owner-only permissions.
 * Login saves the snapshot before selecting it; the first account is selected
   automatically, later accounts require `--activate` or `accounts activate`.
+* Import uses the same protected save and activation path as login, but takes
+  the existing authenticated snapshot instead of invoking a native login.
 * Activation deploys `auth.json` atomically, then updates the active marker. A
   failed or cancelled activation restores the prior file and marker.
 * Refresh returns token fields only from the native service, merges non-empty

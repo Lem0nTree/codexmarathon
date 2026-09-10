@@ -1,142 +1,164 @@
 # CodexMarathon
 
-Keep your Codex work moving across multiple accounts.
+CodexMarathon adds multi-account Marathon controls directly to a custom build
+of the Codex CLI. It is a single `codex` executable: users do not need to run
+a separate controller or set a Marathon socket environment variable.
 
-CodexMarathon is a companion CLI for the Codex CLI already installed on your
-computer. It keeps account profiles, watches usage, and safely moves a long
-conversation to another account when the current account reaches a limit.
+It stores managed account profiles, lets you sign in to more than one ChatGPT
+account, and switches only at a safe boundary between turns. Credential
+snapshots are opaque, protected by Codex's configured credential storage, and
+never appear in status output, logs, or transition records.
 
-## Why use it?
+## Native workflow
 
-- Keep work, personal, and project accounts in one place.
-- Switch accounts without manually copying credential files.
-- Continue the same conversation after a usage limit.
-- Choose an account yourself or let the usage policy choose one.
-- Keep your existing Codex version, settings, plugins, and sessions.
-- See account health and transition status without exposing tokens.
-- Install a small companion beside Codex.
-
-## Example
-
-You use one account for work and another for personal projects:
+Use Marathon from the shell:
 
 ```bash
-codexmarathon accounts list
-# work       Work account
-# personal   Personal account
-
-codexmarathon run --codex codex --codex-dir ~/projects/website
+codex marathon status
+codex marathon login personal --device-code
+codex marathon login work --device-code
+codex marathon on
+codex marathon switch work
 ```
 
-If the active account reaches its limit, CodexMarathon can select the other
-eligible account and continue the same conversation. You can also switch
-manually:
+Or use it from an interactive Codex session:
+
+```text
+/marathon
+/marathon login personal
+/marathon login work
+/marathon on
+/marathon switch work
+```
+
+Running `/marathon` displays the current native state and a help panel. It
+also explains the available account, login, enabled-state, and switching
+commands.
+
+## Sign in on a server
+
+`login` supports a browser-link flow and a device-code flow.
+
+For a headless machine such as an AWS instance, use a device code:
 
 ```bash
-codexmarathon switch work
+codex marathon login work --device-code
 ```
 
-The change happens at a safe point in the current turn. CodexMarathon uses a
-live account reload when the installed Codex supports it. Otherwise, it
-cleanly restarts a process it launched and resumes the same thread.
+Codex prints a verification URL and one-time code. Open the URL on your own
+machine, enter the code, and complete the ChatGPT sign-in. Once Codex receives
+the native login completion, it stores that identity under the `work` alias.
 
-## Install
+In an interactive Codex session, use:
 
-Install Codex first and check that it works:
-
-```bash
-codex --version
+```text
+/marathon login work
 ```
 
-Download the latest archive from the
-[GitHub releases page](https://github.com/Lem0nTree/codexmarathon/releases),
-then install it:
+Codex presents **Browser link** and **Device / auth code** choices. You can
+also choose explicitly:
 
-```bash
-tar -xzf codexmarathon-<version>-linux-<arch>.tar.gz
-cd codexmarathon-<version>-linux-<arch>
-install -m 0755 codexmarathon "$HOME/.local/bin/codexmarathon"
-codexmarathon init
+```text
+/marathon login work browser
+/marathon login work device-code
 ```
 
-Use `linux-x86_64` for amd64 machines and `linux-aarch64` for ARM64 machines.
-CodexMarathon works alongside your existing Codex installation.
-
-## Quick start
-
-```bash
-codexmarathon status --json
-codexmarathon accounts list
-codexmarathon run --codex codex
-```
-
-If Codex is outside `PATH`, pass its full path:
-
-```bash
-codexmarathon run --codex "$HOME/.local/bin/codex"
-```
-
-Use `--codex-dir` for a project and `--codex-home` for a non-default Codex
-home. Use `--attach-only` when you want to connect to an existing compatible
-Codex session instead of launching one.
+For a local browser flow from the shell, omit the flag and choose the prompt,
+or pass `--browser` explicitly.
 
 ## Commands
 
 ```text
-codexmarathon init
-codexmarathon status [--json]
-codexmarathon run [options]
-codexmarathon accounts list
-codexmarathon accounts status [account-id]
-codexmarathon accounts login [options]
-codexmarathon accounts activate <account-id>
-codexmarathon accounts use <account-id>
-codexmarathon accounts rename --name <alias> <account-id>
-codexmarathon accounts remove <account-id>
-codexmarathon switch <account-id>
+codex marathon status
+codex marathon accounts
+codex marathon on
+codex marathon off
+codex marathon import <alias>
+codex marathon login <alias> [--browser | --device-code]
+codex marathon switch <alias-or-id>
 ```
 
-Use `codexmarathon accounts list` to find account IDs. Login and refresh use
-the authentication setup available in your Codex installation; the detailed
-options are in [Features and usage](docs/features-and-usage.md).
+`import` saves the identity that is already active in Codex. `login` uses the
+normal native Codex ChatGPT login flow and imports the completed account under
+the alias automatically. `switch` resolves an alias or account ID and changes
+the active identity only when no turn is running.
 
-## Safe handoff
+The matching interactive commands are:
 
-CodexMarathon waits for a safe turn boundary before changing accounts. It
-reloads credentials through Codex when possible. If a restart is needed, it
-only controls a Codex process started by `codexmarathon run`, deploys the next
-profile atomically, resumes the same conversation, and verifies the target
-account. It never interrupts an unrelated Codex process or creates a duplicate
-resume prompt.
+```text
+/marathon
+/marathon status
+/marathon on
+/marathon off
+/marathon import <alias>
+/marathon login <alias> [browser|device-code]
+/marathon switch <alias-or-id>
+```
 
-## Security
+Configure the status line with the `marathon` and `marathon-accounts` items.
+They display whether native Marathon is enabled and the number of managed
+accounts.
 
-Credential snapshots are treated as private opaque data. They are kept in the
-companion's protected state, excluded from logs and release files, and never
-printed by status commands. Account metadata and transition records contain no
-access or refresh tokens.
+## Safety model
 
-## Build and test
+- Only managed ChatGPT authentication profiles are switchable initially.
+- A switch waits until all account-bound work is idle; it never changes an
+  active model response, tool call, or subagent turn.
+- The source identity is checked again before a transition. The target profile
+  is validated and persisted atomically before Codex updates its in-memory
+  credentials.
+- A failed or uncertain transition is recorded as such and requires
+  reconciliation; Marathon never guesses that a credential change succeeded.
+- API keys, external bearer authentication, workload identity, and other
+  unsupported provider modes are rejected for Marathon switching.
+
+## Quota reset actions
+
+The native runtime includes a mock-tested capability and scheduler for a
+provider-supported quota-reset action. Its intended behavior is to use a real
+provider reset action only after every eligible managed account has reached
+zero weekly quota, then verify the refreshed quota before selecting that
+account.
+
+No real reset action is called by this project during development, tests, or
+the current build. Production execution remains disabled until a provider
+integration exposes a documented reset capability and is explicitly enabled.
+
+## Build
+
+The custom CLI is built from the Codex Rust workspace:
 
 ```bash
-bash scripts/build-release.sh
-(cd controller && go test ./...)
-(cd controller && go vet ./...)
-(cd integration && go test ./...)
-python3 scripts/test_package_release.py
+cd runtime/codex-rs
+cargo build --release -p codex-cli
 ```
 
-See [Build and verification](docs/build-test.md) for the complete check list.
+The resulting executable is:
+
+```text
+runtime/codex-rs/target/release/codex
+```
+
+Run focused checks while developing:
+
+```bash
+cargo check -p codexmarathon-runtime
+cargo check -p codex-login
+cargo check -p codex-app-server
+cargo check -p codex-tui
+cargo check -p codex-cli
+```
+
+## Legacy companion
+
+Earlier repository versions used a separate Go `codexmarathon` controller.
+It remains in the source tree for compatibility and migration work, but the
+supported user workflow is the native `codex marathon` and `/marathon`
+interface described above.
 
 ## Documentation
 
 - [Features and usage](docs/features-and-usage.md)
-- [Companion design](docs/companion-cli.md)
 - [Architecture](docs/architecture.md)
 - [Build and verification](docs/build-test.md)
-- [Release checklist](docs/release.md)
-- [Project plan](PLAN.md)
-
-CodexMarathon-specific code is provided in this repository. Imported
-Codex-derived source and its notices are documented in
-[runtime provenance](runtime/PROVENANCE.md).
+- [Runtime provenance](runtime/PROVENANCE.md)

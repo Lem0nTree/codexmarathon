@@ -239,6 +239,9 @@ impl ChatWidget {
                     self.on_shutdown_complete();
                 }
             }
+            ServerNotification::AccountLoginCompleted(notification) => {
+                self.on_marathon_login_completed(notification);
+            }
             ServerNotification::ServerRequestResolved(_)
             | ServerNotification::AccountUpdated(_)
             | ServerNotification::AccountRateLimitsUpdated(_)
@@ -281,7 +284,6 @@ impl ChatWidget {
             | ServerNotification::ThreadRealtimeTranscriptDone(_)
             | ServerNotification::WindowsWorldWritableWarning(_)
             | ServerNotification::WindowsSandboxSetupCompleted(_)
-            | ServerNotification::AccountLoginCompleted(_)
             | ServerNotification::ProjectChanged(_)
             | ServerNotification::ThreadProjectUpdated(_) => {}
             ServerNotification::ContextCompacted(_) => {}
@@ -420,15 +422,16 @@ impl ChatWidget {
             .clone()
             .or_else(|| Some(notification.thread_id.clone()));
         let turn_id = self.active_usage_limit_resume_turn_id.clone();
-        self.app_event_tx.send(AppEvent::CodexMarathonRecoveryLifecycle {
-            event: crate::app_event::CodexMarathonRecoveryLifecycle::Completed {
-                recovery_id,
-                thread_id,
-                turn_id,
-                outcome: outcome.to_string(),
-                error_code: None,
-            },
-        });
+        self.app_event_tx
+            .send(AppEvent::CodexMarathonRecoveryLifecycle {
+                event: crate::app_event::CodexMarathonRecoveryLifecycle::Completed {
+                    recovery_id,
+                    thread_id,
+                    turn_id,
+                    outcome: outcome.to_string(),
+                    error_code: None,
+                },
+            });
         self.active_usage_limit_resume_recovery_id = None;
         self.active_usage_limit_resume_thread_id = None;
         self.active_usage_limit_resume_turn_id = None;

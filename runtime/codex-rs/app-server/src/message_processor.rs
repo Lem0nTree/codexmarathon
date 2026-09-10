@@ -5,8 +5,8 @@ use std::sync::OnceLock;
 use std::sync::atomic::AtomicBool;
 
 use crate::attestation::app_server_attestation_provider;
-use crate::config_manager::ConfigManager;
 use crate::codexmarathon_bridge::CodexMarathonRecoveryBridge;
+use crate::config_manager::ConfigManager;
 use crate::connection_rpc_gate::ConnectionRpcGate;
 use crate::current_time::app_server_time_provider;
 use crate::error_code::internal_error;
@@ -33,6 +33,7 @@ use crate::request_processors::FeedbackRequestProcessor;
 use crate::request_processors::FsRequestProcessor;
 use crate::request_processors::GitRequestProcessor;
 use crate::request_processors::InitializeRequestProcessor;
+use crate::request_processors::MarathonRequestProcessor;
 use crate::request_processors::MarketplaceRequestProcessor;
 use crate::request_processors::McpEventStreamReady;
 use crate::request_processors::McpEventStreams;
@@ -80,7 +81,6 @@ use codex_feedback::CodexFeedback;
 use codex_goal_extension::GoalService;
 use codex_home::CodexHomeUserInstructionsProvider;
 use codex_login::AuthManager;
-use codexmarathon_runtime::{CodexNativeRuntime, NativeAuthConfig};
 use codex_protocol::ThreadId;
 use codex_protocol::mcp::ClientMcpExtensions;
 use codex_protocol::protocol::SessionSource;
@@ -90,6 +90,7 @@ use codex_rollout::StateDbHandle;
 use codex_state::log_db::LogDbLayer;
 use codex_thread_store::LocalQueueStore;
 use codex_thread_store::QueueStore;
+use codexmarathon_runtime::{CodexNativeRuntime, MarathonConfig, NativeAuthConfig};
 use tokio::sync::Mutex;
 use tokio::sync::Semaphore;
 use tokio::sync::broadcast;
@@ -99,6 +100,7 @@ use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
+use crate::marathon_service::MarathonService;
 use crate::models_refresh_worker::ModelsRefreshWorker;
 
 const CONNECTION_RPC_DRAIN_TIMEOUT: Duration = Duration::from_secs(/*secs*/ 30);
@@ -153,6 +155,7 @@ pub(crate) struct MessageProcessor {
     git_processor: GitRequestProcessor,
     initialize_processor: InitializeRequestProcessor,
     marketplace_processor: MarketplaceRequestProcessor,
+    marathon_processor: MarathonRequestProcessor,
     mcp_processor: McpRequestProcessor,
     plugin_processor: PluginRequestProcessor,
     project_processor: ProjectRequestProcessor,
@@ -514,7 +517,7 @@ impl MessageProcessor {
             config_warnings,
         );
         let turn_processor = TurnRequestProcessor::new(
-            auth_manager,
+            Arc::clone(&auth_manager),
             Arc::clone(&thread_manager),
             outgoing.clone(),
             analytics_events_client.clone(),
@@ -524,11 +527,24 @@ impl MessageProcessor {
             pending_thread_unloads,
             thread_state_manager,
             thread_watch_manager,
-            auth_transition_lock,
+            Arc::clone(&auth_transition_lock),
             thread_list_state_permit,
             Arc::clone(&skills_watcher),
             turn_cost_worker.as_ref().map(TurnCostWorker::handle),
         );
+        let marathon_config = MarathonConfig::new(config.codex_home.to_path_buf())
+            .expect("Codex config must contain a non-empty codex home");
+        let marathon_service = Arc::new(
+            MarathonService::from_config(
+                Arc::clone(&auth_manager),
+                Arc::clone(&thread_manager),
+                thread_processor.subscribe_running_assistant_turn_count(),
+                Arc::clone(&auth_transition_lock),
+                &marathon_config,
+            )
+            .expect("Codex config must produce valid Marathon state paths"),
+        );
+        let marathon_processor = MarathonRequestProcessor::new(marathon_service);
         if matches!(plugin_startup_tasks, crate::PluginStartupTasks::Start) {
             // Keep plugin startup warmups aligned at app-server startup.
             let on_effective_plugins_changed =
@@ -585,6 +601,7 @@ impl MessageProcessor {
             git_processor,
             initialize_processor,
             marketplace_processor,
+            marathon_processor,
             mcp_processor,
             plugin_processor,
             project_processor,
@@ -1092,6 +1109,19 @@ impl MessageProcessor {
                 .clients_revoke(params)
                 .await
                 .map(|response| Some(response.into())),
+            ClientRequest::MarathonStatus { .. } => self.marathon_processor.status(),
+            ClientRequest::MarathonEnabledSet { params, .. } => {
+                self.marathon_processor.enabled_set(params).await
+            }
+            ClientRequest::MarathonAutoResetSet { params, .. } => {
+                self.marathon_processor.auto_reset_set(params).await
+            }
+            ClientRequest::MarathonSwitch { params, .. } => {
+                self.marathon_processor.switch(params).await
+            }
+            ClientRequest::MarathonImport { params, .. } => {
+                self.marathon_processor.import(params).await
+            }
             ClientRequest::ConfigRequirementsRead { params: _, .. } => self
                 .config_processor
                 .config_requirements_read()

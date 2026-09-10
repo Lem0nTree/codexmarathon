@@ -592,9 +592,8 @@ async fn handle_auth_reload_status(
     match status {
         AuthReloadStatus::Reloaded { changed } => {
             if changed {
-                let invalidated_thread_count = thread_manager
-                    .invalidate_model_transport_caches()
-                    .await;
+                let invalidated_thread_count =
+                    thread_manager.invalidate_model_transport_caches().await;
                 info!(
                     "auth reloaded from storage before {reason}; invalidated model transport caches for {invalidated_thread_count} tracked thread(s)"
                 );
@@ -638,6 +637,7 @@ mod feedback_processor;
 mod fs_processor;
 mod git_processor;
 mod initialize_processor;
+mod marathon_processor;
 mod marketplace_processor;
 mod mcp_event_stream;
 mod mcp_processor;
@@ -668,6 +668,7 @@ pub(crate) use feedback_processor::FeedbackRequestProcessor;
 pub(crate) use fs_processor::FsRequestProcessor;
 pub(crate) use git_processor::GitRequestProcessor;
 pub(crate) use initialize_processor::InitializeRequestProcessor;
+pub(crate) use marathon_processor::MarathonRequestProcessor;
 pub(crate) use marketplace_processor::MarketplaceRequestProcessor;
 pub(crate) use mcp_event_stream::McpEventStreamReady;
 pub(crate) use mcp_event_stream::McpEventStreams;

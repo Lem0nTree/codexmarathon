@@ -587,6 +587,11 @@ pub(crate) struct ChatWidget {
     session_header: SessionHeader,
     initial_user_message: Option<UserMessage>,
     status_account_display: Option<StatusAccountDisplay>,
+    /// Last secret-free status received from the optional CodexMarathon controller.
+    marathon_controller_status: Option<crate::marathon_control::MarathonStatus>,
+    /// Login started from `/marathon login`; importing waits for both native
+    /// login completion and the following AuthManager reload notification.
+    pending_marathon_login: Option<PendingMarathonLogin>,
     runtime_model_provider_base_url: Option<String>,
     pub(crate) remote_connection: Option<RemoteConnectionStatus>,
     token_info: Option<TokenUsageInfo>,
@@ -837,6 +842,13 @@ pub(crate) struct ChatWidget {
     // The controller owns release authorization when the embedded Marathon
     // listener is active; ordinary Codex keeps its existing auto-resume path.
     marathon_recovery_controller_enabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingMarathonLogin {
+    login_id: String,
+    alias: String,
+    completed: bool,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -1362,12 +1374,7 @@ impl ChatWidget {
         self.request_redraw();
     }
 
-    fn on_committed_user_message(
-        &mut self,
-        items: &[UserInput],
-        turn_id: &str,
-        from_replay: bool,
-    ) {
+    fn on_committed_user_message(&mut self, items: &[UserInput], turn_id: &str, from_replay: bool) {
         let display = Self::user_message_display_from_inputs(items);
         if from_replay {
             if self.review.is_review_mode {
@@ -1405,12 +1412,12 @@ impl ChatWidget {
                 self.on_user_message_display(display);
             }
         } else if !self.review.is_review_mode {
-            let is_local_echo = self
-                .pending_local_user_message_echo
-                .as_ref()
-                .is_some_and(|pending| {
-                    pending.turn_id.as_deref() == Some(turn_id) && pending.display == display
-                });
+            let is_local_echo =
+                self.pending_local_user_message_echo
+                    .as_ref()
+                    .is_some_and(|pending| {
+                        pending.turn_id.as_deref() == Some(turn_id) && pending.display == display
+                    });
             if is_local_echo {
                 self.pending_local_user_message_echo = None;
             } else {

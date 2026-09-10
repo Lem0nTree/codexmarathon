@@ -16,6 +16,8 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use tracing::warn;
 
 use super::BedrockAccessKeysAuth;
@@ -170,6 +172,124 @@ pub(super) trait AuthStorageBackend: Debug + Send + Sync {
     fn delete(&self) -> std::io::Result<bool>;
 }
 
+static NEXT_AUTH_TEMP_FILE_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Replace a persistent auth file without ever exposing a partially-written
+/// JSON document to a concurrent reader.
+///
+/// The temporary is created in the destination directory, flushed to the
+/// filesystem, and then replaced with a single rename operation. On Unix the
+/// rename is atomic and replaces an existing destination. Windows uses
+/// `MoveFileExW` with replacement and write-through flags. A directory sync is
+/// attempted after the replacement on platforms that support syncing a
+/// directory entry.
+fn atomic_write_auth_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "auth storage path has no file name",
+        )
+    })?;
+    let temp_name = format!(
+        ".{}.tmp-{}-{}",
+        file_name.to_string_lossy(),
+        std::process::id(),
+        NEXT_AUTH_TEMP_FILE_ID.fetch_add(1, Ordering::Relaxed)
+    );
+    let temp_path = parent.join(temp_name);
+
+    let write_result = (|| {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temp_path)?;
+        file.write_all(contents)?;
+        file.sync_all()?;
+        drop(file);
+        replace_auth_file(&temp_path, path)?;
+        sync_auth_directory(parent)
+    })();
+
+    if write_result.is_err() {
+        // The destination remains untouched when writing or replacing fails.
+        // Cleanup is best effort because the original error is more useful to
+        // the caller and the temporary contains credential material.
+        let _ = std::fs::remove_file(&temp_path);
+    }
+    write_result
+}
+
+#[cfg(unix)]
+fn replace_auth_file(temp_path: &Path, destination: &Path) -> std::io::Result<()> {
+    std::fs::rename(temp_path, destination)
+}
+
+#[cfg(windows)]
+fn replace_auth_file(temp_path: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+
+    let temp_path: Vec<u16> = temp_path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let destination: Vec<u16> = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    // SAFETY: both vectors are NUL-terminated UTF-16 paths that remain alive
+    // for the duration of the OS call.
+    let replaced = unsafe {
+        MoveFileExW(
+            temp_path.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if replaced == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn replace_auth_file(temp_path: &Path, destination: &Path) -> std::io::Result<()> {
+    std::fs::rename(temp_path, destination)
+}
+
+#[cfg(unix)]
+fn sync_auth_directory(path: &Path) -> std::io::Result<()> {
+    let directory = File::open(path)?;
+    match directory.sync_all() {
+        Ok(()) => Ok(()),
+        // Some Unix filesystems do not permit syncing a directory. The file
+        // itself has already been synced, so preserve the successful replace.
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::Unsupported | std::io::ErrorKind::InvalidInput
+            ) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(not(unix))]
+fn sync_auth_directory(_path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
 #[derive(Clone, Debug)]
 pub(super) struct FileAuthStorage {
     codex_home: PathBuf,
@@ -210,16 +330,7 @@ impl AuthStorageBackend for FileAuthStorage {
             std::fs::create_dir_all(parent)?;
         }
         let json_data = serde_json::to_string_pretty(auth_dot_json)?;
-        let mut options = OpenOptions::new();
-        options.truncate(true).write(true).create(true);
-        #[cfg(unix)]
-        {
-            options.mode(0o600);
-        }
-        let mut file = options.open(auth_file)?;
-        file.write_all(json_data.as_bytes())?;
-        file.flush()?;
-        Ok(())
+        atomic_write_auth_file(&auth_file, json_data.as_bytes())
     }
 
     fn delete(&self) -> std::io::Result<bool> {

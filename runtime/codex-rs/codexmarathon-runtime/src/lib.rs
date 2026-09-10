@@ -17,7 +17,8 @@ use codexmarathon_runtime_adapter::RuntimeAdapter;
 use codexmarathon_runtime_adapter::protocol::{
     AuthTransitionParams, NativeAuthSnapshotResult, NativeLoginParams, NativeLoginResult,
     NativeRefreshParams, NativeRefreshResult, RateLimitSnapshot, RecoveryLifecycleEvent,
-    RecoveryReleaseParams, RecoveryReleaseResult, RuntimeEvent, TransitionResult,
+    RecoveryReleaseParams, RecoveryReleaseResult, RuntimeEvent,
+    TransitionResult as AdapterTransitionResult,
 };
 use codexmarathon_runtime_adapter::{
     AdapterError, BackendError, BackendIdentity, BackendRateLimits, BackendReload, CodextBackend,
@@ -25,10 +26,46 @@ use codexmarathon_runtime_adapter::{
 use std::future::Future;
 use std::pin::Pin;
 
+pub mod accounts;
+pub mod auto_reset;
+pub mod config;
+pub mod errors;
+pub mod journal;
+pub mod legacy;
+mod persistence;
+pub mod policy;
+pub mod telemetry;
+pub mod transitions;
+pub mod vault;
+
 mod native;
 
 pub use codexmarathon_runtime_adapter::server::{RuntimeServer, ServerConfig};
 pub use native::{CodexNativeRuntime, NativeAuthConfig};
+
+pub use accounts::{
+    AccountRecord, AccountStore, CredentialHealth, FileAccountRegistry, REGISTRY_VERSION,
+    RegistryState, validate_account_id, validate_alias,
+};
+pub use auto_reset::{
+    AUTO_RESET_STATE_VERSION, AccountQuotaTelemetry, AutoResetBegin, AutoResetCoordinator,
+    AutoResetDecision, AutoResetPhase, AutoResetState, AutoResetStore, QuotaResetCapability,
+    QuotaResetExecution, QuotaResetExecutor, QuotaResetOutcome, QuotaResetRequest,
+};
+pub use config::MarathonConfig;
+pub use errors::{DomainError, DomainResult};
+pub use journal::{FileJournal, Journal, JournalEvent};
+pub use legacy::{LegacyImportResult, import_legacy_auth, read_legacy_auth};
+pub use policy::{
+    PolicyConfig, PolicyDecision, PolicyDecisionType, PolicyInput, PolicyTrigger, evaluate,
+};
+pub use telemetry::{
+    AccountTelemetry, CandidateRank, Freshness, LimitTelemetry, Thresholds, UsageWindow, WindowKind,
+};
+pub use transitions::{
+    TransitionIntent, TransitionOutcome, TransitionPhase, TransitionResult, TransitionState,
+};
+pub use vault::{AuthSnapshot, FileSnapshotVault, SnapshotMetadata, SnapshotVault};
 
 /// Future returned by the native Codex/TUI recovery command seam.
 pub type NativeRecoveryReleaseFuture =
@@ -425,7 +462,7 @@ impl<R: NativeCodexRuntime + Send + 'static> EmbeddedRuntime<R> {
     pub fn prepare_transition(
         &mut self,
         params: AuthTransitionParams,
-    ) -> Result<TransitionResult, AdapterError> {
+    ) -> Result<AdapterTransitionResult, AdapterError> {
         self.adapter.prepare(params)
     }
 
@@ -433,7 +470,7 @@ impl<R: NativeCodexRuntime + Send + 'static> EmbeddedRuntime<R> {
     pub fn commit_transition(
         &mut self,
         params: AuthTransitionParams,
-    ) -> Result<TransitionResult, AdapterError> {
+    ) -> Result<AdapterTransitionResult, AdapterError> {
         self.adapter.commit(params)
     }
 

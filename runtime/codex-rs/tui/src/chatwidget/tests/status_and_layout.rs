@@ -3545,6 +3545,30 @@ async fn status_line_workspace_headline_renders_cached_value() {
 }
 
 #[tokio::test]
+async fn status_line_account_renders_current_account() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.config.tui_status_line = Some(vec!["account".to_string()]);
+    chat.update_account_state(
+        Some(StatusAccountDisplay::ChatGpt {
+            email: Some("status@example.com".to_string()),
+            plan: Some("Team".to_string()),
+        }),
+        Some(PlanType::Business),
+        /*has_chatgpt_account*/ true,
+        /*has_codex_backend_auth*/ true,
+    );
+
+    assert_eq!(
+        status_line_text(&chat),
+        Some("status@example.com(Team)".to_string())
+    );
+    assert_eq!(
+        chat.status_line_value_for_item(crate::bottom_pane::StatusLineItem::Account),
+        Some("status@example.com(Team)".to_string())
+    );
+}
+
+#[tokio::test]
 async fn status_line_workspace_headline_omits_when_unavailable() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.thread_id = Some(ThreadId::new());

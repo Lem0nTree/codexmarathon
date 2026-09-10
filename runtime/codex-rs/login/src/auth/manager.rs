@@ -6,6 +6,7 @@ use serde::Serialize;
 use serial_test::serial;
 use std::env;
 use std::fmt::Debug;
+use std::fmt::Formatter;
 use std::future::Future;
 use std::path::Path;
 use std::path::PathBuf;
@@ -1841,6 +1842,115 @@ pub enum AuthReloadStatus {
     Failed,
 }
 
+/// A validated, managed ChatGPT auth payload held for an account transition.
+///
+/// The wrapper deliberately does not implement serialization and redacts its
+/// debug representation. Callers can only obtain the payload explicitly at
+/// the native AuthManager boundary, which keeps transition identifiers and
+/// diagnostics free of credential material by default.
+#[derive(Clone, PartialEq)]
+pub struct AuthTransitionSnapshot {
+    auth_dot_json: AuthDotJson,
+    account_id: String,
+}
+
+impl Debug for AuthTransitionSnapshot {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AuthTransitionSnapshot")
+            .field("account_id", &self.account_id)
+            .field("auth_mode", &self.auth_dot_json.resolved_mode())
+            .finish()
+    }
+}
+
+impl AuthTransitionSnapshot {
+    /// Validate and wrap a stored auth payload for a managed transition.
+    ///
+    /// Only Codex-managed ChatGPT OAuth snapshots are transferable. External
+    /// token modes, API keys, headers, Agent Identity, PAT, and Bedrock auth
+    /// are rejected before any transition can persist them.
+    pub fn from_auth_dot_json(auth_dot_json: AuthDotJson) -> std::io::Result<Self> {
+        let account_id = managed_transition_account_id(&auth_dot_json)?;
+        Ok(Self {
+            auth_dot_json,
+            account_id,
+        })
+    }
+
+    /// Return the non-secret provider account identity.
+    pub fn account_id(&self) -> &str {
+        &self.account_id
+    }
+
+    /// Return the validated auth mode. This is always managed ChatGPT OAuth.
+    pub fn auth_mode(&self) -> AuthMode {
+        self.auth_dot_json.resolved_mode()
+    }
+
+    /// Borrow the opaque native payload at an explicit integration boundary.
+    pub fn as_auth_dot_json(&self) -> &AuthDotJson {
+        &self.auth_dot_json
+    }
+
+    /// Consume the wrapper at an explicit native AuthManager boundary.
+    pub fn into_auth_dot_json(self) -> AuthDotJson {
+        self.auth_dot_json
+    }
+}
+
+fn transition_account_id(value: Option<String>) -> std::io::Result<String> {
+    let account_id = value
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "managed auth snapshot has no account identity",
+            )
+        })?;
+    if account_id.chars().any(|character| character.is_control()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "managed auth snapshot has an invalid account identity",
+        ));
+    }
+    Ok(account_id)
+}
+
+fn managed_transition_account_id(auth_dot_json: &AuthDotJson) -> std::io::Result<String> {
+    if auth_dot_json.resolved_mode() != AuthMode::Chatgpt {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            format!(
+                "auth transitions do not support {} authentication",
+                auth_dot_json.resolved_mode()
+            ),
+        ));
+    }
+    let tokens = auth_dot_json.tokens.as_ref().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "managed ChatGPT auth snapshot has no token data",
+        )
+    })?;
+    if let (Some(account_id), Some(claimed_account_id)) = (
+        tokens.account_id.as_deref(),
+        tokens.id_token.chatgpt_account_id.as_deref(),
+    ) && account_id != claimed_account_id
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "managed auth snapshot has conflicting provider identities",
+        ));
+    }
+    transition_account_id(
+        tokens
+            .account_id
+            .clone()
+            .or_else(|| tokens.id_token.chatgpt_account_id.clone()),
+    )
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum UnauthorizedRecoveryMode {
     Managed,
@@ -2354,6 +2464,199 @@ impl AuthManager {
             self.auth_credentials_store_mode,
             self.keyring_backend_kind,
         )
+    }
+
+    fn ensure_transition_storage(&self) -> std::io::Result<()> {
+        if self.auth_credentials_store_mode == AuthCredentialsStoreMode::Ephemeral {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "auth transitions require persistent managed auth storage",
+            ));
+        }
+        if self.has_external_auth() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "auth transitions do not support externally managed auth",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_transition_policy(&self, auth: &CodexAuth) -> std::io::Result<()> {
+        let allowed_login_methods = self.allowed_login_methods();
+        validate_auth_restrictions(
+            Some(&allowed_login_methods),
+            self.effective_chatgpt_workspaces().as_deref(),
+            auth,
+        )
+        .map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "auth snapshot violates the configured authentication policy",
+            )
+        })
+    }
+
+    fn current_transition_source(&self) -> std::io::Result<(CodexAuth, String)> {
+        let auth = self.auth_cached().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "no managed auth is active for transition",
+            )
+        })?;
+        if !matches!(auth, CodexAuth::Chatgpt(_)) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                format!(
+                    "auth transitions do not support {} authentication",
+                    auth.api_auth_mode()
+                ),
+            ));
+        }
+        self.validate_transition_policy(&auth)?;
+        let account_id = transition_account_id(auth.get_account_id())?;
+        Ok((auth, account_id))
+    }
+
+    async fn auth_from_transition_snapshot(
+        &self,
+        snapshot: &AuthTransitionSnapshot,
+    ) -> std::io::Result<CodexAuth> {
+        let auth = CodexAuth::from_auth_dot_json(
+            &self.codex_home,
+            snapshot.as_auth_dot_json().clone(),
+            self.auth_credentials_store_mode,
+            self.chatgpt_base_url.as_deref(),
+            self.keyring_backend_kind,
+            self.agent_identity_authapi_base_url.as_deref(),
+            &self.auth_route_config,
+        )
+        .await
+        .map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "auth snapshot could not be loaded by the native provider",
+            )
+        })?;
+        if !matches!(auth, CodexAuth::Chatgpt(_)) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                format!(
+                    "auth transitions do not support {} authentication",
+                    auth.api_auth_mode()
+                ),
+            ));
+        }
+        self.validate_transition_policy(&auth)?;
+        Ok(auth)
+    }
+
+    /// Capture the currently active managed ChatGPT auth from the configured
+    /// native storage backend after proving that it belongs to the expected
+    /// account. The refresh semaphore guards this read against concurrent
+    /// native refresh operations.
+    pub async fn snapshot_for_transition(
+        &self,
+        expected_account_id: &str,
+    ) -> std::io::Result<AuthTransitionSnapshot> {
+        let _refresh_guard = self
+            .refresh_lock
+            .acquire()
+            .await
+            .map_err(|_| std::io::Error::other("auth transition guard is unavailable"))?;
+        self.ensure_transition_storage()?;
+        let (_current_auth, current_account_id) = self.current_transition_source()?;
+        if current_account_id != expected_account_id {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "active auth identity does not match the expected transition source",
+            ));
+        }
+
+        let stored = self.auth_dot_json_from_storage()?.ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "managed auth is not persisted",
+            )
+        })?;
+        let snapshot = AuthTransitionSnapshot::from_auth_dot_json(stored)?;
+        if snapshot.account_id() != expected_account_id {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "persisted auth identity does not match the expected transition source",
+            ));
+        }
+        // Validate the provider-specific payload and configured policy before
+        // handing credential material to the transition coordinator.
+        self.auth_from_transition_snapshot(&snapshot).await?;
+        Ok(snapshot)
+    }
+
+    /// Persist a validated managed ChatGPT snapshot for the next account only
+    /// after proving that the expected source account is still active. The
+    /// cache is changed strictly after the configured storage backend reports
+    /// a successful durable write.
+    pub async fn install_snapshot_for_transition(
+        &self,
+        snapshot: AuthTransitionSnapshot,
+        expected_source_id: &str,
+    ) -> std::io::Result<AuthReloadStatus> {
+        let _refresh_guard = self
+            .refresh_lock
+            .acquire()
+            .await
+            .map_err(|_| std::io::Error::other("auth transition guard is unavailable"))?;
+        self.ensure_transition_storage()?;
+        let (_current_auth, current_account_id) = self.current_transition_source()?;
+        if current_account_id != expected_source_id {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "active auth identity does not match the expected transition source",
+            ));
+        }
+
+        let stored = self.auth_dot_json_from_storage()?.ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "managed auth is not persisted",
+            )
+        })?;
+        let stored_snapshot = AuthTransitionSnapshot::from_auth_dot_json(stored)?;
+        if stored_snapshot.account_id() != expected_source_id {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "persisted auth identity does not match the expected transition source",
+            ));
+        }
+
+        let candidate = self.auth_from_transition_snapshot(&snapshot).await?;
+        let storage = create_auth_storage(
+            self.codex_home.clone(),
+            self.auth_credentials_store_mode,
+            self.keyring_backend_kind,
+        );
+        storage
+            .save(snapshot.as_auth_dot_json())
+            .map_err(|_| std::io::Error::other("managed auth snapshot could not be persisted"))?;
+
+        let changed = self.set_cached_auth_after_transition(candidate)?;
+        Ok(AuthReloadStatus::Reloaded { changed })
+    }
+
+    fn set_cached_auth_after_transition(&self, new_auth: CodexAuth) -> std::io::Result<bool> {
+        let mut guard = self
+            .inner
+            .write()
+            .map_err(|_| std::io::Error::other("auth cache lock is poisoned"))?;
+        let changed = !Self::auths_equal_for_refresh(guard.auth.as_ref(), Some(&new_auth));
+        if changed {
+            guard.permanent_refresh_failure = None;
+        }
+        guard.auth = Some(new_auth);
+        if changed {
+            self.auth_change_tx.send_modify(|revision| *revision += 1);
+        }
+        Ok(changed)
     }
 
     /// Subscribes to cached auth changes that can affect request recovery.

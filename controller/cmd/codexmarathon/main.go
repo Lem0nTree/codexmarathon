@@ -30,6 +30,7 @@ Usage:
   codexmarathon accounts list [options]
   codexmarathon accounts login [options]
   codexmarathon accounts add [options]
+  codexmarathon accounts import [options]
   codexmarathon accounts status [account-id] [options]
   codexmarathon accounts rename --name <alias> <account-id> [options]
   codexmarathon accounts activate <account-id> [options]

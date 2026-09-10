@@ -25,3 +25,20 @@ The resulting app-server is never packaged by default. Use
 `--include-embedded-runtime` or `CODEXMARATHON_INCLUDE_EMBEDDED_RUNTIME=1`
 only for controlled protocol diagnostics. No donor path appears in the Cargo
 workspace.
+
+## Native Marathon user flow
+
+The integrated Codex build exposes Marathon from the `codex` executable itself:
+
+```text
+codex marathon status
+codex marathon login work --device-code
+codex marathon switch work
+```
+
+`codex marathon login ALIAS` prompts in an interactive terminal to choose a
+browser link or device/auth-code login. Use `--browser` or `--device-code` for
+scripted or headless use. Inside the TUI, `/marathon` shows the current status
+and help, and `/marathon login ALIAS` opens the same choice. Device-code login
+prints a verification URL and one-time code that can be completed from another
+machine; the account is imported automatically after native auth reloads.

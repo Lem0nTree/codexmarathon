@@ -67,6 +67,18 @@ type LoginResult struct {
 	Metadata  map[string]string
 }
 
+// ImportRequest describes an already authenticated Codex auth.json snapshot.
+// AuthJSON is sensitive and is consumed only in memory before it is persisted
+// to the protected vault; callers must not log or print it.
+type ImportRequest struct {
+	AccountID string
+	Alias     string
+	AuthJSON  []byte
+	Activate  bool
+	Overwrite bool
+	Metadata  map[string]string
+}
+
 // RefreshRequest is the in-memory handoff for a native refresh.  The runtime
 // receives the opaque current snapshot so it can use its own auth schema and
 // refresh implementation.  The manager validates the returned token set and
@@ -312,11 +324,65 @@ func (m *Manager) Login(ctx context.Context, request LoginRequest) (LoginOutcome
 			metadata[key] = value
 		}
 	}
+	return m.persistSnapshotLocked(ctx, accountID, alias, raw, metadata, request.Overwrite, request.Activate)
+}
+
+// Import stores an existing Codex auth.json snapshot without invoking a login
+// runtime. This is the supported bootstrap path for a stock Codex CLI whose
+// active authentication already exists but which does not expose Marathon's
+// native login endpoint.
+func (m *Manager) Import(ctx context.Context, request ImportRequest) (LoginOutcome, error) {
+	if err := contextError(ctx); err != nil {
+		return LoginOutcome{}, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := m.validateLocked(false); err != nil {
+		return LoginOutcome{}, err
+	}
+	if err := ValidateAccountIDOptional(request.AccountID); err != nil {
+		return LoginOutcome{}, err
+	}
+	if err := ValidateAlias(request.Alias); err != nil {
+		return LoginOutcome{}, err
+	}
+	raw, err := credentials.ValidateSnapshot(request.AuthJSON)
+	if err != nil {
+		return LoginOutcome{}, err
+	}
+	identity, err := credentials.ExtractAccountID(raw)
+	if err != nil {
+		return LoginOutcome{}, err
+	}
+	accountID := request.AccountID
+	if accountID == "" {
+		accountID = identity
+	}
+	if accountID == "" {
+		return LoginOutcome{}, ErrLoginMissingIdentity
+	}
+	if err := ValidateAccountID(accountID); err != nil {
+		return LoginOutcome{}, err
+	}
+	if identity != "" && identity != accountID {
+		return LoginOutcome{}, fmt.Errorf("%w: snapshot is for %q, requested %q", ErrLoginIdentityMismatch, identity, accountID)
+	}
+	alias := request.Alias
+	if alias == "" {
+		alias = accountID
+	}
+	if err := ValidateAlias(alias); err != nil {
+		return LoginOutcome{}, err
+	}
+	return m.persistSnapshotLocked(ctx, accountID, alias, raw, request.Metadata, request.Overwrite, request.Activate)
+}
+
+func (m *Manager) persistSnapshotLocked(ctx context.Context, accountID, alias string, raw []byte, metadata map[string]string, overwrite, activateRequested bool) (LoginOutcome, error) {
 	account := Account{
 		ID:               accountID,
 		Alias:            alias,
 		CredentialRef:    accountID,
-		Metadata:         metadata,
+		Metadata:         cloneMetadata(metadata),
 		CredentialHealth: CredentialHealthHealthy,
 	}
 	if err := ValidateAccount(account); err != nil {
@@ -331,7 +397,7 @@ func (m *Manager) Login(ctx context.Context, request LoginRequest) (LoginOutcome
 	if err != nil {
 		return LoginOutcome{}, err
 	}
-	if existed && !request.Overwrite {
+	if existed && !overwrite {
 		return LoginOutcome{}, fmt.Errorf("%w: %s", ErrAccountExists, accountID)
 	}
 	if !existed && hadPreviousRaw {
@@ -355,7 +421,7 @@ func (m *Manager) Login(ctx context.Context, request LoginRequest) (LoginOutcome
 	// An overwrite of the currently selected profile must redeploy the newly
 	// authenticated snapshot as well; otherwise the vault and auth.json would
 	// silently diverge until a later manual activation.
-	activate := request.Activate || activeID == "" || activeID == accountID
+	activate := activateRequested || activeID == "" || activeID == accountID
 	if !activate {
 		return LoginOutcome{AccountID: accountID, Alias: alias}, nil
 	}

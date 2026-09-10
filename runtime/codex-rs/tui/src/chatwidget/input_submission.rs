@@ -395,10 +395,8 @@ impl ChatWidget {
         let render_before_submit =
             render_in_history && matches!(&self.codex_op_target, CodexOpTarget::AppEvent);
         if render_before_submit {
-            let display = user_message_display_for_history(
-                submitted_message.clone(),
-                &history_record,
-            );
+            let display =
+                user_message_display_for_history(submitted_message.clone(), &history_record);
             self.pending_local_user_message_echo = Some(PendingLocalUserMessageEcho {
                 display: display.clone(),
                 turn_id: None,

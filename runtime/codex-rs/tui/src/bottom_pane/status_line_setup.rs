@@ -150,6 +150,21 @@ pub(crate) enum StatusLineItem {
     /// Current workspace notification headline.
     WorkspaceHeadline,
 
+    /// Current signed-in account identity.
+    Account,
+
+    /// Whether the native CodexMarathon service is enabled.
+    #[strum(to_string = "marathon", serialize = "marathon-status")]
+    Marathon,
+
+    /// Number of accounts managed by the native CodexMarathon service.
+    #[strum(
+        to_string = "marathon-accounts",
+        serialize = "managed-accounts",
+        serialize = "managed-account-count"
+    )]
+    ManagedAccounts,
+
     /// Latest checklist task progress from `update_plan` (if available).
     TaskProgress,
 }
@@ -208,6 +223,9 @@ impl StatusLineItem {
             StatusLineItem::WorkspaceHeadline => {
                 "Workspace notification headline (Enterprise workspaces only; omitted when unavailable)"
             }
+            StatusLineItem::Account => "Current signed-in account (omitted when unavailable)",
+            StatusLineItem::Marathon => "Native CodexMarathon state (enabled or disabled)",
+            StatusLineItem::ManagedAccounts => "Number of accounts managed by native CodexMarathon",
             StatusLineItem::TaskProgress => {
                 "Latest task progress from update_plan (omitted until available)"
             }
@@ -244,6 +262,9 @@ impl StatusLineItem {
             StatusLineItem::RawOutput => StatusSurfacePreviewItem::RawOutput,
             StatusLineItem::ThreadTitle => StatusSurfacePreviewItem::ThreadTitle,
             StatusLineItem::WorkspaceHeadline => StatusSurfacePreviewItem::WorkspaceHeadline,
+            StatusLineItem::Account => StatusSurfacePreviewItem::Account,
+            StatusLineItem::Marathon => StatusSurfacePreviewItem::Marathon,
+            StatusLineItem::ManagedAccounts => StatusSurfacePreviewItem::ManagedAccounts,
             StatusLineItem::TaskProgress => StatusSurfacePreviewItem::TaskProgress,
         }
     }
@@ -505,6 +526,32 @@ mod tests {
         assert_eq!(
             "reasoning".parse::<StatusLineItem>(),
             Ok(StatusLineItem::Reasoning)
+        );
+    }
+
+    #[test]
+    fn account_is_selectable_id() {
+        assert_eq!(StatusLineItem::Account.to_string(), "account");
+        assert_eq!(
+            "account".parse::<StatusLineItem>(),
+            Ok(StatusLineItem::Account)
+        );
+    }
+
+    #[test]
+    fn marathon_items_are_selectable_ids() {
+        assert_eq!(StatusLineItem::Marathon.to_string(), "marathon");
+        assert_eq!(
+            "marathon-status".parse::<StatusLineItem>(),
+            Ok(StatusLineItem::Marathon)
+        );
+        assert_eq!(
+            "managed-accounts".parse::<StatusLineItem>(),
+            Ok(StatusLineItem::ManagedAccounts)
+        );
+        assert_eq!(
+            "marathon-accounts".parse::<StatusLineItem>(),
+            Ok(StatusLineItem::ManagedAccounts)
         );
     }
 
