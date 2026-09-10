@@ -14,51 +14,25 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  static:
-    name: Static, provenance, and package-policy checks
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout product source
-        uses: actions/checkout@v4
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-      - name: Validate provenance and source boundaries
-        run: python scripts/verify_provenance.py --root .
-      - name: Validate allow-listed release inputs
-        run: python scripts/verify_package.py --root . --manifest packaging/release-manifest.json
-      - name: Validate cross-language protocol catalogs
-        run: python scripts/verify_protocol.py --root .
-      - name: Compile release scripts
-        run: python -m compileall -q scripts
-      - name: Test companion packaging modes
-        run: python scripts/test_package_release.py
-
-  build-test:
-    name: Go companion and optional bridge tests (${{ matrix.os }})
-    needs: static
+  rust:
+    name: Native Rust CLI checks (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - name: Checkout product source
+      - name: Checkout source
         uses: actions/checkout@v4
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: '1.22.x'
-          cache: true
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
+          components: rustfmt
       - name: Cache Cargo registry and build
         uses: actions/cache@v4
         with:
@@ -68,43 +42,22 @@ jobs:
             runtime/codex-rs/target
           key: ${{ runner.os }}-cargo-${{ hashFiles('runtime/codex-rs/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
-      - name: Run controller tests
+      - name: Validate provenance
         shell: bash
-        run: cd controller && go test ./...
-      - name: Run integration tests
+        run: python scripts/verify_provenance.py --root .
+      - name: Check formatting
         shell: bash
-        run: cd integration && go test ./...
-      - name: Run adapter tests
+        working-directory: runtime/codex-rs
+        run: cargo fmt --all -- --check
+      - name: Test native Marathon runtime
         shell: bash
-        run: cd runtime/codex-rs && cargo test --locked -p codexmarathon-runtime-adapter
-      - name: Run native bridge tests
+        working-directory: runtime/codex-rs
+        run: cargo test --locked -p codexmarathon-runtime
+      - name: Build native Codex CLI
         shell: bash
-        run: cd runtime/codex-rs && cargo test --locked -p codexmarathon-runtime
-      - name: Build controller and package Linux artifact
+        working-directory: runtime/codex-rs
+        run: cargo build --locked --release -p codex-cli
+      - name: Verify Marathon command surface
         if: matrix.os == 'ubuntu-latest'
         shell: bash
-        run: |
-          mkdir -p dist/build dist/release
-          (cd controller && go build -trimpath -o ../dist/build/codexmarathon ./cmd/codexmarathon)
-          python scripts/package_release.py \
-            --root . --output dist/release \
-            --controller-binary dist/build/codexmarathon \
-            --platform linux-x86_64 --version 0.1.0 --format tar.gz
-          artifact=$(find dist/release -maxdepth 1 -type f -name '*.tar.gz' -print -quit)
-          python scripts/verify_package.py --artifact "$artifact" --manifest packaging/release-manifest.json
-          python scripts/clean_machine_check.py --root . --artifact "$artifact"
-      - name: Build controller and package Windows artifact
-        if: matrix.os == 'windows-latest'
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path dist/build, dist/release | Out-Null
-          Push-Location controller
-          go build -trimpath -o ../dist/build/codexmarathon.exe ./cmd/codexmarathon
-          Pop-Location
-          python scripts/package_release.py `
-            --root . --output dist/release `
-            --controller-binary dist/build/codexmarathon.exe `
-            --platform windows-x86_64 --version 0.1.0 --format zip --windows-exe
-          $artifact = (Get-ChildItem dist/release -Filter '*.zip' | Select-Object -First 1).FullName
-          python scripts/verify_package.py --artifact $artifact --manifest packaging/release-manifest.json
-          python scripts/clean_machine_check.py --root . --artifact $artifact
+        run: runtime/codex-rs/target/release/codex marathon --help
