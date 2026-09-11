@@ -1,4 +1,0 @@
-ONE
-two
-between
-three

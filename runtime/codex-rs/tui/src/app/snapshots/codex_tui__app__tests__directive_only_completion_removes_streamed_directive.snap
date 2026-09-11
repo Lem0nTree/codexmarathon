@@ -1,5 +1,0 @@
----
-source: tui/src/app/tests.rs
-expression: "rendered.lines.iter().map(rendered_line_text).collect::<Vec<_>>().join(\"\\n\")"
----
-before directive
