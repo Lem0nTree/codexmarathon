@@ -1,0 +1,5 @@
+---
+source: tui/src/history_cell.rs
+expression: rendered
+---
+• Ran 3 commands · ctrl + t to view transcript

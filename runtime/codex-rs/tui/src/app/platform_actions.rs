@@ -1,0 +1,121 @@
+//! Platform-specific app actions and small global shortcuts.
+//!
+//! This module owns platform state used by `App`, the side-conversation return shortcut predicate,
+//! and Windows sandbox helper actions that are compiled only on Windows.
+
+use super::*;
+
+#[derive(Default)]
+pub(super) struct WindowsSandboxState {
+    pub(super) setup_started_at: Option<Instant>,
+    // One-shot suppression of the next world-writable scan after user confirmation.
+    pub(super) skip_world_writable_scan_once: bool,
+    /// A startup filesystem scan can still enqueue a protected warning after the app queue drains.
+    pub(super) startup_world_writable_scan_pending: bool,
+}
+
+impl App {
+    #[cfg(target_os = "windows")]
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn spawn_world_writable_scan(
+        cwd: AbsolutePathBuf,
+        workspace_roots: Vec<AbsolutePathBuf>,
+        env_map: std::collections::HashMap<String, String>,
+        logs_base_dir: AbsolutePathBuf,
+        permission_profile: PermissionProfile,
+        session_telemetry: SessionTelemetry,
+        tx: AppEventSender,
+        startup_scan: bool,
+    ) {
+        let Ok(permissions) =
+            codex_windows_sandbox::ResolvedWindowsSandboxPermissions::try_from_permission_profile_for_workspace_roots(
+                &permission_profile,
+                workspace_roots.as_slice(),
+            )
+        else {
+            if startup_scan {
+                tx.send(AppEvent::StartupWorldWritableScanCompleted);
+            }
+            return;
+        };
+
+        tokio::task::spawn_blocking(move || {
+            let logs_base_dir_path = logs_base_dir.as_path();
+            let result =
+                codex_windows_sandbox::apply_world_writable_scan_and_denies_for_permissions(
+                    logs_base_dir_path,
+                    cwd.as_path(),
+                    &env_map,
+                    &permissions,
+                    Some(logs_base_dir_path),
+                );
+            crate::windows_sandbox::record_world_writable_scan_result(&session_telemetry, &result);
+            if result.is_err() {
+                // Scan failed: warn without examples.
+                send_world_writable_scan_failed(&tx);
+            }
+            if startup_scan {
+                tx.send(AppEvent::StartupWorldWritableScanCompleted);
+            }
+        });
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn send_world_writable_scan_failed(tx: &AppEventSender) {
+    tx.send(AppEvent::OpenWorldWritableWarningConfirmation {
+        preset: None,
+        profile_selection: None,
+        sample_paths: Vec::new(),
+        extra_count: 0usize,
+        failed_scan: true,
+    });
+}
+
+pub(super) fn side_return_shortcut_matches(key_event: KeyEvent) -> bool {
+    matches!(
+        key_event,
+        KeyEvent {
+            code: KeyCode::Char(c),
+            modifiers,
+            kind: KeyEventKind::Press,
+            ..
+        } if modifiers.contains(KeyModifiers::CONTROL)
+            && (c.eq_ignore_ascii_case(&'c') || c.eq_ignore_ascii_case(&'d'))
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn side_return_shortcuts_match_ctrl_c_and_ctrl_d() {
+        assert!(side_return_shortcut_matches(KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+        )));
+        assert!(side_return_shortcut_matches(KeyEvent::new(
+            KeyCode::Char('C'),
+            KeyModifiers::CONTROL,
+        )));
+        assert!(side_return_shortcut_matches(KeyEvent::new(
+            KeyCode::Char('d'),
+            KeyModifiers::CONTROL,
+        )));
+        assert!(side_return_shortcut_matches(KeyEvent::new(
+            KeyCode::Char('D'),
+            KeyModifiers::CONTROL,
+        )));
+        assert!(!side_return_shortcut_matches(KeyEvent::new_with_kind(
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+            KeyEventKind::Press,
+        )));
+        assert!(!side_return_shortcut_matches(KeyEvent::new_with_kind(
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+            KeyEventKind::Release,
+        )));
+    }
+}

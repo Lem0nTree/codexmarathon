@@ -1,0 +1,196 @@
+use std::collections::HashMap;
+use std::collections::hash_map::Entry;
+use std::sync::Arc;
+use std::sync::OnceLock;
+use std::time::Duration;
+
+use serde::Deserialize;
+use tokio::sync::Barrier;
+use tokio::time::sleep;
+
+use crate::function_tool::FunctionCallError;
+use crate::tools::context::FunctionToolOutput;
+use crate::tools::context::ToolInvocation;
+use crate::tools::context::ToolPayload;
+use crate::tools::context::boxed_tool_output;
+use crate::tools::handlers::parse_arguments;
+use crate::tools::handlers::test_sync_spec::create_test_sync_tool;
+use crate::tools::registry::CoreToolRuntime;
+use crate::tools::registry::ToolExecutor;
+use codex_tools::ToolName;
+use codex_tools::ToolSpec;
+
+pub struct TestSyncHandler;
+
+const DEFAULT_TIMEOUT_MS: u64 = 1_000;
+const GIT_ENRICHMENT_TIMEOUT: Duration = Duration::from_secs(10);
+
+static BARRIERS: OnceLock<tokio::sync::Mutex<HashMap<String, BarrierState>>> = OnceLock::new();
+
+struct BarrierState {
+    barrier: Arc<Barrier>,
+    participants: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct BarrierArgs {
+    id: String,
+    participants: usize,
+    #[serde(default = "default_timeout_ms")]
+    timeout_ms: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct TestSyncArgs {
+    #[serde(default)]
+    sleep_before_ms: Option<u64>,
+    #[serde(default)]
+    sleep_after_ms: Option<u64>,
+    #[serde(default)]
+    barrier: Option<BarrierArgs>,
+    #[serde(default)]
+    wait_for_git_enrichment: bool,
+}
+
+fn default_timeout_ms() -> u64 {
+    DEFAULT_TIMEOUT_MS
+}
+
+fn barrier_map() -> &'static tokio::sync::Mutex<HashMap<String, BarrierState>> {
+    BARRIERS.get_or_init(|| tokio::sync::Mutex::new(HashMap::new()))
+}
+
+impl ToolExecutor<ToolInvocation> for TestSyncHandler {
+    fn tool_name(&self) -> ToolName {
+        ToolName::plain("test_sync_tool")
+    }
+
+    fn spec(&self) -> ToolSpec {
+        create_test_sync_tool()
+    }
+
+    fn supports_parallel_tool_calls(&self) -> bool {
+        true
+    }
+
+    fn handle<'a>(&'a self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'a>
+    where
+        ToolInvocation: 'a,
+    {
+        Box::pin(self.handle_call(invocation))
+    }
+}
+
+impl TestSyncHandler {
+    async fn handle_call(
+        &self,
+        invocation: ToolInvocation,
+    ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError> {
+        let ToolInvocation { payload, turn, .. } = invocation;
+
+        let arguments = match payload {
+            ToolPayload::Function { arguments } => arguments,
+            _ => {
+                return Err(FunctionCallError::RespondToModel(
+                    "test_sync_tool handler received unsupported payload".to_string(),
+                ));
+            }
+        };
+
+        let args: TestSyncArgs = parse_arguments(&arguments)?;
+
+        if let Some(delay) = args.sleep_before_ms
+            && delay > 0
+        {
+            sleep(Duration::from_millis(delay)).await;
+        }
+
+        if let Some(barrier) = args.barrier {
+            wait_on_barrier(barrier).await?;
+        }
+
+        if args.wait_for_git_enrichment {
+            tokio::time::timeout(
+                GIT_ENRICHMENT_TIMEOUT,
+                turn.turn_metadata_state.wait_for_git_enrichment(),
+            )
+            .await
+            .map_err(|_| {
+                FunctionCallError::RespondToModel(format!(
+                    "test_sync_tool git enrichment wait timed out after {} seconds",
+                    GIT_ENRICHMENT_TIMEOUT.as_secs()
+                ))
+            })?;
+        }
+
+        if let Some(delay) = args.sleep_after_ms
+            && delay > 0
+        {
+            sleep(Duration::from_millis(delay)).await;
+        }
+
+        Ok(boxed_tool_output(FunctionToolOutput::from_text(
+            "ok".to_string(),
+            Some(true),
+        )))
+    }
+}
+
+impl CoreToolRuntime for TestSyncHandler {}
+
+async fn wait_on_barrier(args: BarrierArgs) -> Result<(), FunctionCallError> {
+    if args.participants == 0 {
+        return Err(FunctionCallError::RespondToModel(
+            "barrier participants must be greater than zero".to_string(),
+        ));
+    }
+
+    if args.timeout_ms == 0 {
+        return Err(FunctionCallError::RespondToModel(
+            "barrier timeout must be greater than zero".to_string(),
+        ));
+    }
+
+    let barrier_id = args.id.clone();
+    let barrier = {
+        let mut map = barrier_map().lock().await;
+        match map.entry(barrier_id.clone()) {
+            Entry::Occupied(entry) => {
+                let state = entry.get();
+                if state.participants != args.participants {
+                    let existing = state.participants;
+                    return Err(FunctionCallError::RespondToModel(format!(
+                        "barrier {barrier_id} already registered with {existing} participants"
+                    )));
+                }
+                state.barrier.clone()
+            }
+            Entry::Vacant(entry) => {
+                let barrier = Arc::new(Barrier::new(args.participants));
+                entry.insert(BarrierState {
+                    barrier: barrier.clone(),
+                    participants: args.participants,
+                });
+                barrier
+            }
+        }
+    };
+
+    let timeout = Duration::from_millis(args.timeout_ms);
+    let wait_result = tokio::time::timeout(timeout, barrier.wait())
+        .await
+        .map_err(|_| {
+            FunctionCallError::RespondToModel("test_sync_tool barrier wait timed out".to_string())
+        })?;
+
+    if wait_result.is_leader() {
+        let mut map = barrier_map().lock().await;
+        if let Some(state) = map.get(&barrier_id)
+            && Arc::ptr_eq(&state.barrier, &barrier)
+        {
+            map.remove(&barrier_id);
+        }
+    }
+
+    Ok(())
+}

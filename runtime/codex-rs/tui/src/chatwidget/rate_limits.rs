@@ -1,0 +1,794 @@
+//! Rate-limit warning, prompt, and notice surfaces for `ChatWidget`.
+
+use super::*;
+pub(super) const WORKSPACE_NUDGE_VIEW_ID: &str = "workspace-usage-nudge";
+use crate::bottom_pane::ActionableBanner;
+use codex_app_server_protocol::CodexErrorInfo as AppServerCodexErrorInfo;
+use uuid::Uuid;
+
+pub(super) struct PendingCreditsNudge {
+    request_id: Uuid,
+    credit_type: AddCreditsNudgeCreditType,
+}
+
+pub(super) const NUDGE_MODEL_SLUG: &str = "gpt-5.6-luna";
+pub(super) const RATE_LIMIT_SWITCH_PROMPT_THRESHOLD: f64 = 90.0;
+pub(super) const RATE_LIMIT_SWITCH_PROMPT_VIEW_ID: &str = "rate-limit-switch-prompt";
+
+const RATE_LIMIT_WARNING_THRESHOLDS: [f64; 3] = [75.0, 90.0, 95.0];
+const PRIMARY_LIMIT_FALLBACK_LABEL: &str = "usage";
+const SECONDARY_LIMIT_FALLBACK_LABEL: &str = "secondary usage";
+
+#[derive(Default)]
+pub(super) struct RateLimitWarningState {
+    pub(super) secondary_index: usize,
+    pub(super) primary_index: usize,
+}
+
+impl RateLimitWarningState {
+    pub(super) fn take_warnings(
+        &mut self,
+        secondary_used_percent: Option<f64>,
+        secondary_window_minutes: Option<i64>,
+        primary_used_percent: Option<f64>,
+        primary_window_minutes: Option<i64>,
+    ) -> Vec<String> {
+        let reached_secondary_cap =
+            matches!(secondary_used_percent, Some(percent) if percent == 100.0);
+        let reached_primary_cap = matches!(primary_used_percent, Some(percent) if percent == 100.0);
+        if reached_secondary_cap || reached_primary_cap {
+            return Vec::new();
+        }
+
+        let mut warnings = Vec::new();
+
+        if let Some(secondary_used_percent) = secondary_used_percent {
+            let mut highest_secondary: Option<f64> = None;
+            while self.secondary_index < RATE_LIMIT_WARNING_THRESHOLDS.len()
+                && secondary_used_percent >= RATE_LIMIT_WARNING_THRESHOLDS[self.secondary_index]
+            {
+                highest_secondary = Some(RATE_LIMIT_WARNING_THRESHOLDS[self.secondary_index]);
+                self.secondary_index += 1;
+            }
+            if let Some(threshold) = highest_secondary {
+                let limit_label =
+                    limit_label_for_window(secondary_window_minutes, /*is_secondary*/ true);
+                let remaining_percent = 100.0 - threshold;
+                warnings.push(format!(
+                    "Heads up, you have less than {remaining_percent:.0}% of your {limit_label} limit left. Run /status for a breakdown."
+                ));
+            }
+        }
+
+        if let Some(primary_used_percent) = primary_used_percent {
+            let mut highest_primary: Option<f64> = None;
+            while self.primary_index < RATE_LIMIT_WARNING_THRESHOLDS.len()
+                && primary_used_percent >= RATE_LIMIT_WARNING_THRESHOLDS[self.primary_index]
+            {
+                highest_primary = Some(RATE_LIMIT_WARNING_THRESHOLDS[self.primary_index]);
+                self.primary_index += 1;
+            }
+            if let Some(threshold) = highest_primary {
+                let limit_label =
+                    limit_label_for_window(primary_window_minutes, /*is_secondary*/ false);
+                let remaining_percent = 100.0 - threshold;
+                warnings.push(format!(
+                    "Heads up, you have less than {remaining_percent:.0}% of your {limit_label} limit left. Run /status for a breakdown."
+                ));
+            }
+        }
+
+        warnings
+    }
+}
+
+pub(crate) fn limit_label_for_window(window_minutes: Option<i64>, is_secondary: bool) -> String {
+    window_minutes
+        .and_then(get_limits_duration)
+        .unwrap_or_else(|| fallback_limit_label(is_secondary).to_string())
+}
+
+pub(crate) fn get_limits_duration(windows_minutes: i64) -> Option<String> {
+    const MINUTES_PER_HOUR: i64 = 60;
+    const MINUTES_PER_5_HOURS: i64 = 5 * MINUTES_PER_HOUR;
+    const MINUTES_PER_DAY: i64 = 24 * MINUTES_PER_HOUR;
+    const MINUTES_PER_WEEK: i64 = 7 * MINUTES_PER_DAY;
+    const MINUTES_PER_MONTH: i64 = 30 * MINUTES_PER_DAY;
+    const MINUTES_PER_YEAR: i64 = 365 * MINUTES_PER_DAY;
+
+    let windows_minutes = windows_minutes.max(0);
+
+    if is_approximate_window(windows_minutes, MINUTES_PER_5_HOURS) {
+        Some("5h".to_string())
+    } else if is_approximate_window(windows_minutes, MINUTES_PER_DAY) {
+        Some("daily".to_string())
+    } else if is_approximate_window(windows_minutes, MINUTES_PER_WEEK) {
+        Some("weekly".to_string())
+    } else if is_approximate_window(windows_minutes, MINUTES_PER_MONTH) {
+        Some("monthly".to_string())
+    } else if is_approximate_window(windows_minutes, MINUTES_PER_YEAR) {
+        Some("annual".to_string())
+    } else {
+        None
+    }
+}
+
+pub(crate) fn fallback_limit_label(is_secondary: bool) -> &'static str {
+    if is_secondary {
+        SECONDARY_LIMIT_FALLBACK_LABEL
+    } else {
+        PRIMARY_LIMIT_FALLBACK_LABEL
+    }
+}
+
+fn is_approximate_window(minutes: i64, expected_minutes: i64) -> bool {
+    let minutes = minutes as f64;
+    let expected_minutes = expected_minutes as f64;
+    minutes >= expected_minutes * 0.95 && minutes <= expected_minutes * 1.05
+}
+
+#[derive(Default)]
+pub(super) enum RateLimitSwitchPromptState {
+    #[default]
+    Idle,
+    Pending,
+    Shown,
+}
+
+#[derive(Debug)]
+pub(super) enum RateLimitErrorKind {
+    ServerOverloaded,
+    UsageLimit,
+    Generic,
+}
+
+pub(super) fn app_server_rate_limit_error_kind(
+    info: &AppServerCodexErrorInfo,
+) -> Option<RateLimitErrorKind> {
+    match info {
+        AppServerCodexErrorInfo::ServerOverloaded => Some(RateLimitErrorKind::ServerOverloaded),
+        AppServerCodexErrorInfo::UsageLimitExceeded => Some(RateLimitErrorKind::UsageLimit),
+        AppServerCodexErrorInfo::ResponseTooManyFailedAttempts {
+            http_status_code: Some(429),
+        } => Some(RateLimitErrorKind::Generic),
+        _ => None,
+    }
+}
+
+pub(super) fn is_app_server_cyber_policy_error(info: &AppServerCodexErrorInfo) -> bool {
+    matches!(info, AppServerCodexErrorInfo::CyberPolicy)
+}
+
+#[derive(Clone, Copy)]
+enum RateLimitSnapshotSource {
+    AccountUsage,
+    RollingUpdate,
+}
+
+fn has_usable_workspace_credits(credits: &CreditsSnapshot) -> bool {
+    credits.unlimited || credits.has_credits
+}
+
+impl ChatWidget {
+    pub(crate) fn hold_rate_limit_recovery(&mut self) -> bool {
+        std::mem::replace(&mut self.input_queue.rate_limit_recovery_pending, true)
+    }
+
+    pub(crate) fn finish_rate_limit_recovery(&mut self) {
+        if std::mem::take(&mut self.input_queue.rate_limit_recovery_pending) {
+            // Marathon keeps the native synthetic turn parked until its
+            // controller has committed an identity-changing transition and
+            // sent the explicit release command. A successful quota read is
+            // not itself release authorization.
+            if self.marathon_recovery_controller_enabled
+                && self.pending_usage_limit_resume_turn.is_some()
+            {
+                return;
+            }
+            self.submit_initial_user_message_if_pending();
+            self.maybe_send_next_queued_input();
+        }
+    }
+
+    pub(crate) fn on_rate_limit_snapshot(&mut self, snapshot: Option<RateLimitSnapshot>) {
+        self.on_rate_limit_snapshot_from(snapshot, RateLimitSnapshotSource::AccountUsage);
+    }
+
+    pub(crate) fn on_rolling_rate_limit_snapshot(&mut self, snapshot: RateLimitSnapshot) {
+        if let (Some(previous), Some(current)) = (
+            self.codex_rate_limit_reached_type,
+            snapshot.rate_limit_reached_type,
+        ) && previous != current
+        {
+            // Do not keep a credits CTA when a newer notification requires a different remedy.
+            // An absent aggregate limit type is not a contradiction of model-scoped recovery.
+            self.clear_backend_banner();
+        }
+        // Rolling app-server notifications are sparse. Preserve metadata learned from the full read.
+        self.on_rate_limit_snapshot_from(Some(snapshot), RateLimitSnapshotSource::RollingUpdate);
+    }
+
+    fn on_rate_limit_snapshot_from(
+        &mut self,
+        snapshot: Option<RateLimitSnapshot>,
+        source: RateLimitSnapshotSource,
+    ) {
+        if let Some(mut snapshot) = snapshot {
+            let limit_id = snapshot
+                .limit_id
+                .clone()
+                .unwrap_or_else(|| "codex".to_string());
+            let limit_label = snapshot
+                .limit_name
+                .clone()
+                .unwrap_or_else(|| limit_id.clone());
+            if matches!(source, RateLimitSnapshotSource::RollingUpdate)
+                && snapshot.credits.is_none()
+            {
+                snapshot.credits = self
+                    .rate_limit_snapshots_by_limit_id
+                    .get(&limit_id)
+                    .and_then(|display| display.credits.as_ref())
+                    .map(|credits| CreditsSnapshot {
+                        has_credits: credits.has_credits,
+                        unlimited: credits.unlimited,
+                        balance: credits.balance.clone(),
+                    });
+            }
+            let preserved_individual_limit =
+                if matches!(source, RateLimitSnapshotSource::RollingUpdate)
+                    && snapshot.individual_limit.is_none()
+                {
+                    self.rate_limit_snapshots_by_limit_id
+                        .get(&limit_id)
+                        .and_then(|display| display.individual_limit.clone())
+                } else {
+                    None
+                };
+            self.plan_type = snapshot.plan_type.or(self.plan_type);
+
+            let is_codex_limit = limit_id.eq_ignore_ascii_case("codex");
+            if is_codex_limit
+                && (matches!(source, RateLimitSnapshotSource::AccountUsage)
+                    || snapshot.spend_control_reached.is_some())
+            {
+                self.codex_spend_control_reached = snapshot.spend_control_reached;
+            }
+            if (is_codex_limit && matches!(source, RateLimitSnapshotSource::AccountUsage))
+                || snapshot.rate_limit_reached_type.is_some()
+            {
+                self.codex_rate_limit_reached_type = snapshot.rate_limit_reached_type;
+            }
+            let workspace_limit_reached = self.codex_spend_control_reached == Some(true)
+                || matches!(
+                    self.codex_rate_limit_reached_type,
+                    Some(
+                        RateLimitReachedType::WorkspaceOwnerCreditsDepleted
+                            | RateLimitReachedType::WorkspaceMemberCreditsDepleted
+                            | RateLimitReachedType::WorkspaceOwnerUsageLimitReached
+                            | RateLimitReachedType::WorkspaceMemberUsageLimitReached
+                    )
+                );
+            let has_workspace_credits = !workspace_limit_reached
+                && snapshot
+                    .credits
+                    .as_ref()
+                    .is_some_and(has_usable_workspace_credits);
+            if is_codex_limit && has_workspace_credits {
+                match self.rate_limit_switch_prompt {
+                    RateLimitSwitchPromptState::Pending => {
+                        self.rate_limit_switch_prompt = RateLimitSwitchPromptState::Idle;
+                    }
+                    RateLimitSwitchPromptState::Shown => {
+                        self.bottom_pane
+                            .dismiss_view_by_id(RATE_LIMIT_SWITCH_PROMPT_VIEW_ID);
+                    }
+                    RateLimitSwitchPromptState::Idle => {}
+                }
+            }
+            let should_warn_about_rate_limit_usage = is_codex_limit && !has_workspace_credits;
+            let warnings = if should_warn_about_rate_limit_usage {
+                self.rate_limit_warnings.take_warnings(
+                    snapshot
+                        .secondary
+                        .as_ref()
+                        .map(|window| f64::from(window.used_percent)),
+                    snapshot
+                        .secondary
+                        .as_ref()
+                        .and_then(|window| window.window_duration_mins),
+                    snapshot
+                        .primary
+                        .as_ref()
+                        .map(|window| f64::from(window.used_percent)),
+                    snapshot
+                        .primary
+                        .as_ref()
+                        .and_then(|window| window.window_duration_mins),
+                )
+            } else {
+                vec![]
+            };
+
+            let high_usage = is_codex_limit
+                && (snapshot
+                    .secondary
+                    .as_ref()
+                    .map(|w| f64::from(w.used_percent) >= RATE_LIMIT_SWITCH_PROMPT_THRESHOLD)
+                    .unwrap_or(false)
+                    || snapshot
+                        .primary
+                        .as_ref()
+                        .map(|w| f64::from(w.used_percent) >= RATE_LIMIT_SWITCH_PROMPT_THRESHOLD)
+                        .unwrap_or(false));
+
+            if high_usage
+                && !has_workspace_credits
+                && !self.rate_limit_switch_prompt_hidden()
+                && self.current_model() != NUDGE_MODEL_SLUG
+                && !matches!(
+                    self.rate_limit_switch_prompt,
+                    RateLimitSwitchPromptState::Shown
+                )
+            {
+                self.rate_limit_switch_prompt = RateLimitSwitchPromptState::Pending;
+            }
+
+            let has_exhausted_quota = Self::rate_limit_snapshot_has_exhausted_quota(&snapshot);
+            let has_available_quota = Self::rate_limit_snapshot_has_available_quota(&snapshot);
+            let should_resume_paused_queue =
+                is_codex_limit && !has_exhausted_quota && has_available_quota;
+            let should_pause_queue = is_codex_limit && has_exhausted_quota;
+
+            let mut display =
+                rate_limit_snapshot_display_for_limit(&snapshot, limit_label, Local::now());
+            if display.individual_limit.is_none() {
+                display.individual_limit = preserved_individual_limit;
+            }
+            self.rate_limit_snapshots_by_limit_id
+                .insert(limit_id, display);
+
+            if !warnings.is_empty() {
+                for warning in warnings {
+                    self.add_to_history(history_cell::new_warning_event(warning));
+                }
+                self.request_redraw();
+            }
+            if should_pause_queue {
+                self.input_queue.suppress_queue_autosend = true;
+                self.bottom_pane
+                    .set_queue_submissions(/*queue_submissions*/ true);
+                self.request_redraw();
+            } else if should_resume_paused_queue {
+                let was_suppressing_queue_autosend = self.input_queue.suppress_queue_autosend;
+                self.codex_rate_limit_reached_type = None;
+                self.input_queue.suppress_queue_autosend = false;
+                self.bottom_pane
+                    .set_queue_submissions(/*queue_submissions*/ false);
+                if was_suppressing_queue_autosend && self.has_queued_follow_up_messages() {
+                    self.clear_pending_usage_limit_resume_turn();
+                }
+                if was_suppressing_queue_autosend {
+                    // Synthetic recovery remains parked for an account change; quota recovery
+                    // resumes only user-queued follow-ups.
+                    self.maybe_send_next_queued_input();
+                }
+            }
+        } else {
+            self.rate_limit_snapshots_by_limit_id.clear();
+            self.codex_rate_limit_reached_type = None;
+            self.codex_spend_control_reached = None;
+        }
+        self.refresh_status_line();
+    }
+
+    pub(super) fn stop_rate_limit_poller(&mut self) {}
+
+    /// Reports whether the snapshot still leaves usable quota.
+    ///
+    /// Credits satisfy this on their own; otherwise at least one window must be
+    /// present and under 100% used.
+    fn rate_limit_snapshot_has_available_quota(snapshot: &RateLimitSnapshot) -> bool {
+        if Self::rate_limit_snapshot_has_exhausted_quota(snapshot) {
+            return false;
+        }
+
+        if snapshot
+            .credits
+            .as_ref()
+            .is_some_and(|credits| credits.has_credits || credits.unlimited)
+        {
+            return true;
+        }
+
+        let windows = [snapshot.primary.as_ref(), snapshot.secondary.as_ref()];
+        let mut saw_window = false;
+        for window in windows.into_iter().flatten() {
+            saw_window = true;
+            if window.used_percent >= 100 {
+                return false;
+            }
+        }
+        saw_window
+    }
+
+    fn rate_limit_snapshot_has_exhausted_quota(snapshot: &RateLimitSnapshot) -> bool {
+        if matches!(
+            snapshot.rate_limit_reached_type,
+            Some(
+                RateLimitReachedType::RateLimitReached
+                    | RateLimitReachedType::WorkspaceOwnerCreditsDepleted
+                    | RateLimitReachedType::WorkspaceMemberCreditsDepleted
+                    | RateLimitReachedType::WorkspaceOwnerUsageLimitReached
+                    | RateLimitReachedType::WorkspaceMemberUsageLimitReached
+            )
+        ) {
+            return true;
+        }
+
+        [snapshot.primary.as_ref(), snapshot.secondary.as_ref()]
+            .into_iter()
+            .flatten()
+            .any(|window| window.used_percent >= 100)
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) fn prefetch_rate_limits(&mut self) {
+        self.stop_rate_limit_poller();
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) fn should_prefetch_rate_limits(&self) -> bool {
+        self.config.model_provider.requires_openai_auth && self.has_chatgpt_account
+    }
+
+    fn lower_cost_preset(&self) -> Option<ModelPreset> {
+        let models = self.model_catalog.try_list_models().ok()?;
+        models
+            .iter()
+            .find(|preset| preset.show_in_picker && preset.model == NUDGE_MODEL_SLUG)
+            .cloned()
+    }
+
+    fn rate_limit_switch_prompt_hidden(&self) -> bool {
+        self.config
+            .notices
+            .hide_rate_limit_model_nudge
+            .unwrap_or(false)
+    }
+
+    pub(super) fn maybe_show_pending_rate_limit_prompt(&mut self) {
+        if self.has_applicable_backend_banner() {
+            return;
+        }
+        if self.rate_limit_switch_prompt_hidden() || self.current_model() == NUDGE_MODEL_SLUG {
+            self.rate_limit_switch_prompt = RateLimitSwitchPromptState::Idle;
+            return;
+        }
+        if !matches!(
+            self.rate_limit_switch_prompt,
+            RateLimitSwitchPromptState::Pending
+        ) {
+            return;
+        }
+        if let Some(preset) = self.lower_cost_preset() {
+            self.open_rate_limit_switch_prompt(preset);
+            self.rate_limit_switch_prompt = RateLimitSwitchPromptState::Shown;
+        } else {
+            self.rate_limit_switch_prompt = RateLimitSwitchPromptState::Idle;
+        }
+    }
+
+    fn open_rate_limit_switch_prompt(&mut self, preset: ModelPreset) {
+        let switch_model = preset.model;
+        let switch_model_for_events = switch_model.clone();
+        let default_effort: ReasoningEffortConfig = preset.default_reasoning_effort;
+
+        let switch_actions: Vec<SelectionAction> = vec![Box::new(move |tx| {
+            tx.send(AppEvent::CodexOp(AppCommand::override_turn_context(
+                /*cwd*/ None,
+                /*approval_policy*/ None,
+                /*approvals_reviewer*/ None,
+                /*permission_profile*/ None,
+                /*active_permission_profile*/ None,
+                /*windows_sandbox_level*/ None,
+                Some(switch_model_for_events.clone()),
+                Some(Some(default_effort.clone())),
+                /*summary*/ None,
+                /*service_tier*/ None,
+                /*collaboration_mode*/ None,
+                /*personality*/ None,
+            )));
+            tx.send(AppEvent::UpdateModel(switch_model_for_events.clone()));
+            tx.send(AppEvent::UpdateReasoningEffort(Some(
+                default_effort.clone(),
+            )));
+        })];
+
+        let keep_actions: Vec<SelectionAction> = Vec::new();
+        let never_actions: Vec<SelectionAction> = vec![Box::new(|tx| {
+            tx.send(AppEvent::UpdateRateLimitSwitchPromptHidden(true));
+            tx.send(AppEvent::PersistRateLimitSwitchPromptHidden);
+        })];
+        let description = if preset.description.is_empty() {
+            Some("Uses fewer credits for upcoming turns.".to_string())
+        } else {
+            Some(preset.description)
+        };
+
+        let items = vec![
+            SelectionItem {
+                name: format!("Switch to {switch_model}"),
+                description,
+                selected_description: None,
+                is_current: false,
+                actions: switch_actions,
+                dismiss_on_select: true,
+                ..Default::default()
+            },
+            SelectionItem {
+                name: "Keep current model".to_string(),
+                description: None,
+                selected_description: None,
+                is_current: false,
+                actions: keep_actions,
+                dismiss_on_select: true,
+                ..Default::default()
+            },
+            SelectionItem {
+                name: "Keep current model (never show again)".to_string(),
+                description: Some(
+                    "Hide future rate limit reminders about switching models.".to_string(),
+                ),
+                selected_description: None,
+                is_current: false,
+                actions: never_actions,
+                dismiss_on_select: true,
+                ..Default::default()
+            },
+        ];
+
+        self.bottom_pane.show_selection_view(SelectionViewParams {
+            view_id: Some(RATE_LIMIT_SWITCH_PROMPT_VIEW_ID),
+            title: Some("Approaching rate limits".to_string()),
+            subtitle: Some(format!("Switch to {switch_model} for lower credit usage?")),
+            footer_hint: Some(standard_popup_hint_line()),
+            items,
+            ..Default::default()
+        });
+    }
+
+    pub(super) fn open_workspace_owner_nudge_prompt(
+        &mut self,
+        credit_type: AddCreditsNudgeCreditType,
+    ) {
+        if self.add_credits_nudge_email_in_flight.is_some() {
+            return;
+        }
+
+        let (title, prompt) = match credit_type {
+            AddCreditsNudgeCreditType::Credits => (
+                "You've reached your workspace credit limit",
+                "Your workspace is out of credits. Ask your workspace owner to add more. Notify owner?",
+            ),
+            AddCreditsNudgeCreditType::UsageLimit => (
+                "Usage limit reached",
+                "Request a limit increase from your owner to continue using codex. Request increase?",
+            ),
+        };
+        let send_actions: Vec<SelectionAction> = vec![Box::new(move |tx| {
+            tx.send(AppEvent::SendAddCreditsNudgeEmail { credit_type });
+        })];
+        let items = vec![
+            SelectionItem {
+                name: "Yes".to_string(),
+                display_shortcut: Some(key_hint::plain(KeyCode::Char('y')).into()),
+                actions: send_actions,
+                dismiss_on_select: true,
+                ..Default::default()
+            },
+            SelectionItem {
+                name: "No".to_string(),
+                display_shortcut: Some(key_hint::plain(KeyCode::Char('n')).into()),
+                is_default: true,
+                dismiss_on_select: true,
+                ..Default::default()
+            },
+        ];
+
+        self.bottom_pane.show_actionable_banner(ActionableBanner {
+            view_id: Some(WORKSPACE_NUDGE_VIEW_ID),
+            title: title.to_string(),
+            description: prompt.to_string(),
+            actions: items,
+            initial_selected_idx: Some(1),
+            ..Default::default()
+        });
+    }
+
+    pub(crate) fn start_add_credits_nudge_email_request(
+        &mut self,
+        credit_type: AddCreditsNudgeCreditType,
+    ) -> Option<Uuid> {
+        if self.add_credits_nudge_email_in_flight.is_some() {
+            return None;
+        }
+        let request_id = Uuid::new_v4();
+        self.add_credits_nudge_email_in_flight = Some(PendingCreditsNudge {
+            request_id,
+            credit_type,
+        });
+        Some(request_id)
+    }
+
+    pub(crate) fn finish_add_credits_nudge_email_request(
+        &mut self,
+        request_id: Uuid,
+        result: Result<AddCreditsNudgeEmailStatus, String>,
+    ) {
+        let Some(pending) = self
+            .add_credits_nudge_email_in_flight
+            .as_ref()
+            .filter(|pending| pending.request_id == request_id)
+        else {
+            return;
+        };
+        let credit_type = pending.credit_type;
+        self.add_credits_nudge_email_in_flight = None;
+        let message = match (credit_type, result) {
+            (AddCreditsNudgeCreditType::Credits, Ok(AddCreditsNudgeEmailStatus::Sent)) => {
+                "Workspace owner notified."
+            }
+            (
+                AddCreditsNudgeCreditType::Credits,
+                Ok(AddCreditsNudgeEmailStatus::CooldownActive),
+            ) => "Workspace owner was already notified recently.",
+            (AddCreditsNudgeCreditType::Credits, Err(_)) => {
+                "Could not notify your workspace owner. Please try again."
+            }
+            (AddCreditsNudgeCreditType::UsageLimit, Ok(AddCreditsNudgeEmailStatus::Sent)) => {
+                "Limit increase requested."
+            }
+            (
+                AddCreditsNudgeCreditType::UsageLimit,
+                Ok(AddCreditsNudgeEmailStatus::CooldownActive),
+            ) => "A limit increase was already requested recently.",
+            (AddCreditsNudgeCreditType::UsageLimit, Err(_)) => {
+                "Could not request a limit increase. Please try again."
+            }
+        };
+        self.add_to_history(history_cell::new_info_event(
+            message.to_string(),
+            /*hint*/ None,
+        ));
+        self.request_redraw();
+    }
+
+    /// Reset every cached rate-limit warning/prompt after the account identity changed.
+    ///
+    /// Usage-limit and switch-prompt state belong to the previous auth context, so
+    /// keeping them would let stale warnings keep re-triggering for the new account.
+    pub(crate) fn handle_auth_identity_changed(&mut self) {
+        self.rate_limit_snapshots_by_limit_id.clear();
+        self.codex_rate_limit_reached_type = None;
+        let hold_for_marathon = self.marathon_recovery_controller_enabled
+            && self.pending_usage_limit_resume_turn.is_some()
+            && self.usage_limit_resume_waiting_for_auth_reload;
+        if !hold_for_marathon {
+            self.input_queue.suppress_queue_autosend = false;
+            self.bottom_pane
+                .set_queue_submissions(/*queue_submissions*/ false);
+        }
+        self.rate_limit_warnings = RateLimitWarningState::default();
+        self.rate_limit_switch_prompt = RateLimitSwitchPromptState::default();
+        self.add_credits_nudge_email_in_flight = None;
+        self.refresh_status_line();
+        self.request_redraw();
+    }
+
+    pub(crate) fn defer_auth_reload_until_idle(&mut self, attempt: u8) {
+        self.pending_auth_reload_attempt = Some(
+            self.pending_auth_reload_attempt
+                .map(|existing| existing.min(attempt))
+                .unwrap_or(attempt),
+        );
+    }
+
+    pub(crate) fn on_auth_reload_completed(&mut self, identity_changed: bool) {
+        self.pending_auth_reload_attempt = None;
+        if identity_changed && self.pending_usage_limit_resume_turn.is_some() {
+            self.usage_limit_resume_auth_reloaded = true;
+            if !self.marathon_recovery_controller_enabled {
+                self.usage_limit_resume_waiting_for_auth_reload = false;
+            }
+        }
+        self.maybe_send_next_queued_input();
+    }
+
+    /// Apply the controller's release authorization to the existing parked
+    /// synthetic turn. No prompt or queue entry is created here; the normal
+    /// `maybe_send_next_queued_input` path performs the one submission and
+    /// retains its priority over user-queued follow-ups.
+    pub(crate) fn release_usage_limit_resume_turn(
+        &mut self,
+        recovery_id: &str,
+        thread_id: Option<&str>,
+    ) -> bool {
+        if !self.marathon_recovery_controller_enabled
+            || self.pending_usage_limit_resume_turn.is_none()
+            || !self.usage_limit_resume_auth_reloaded
+            || !self.usage_limit_resume_waiting_for_auth_reload
+        {
+            return false;
+        }
+        if thread_id.is_some_and(|thread_id| {
+            self.thread_id
+                .is_none_or(|current| current.to_string() != thread_id)
+        }) {
+            return false;
+        }
+        if self.pending_usage_limit_resume_recovery_id.as_deref() != Some(recovery_id) {
+            return false;
+        }
+        self.usage_limit_resume_waiting_for_auth_reload = false;
+        self.input_queue.rate_limit_recovery_pending = false;
+        self.input_queue.suppress_queue_autosend = false;
+        self.bottom_pane
+            .set_queue_submissions(/*queue_submissions*/ false);
+        let _ = self.maybe_send_next_queued_input();
+        true
+    }
+
+    /// Recovery prompt sent after a `UsageLimitExceeded` turn.
+    ///
+    /// `None` means the automatic recovery turn is disabled.
+    pub(crate) fn usage_limit_resume_prompt(&self) -> Option<String> {
+        match self.config.tui_usage_limit_resume_prompt.as_deref() {
+            Some("") => None,
+            Some(prompt) => Some(prompt.to_string()),
+            None => Some(DEFAULT_USAGE_LIMIT_RESUME_PROMPT.to_string()),
+        }
+    }
+
+    pub(crate) fn clear_pending_usage_limit_resume_turn(&mut self) {
+        if self.pending_usage_limit_resume_turn.is_none()
+            && !self.usage_limit_resume_waiting_for_auth_reload
+        {
+            return;
+        }
+        self.pending_usage_limit_resume_turn = None;
+        self.pending_usage_limit_resume_recovery_id = None;
+        self.pending_usage_limit_resume_thread_id = None;
+        self.pending_usage_limit_resume_turn_id = None;
+        self.usage_limit_resume_waiting_for_auth_reload = false;
+        self.usage_limit_resume_auth_reloaded = false;
+        self.refresh_pending_input_preview();
+    }
+
+    pub(crate) fn is_task_running(&self) -> bool {
+        self.bottom_pane.is_task_running()
+    }
+
+    /// Dispatch a deferred auth reload once the running task has finished.
+    pub(crate) fn maybe_dispatch_deferred_auth_reload(&mut self) {
+        if self.bottom_pane.is_task_running() {
+            return;
+        }
+        let Some(attempt) = self.pending_auth_reload_attempt.take() else {
+            return;
+        };
+        if attempt <= 1 {
+            self.app_event_tx.send(AppEvent::AuthFileChanged);
+        } else {
+            self.app_event_tx
+                .send(AppEvent::AuthFileChangedRetry { attempt });
+        }
+    }
+
+    pub(crate) fn set_rate_limit_switch_prompt_hidden(&mut self, hidden: bool) {
+        self.config.notices.hide_rate_limit_model_nudge = Some(hidden);
+        if hidden {
+            self.rate_limit_switch_prompt = RateLimitSwitchPromptState::Idle;
+        }
+    }
+}
