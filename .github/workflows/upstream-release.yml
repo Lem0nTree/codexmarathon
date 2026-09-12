@@ -1,0 +1,425 @@
+name: Upstream Codex release
+
+on:
+  schedule:
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: Published stable OpenAI Codex tag (blank means latest)
+        required: false
+        type: string
+      port_only:
+        description: Prepare the port and diagnostics without building or publishing
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codexmarathon-upstream-release
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPOSITORY: openai/codex
+
+jobs:
+  detect:
+    name: Detect an unpublished stable upstream release
+    runs-on: ubuntu-latest
+    outputs:
+      upstream_tag: ${{ steps.release.outputs.upstream_tag }}
+      release_tag: ${{ steps.release.outputs.release_tag }}
+      should_prepare: ${{ steps.release.outputs.should_prepare }}
+      should_publish: ${{ steps.release.outputs.should_publish }}
+    steps:
+      - name: Resolve upstream release
+        id: release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_TAG: ${{ inputs.upstream_tag }}
+          PORT_ONLY: ${{ github.event_name == 'workflow_dispatch' && inputs.port_only }}
+        run: |
+          set -euo pipefail
+          api_headers=(
+            -H "Authorization: Bearer $GH_TOKEN"
+            -H "Accept: application/vnd.github+json"
+            -H "X-GitHub-Api-Version: 2022-11-28"
+          )
+
+          if [[ -n "$REQUESTED_TAG" ]]; then
+            release_url="https://api.github.com/repos/$UPSTREAM_REPOSITORY/releases/tags/$REQUESTED_TAG"
+          else
+            release_url="https://api.github.com/repos/$UPSTREAM_REPOSITORY/releases/latest"
+          fi
+          curl --fail --silent --show-error --location "${api_headers[@]}" \
+            "$release_url" > upstream-release.json
+
+          upstream_tag="$(jq -r '.tag_name' upstream-release.json)"
+          if [[ ! "$upstream_tag" =~ ^rust-v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Unsupported upstream release tag: $upstream_tag" >&2
+            exit 1
+          fi
+          if [[ "$(jq -r '.draft or .prerelease' upstream-release.json)" != "false" ]]; then
+            echo "Refusing to publish from a draft or prerelease: $upstream_tag" >&2
+            exit 1
+          fi
+
+          release_tag="codexmarathon-${upstream_tag#rust-}"
+          existing_status="$(curl --silent --show-error --location \
+            --output existing-release.json --write-out '%{http_code}' \
+            "${api_headers[@]}" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/releases/tags/$release_tag")"
+          case "$existing_status" in
+            200) exists=true ;;
+            404) exists=false ;;
+            *)
+              echo "GitHub release lookup failed with HTTP $existing_status" >&2
+              cat existing-release.json >&2
+              exit 1
+              ;;
+          esac
+
+          should_prepare=false
+          should_publish=false
+          if [[ "$PORT_ONLY" == "true" ]]; then
+            should_prepare=true
+          elif [[ "$exists" == "false" ]]; then
+            should_prepare=true
+            should_publish=true
+          fi
+
+          {
+            echo "upstream_tag=$upstream_tag"
+            echo "release_tag=$release_tag"
+            echo "should_prepare=$should_prepare"
+            echo "should_publish=$should_publish"
+          } >> "$GITHUB_OUTPUT"
+
+          if [[ "$should_prepare" == "false" ]]; then
+            echo "### No-op" >> "$GITHUB_STEP_SUMMARY"
+            echo "Release \`$release_tag\` already exists." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  source:
+    name: Apply CodexMarathon to upstream source
+    needs: detect
+    if: needs.detect.outputs.should_prepare == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      rust_toolchain: ${{ steps.archive.outputs.rust_toolchain }}
+      upstream_commit: ${{ steps.archive.outputs.upstream_commit }}
+    steps:
+      - name: Checkout CodexMarathon customization
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Prepare upstream port
+        id: port
+        continue-on-error: true
+        shell: bash
+        env:
+          CODEXMARATHON_CUSTOMIZATION_COMMIT: ${{ github.sha }}
+          UPSTREAM_TAG: ${{ needs.detect.outputs.upstream_tag }}
+        run: |
+          set -o pipefail
+          scripts/prepare-upstream-release.sh \
+            --upstream-ref "$UPSTREAM_TAG" \
+            --destination "$RUNNER_TEMP/codex-port" \
+            --patch-output "$RUNNER_TEMP/port-evidence" \
+            2>&1 | tee "$RUNNER_TEMP/prepare.log"
+
+      - name: Upload port diagnostics
+        if: always() && steps.port.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: port-conflict-${{ needs.detect.outputs.release_tag }}
+          path: |
+            ${{ runner.temp }}/port-evidence/
+            ${{ runner.temp }}/prepare.log
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Report required manual port
+        if: steps.port.outcome == 'failure'
+        shell: bash
+        env:
+          UPSTREAM_TAG: ${{ needs.detect.outputs.upstream_tag }}
+        run: |
+          {
+            echo "### Manual port required"
+            echo
+            echo "CodexMarathon did not apply cleanly to \`$UPSTREAM_TAG\`."
+            echo "Nothing was built or published. Download the port-conflict artifact for the patch and path list."
+            echo
+            echo '```text'
+            cat "$RUNNER_TEMP/port-evidence/port-status.txt" 2>/dev/null || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 1
+
+      - name: Archive prepared source and provenance
+        id: archive
+        if: steps.port.outcome == 'success'
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.detect.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+          set -a
+          source "$RUNNER_TEMP/port-evidence/source-metadata.env"
+          set +a
+
+          rust_toolchain="$(sed -n 's/^channel = "\([^"]*\)"/\1/p' \
+            "$RUNNER_TEMP/codex-port/codex-rs/rust-toolchain.toml")"
+          if [[ -z "$rust_toolchain" ]]; then
+            echo "Unable to read the pinned Rust toolchain" >&2
+            exit 1
+          fi
+
+          mkdir -p "$RUNNER_TEMP/prepared"
+          source_archive="$RUNNER_TEMP/prepared/${RELEASE_TAG}-source.tar.gz"
+          source_epoch="$(git -C "$RUNNER_TEMP/codex-port" show -s --format=%ct "$UPSTREAM_COMMIT")"
+          tar --sort=name --mtime="@$source_epoch" --owner=0 --group=0 --numeric-owner \
+            --exclude='.git' -C "$RUNNER_TEMP/codex-port" -cf - . | gzip -n > "$source_archive"
+          source_sha256="$(sha256sum "$source_archive" | awk '{print $1}')"
+
+          jq -n \
+            --arg upstream_repository "$UPSTREAM_REPOSITORY" \
+            --arg upstream_ref "$UPSTREAM_REF" \
+            --arg upstream_commit "$UPSTREAM_COMMIT" \
+            --arg upstream_base_commit "$UPSTREAM_BASE_COMMIT" \
+            --arg customization_repository "$GITHUB_REPOSITORY" \
+            --arg customization_commit "$CUSTOMIZATION_COMMIT" \
+            --arg customization_patch_sha256 "$CUSTOMIZATION_PATCH_SHA256" \
+            --arg prepared_source_tree "$PREPARED_SOURCE_TREE" \
+            --arg prepared_source_sha256 "$source_sha256" \
+            '{
+              upstream_repository: $upstream_repository,
+              upstream_ref: $upstream_ref,
+              upstream_commit: $upstream_commit,
+              upstream_base_commit: $upstream_base_commit,
+              customization_repository: $customization_repository,
+              customization_commit: $customization_commit,
+              customization_patch_sha256: $customization_patch_sha256,
+              prepared_source_tree: $prepared_source_tree,
+              prepared_source_sha256: $prepared_source_sha256
+            }' > "$RUNNER_TEMP/prepared/release-provenance.json"
+          cp "$RUNNER_TEMP/port-evidence/codexmarathon-customizations.patch" \
+            "$RUNNER_TEMP/prepared/codexmarathon-customizations.patch"
+
+          echo "rust_toolchain=$rust_toolchain" >> "$GITHUB_OUTPUT"
+          echo "upstream_commit=$UPSTREAM_COMMIT" >> "$GITHUB_OUTPUT"
+
+      - name: Upload prepared source
+        if: steps.port.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: prepared-source-${{ needs.detect.outputs.release_tag }}
+          path: ${{ runner.temp }}/prepared/
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Report port-only result
+        if: steps.port.outcome == 'success' && github.event_name == 'workflow_dispatch' && inputs.port_only
+        shell: bash
+        run: |
+          echo "### Port preparation passed" >> "$GITHUB_STEP_SUMMARY"
+          echo "Prepared source and provenance were uploaded; build and publication were intentionally skipped." >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    name: Build ${{ matrix.target }} package
+    needs: [detect, source]
+    if: needs.detect.outputs.should_publish == 'true' && needs.source.result == 'success'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux
+            target: x86_64-unknown-linux-gnu
+            extension: tar.gz
+          - os: windows-latest
+            platform: windows
+            target: x86_64-pc-windows-msvc
+            extension: zip
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout release tooling
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Download prepared source
+        uses: actions/download-artifact@v4
+        with:
+          name: prepared-source-${{ needs.detect.outputs.release_tag }}
+          path: prepared-artifact
+
+      - name: Extract prepared source
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.detect.outputs.release_tag }}
+        run: |
+          mkdir -p upstream-source
+          tar -xzf "prepared-artifact/${RELEASE_TAG}-source.tar.gz" -C upstream-source
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ needs.source.outputs.rust_toolchain }}
+
+      - name: Configure checksum-verified rusty_v8 artifacts
+        shell: bash
+        env:
+          SOURCE_ROOT: ${{ github.workspace }}/upstream-source
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          version="$(python3 "$SOURCE_ROOT/.github/scripts/rusty_v8_bazel.py" resolved-v8-crate-version)"
+          release_tag="rusty-v8-v${version}"
+          base_url="https://github.com/openai/codex/releases/download/${release_tag}"
+          binding_dir="$RUNNER_TEMP/rusty_v8"
+          profile="ptrcomp_sandbox_release"
+
+          if [[ "$TARGET" == *-pc-windows-msvc ]]; then
+            archive_name="rusty_v8_${profile}_${TARGET}.lib.gz"
+          else
+            archive_name="librusty_v8_${profile}_${TARGET}.a.gz"
+          fi
+          binding_name="src_binding_${profile}_${TARGET}.rs"
+          checksums_name="rusty_v8_${profile}_${TARGET}.sha256"
+          archive_path="$binding_dir/$archive_name"
+          binding_path="$binding_dir/$binding_name"
+          checksums_path="$binding_dir/$checksums_name"
+          trusted_checksums="$SOURCE_ROOT/third_party/v8/rusty_v8_${version//./_}_release_manifests.sha256"
+          if command -v sha256sum >/dev/null 2>&1; then
+            checksum_command=(sha256sum --check -)
+          else
+            checksum_command=(shasum -a 256 --check -)
+          fi
+
+          mkdir -p "$binding_dir"
+          curl -fsSL "$base_url/$checksums_name" -o "$checksums_path"
+          expected_manifest_checksum="$(grep -F "  $checksums_name" "$trusted_checksums" | cut -d ' ' -f 1)"
+          actual_manifest_checksum="$(python3 -c 'import hashlib, pathlib, sys; print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())' "$checksums_path")"
+          if [[ -z "$expected_manifest_checksum" || "$actual_manifest_checksum" != "$expected_manifest_checksum" ]]; then
+            echo "rusty_v8 checksum manifest did not match the prepared upstream source" >&2
+            exit 1
+          fi
+
+          curl -fsSL "$base_url/$archive_name" -o "$archive_path"
+          curl -fsSL "$base_url/$binding_name" -o "$binding_path"
+          if [[ "$(wc -l < "$checksums_path")" -ne 2 ]]; then
+            echo "Expected exactly two rusty_v8 checksums" >&2
+            exit 1
+          fi
+          (
+            cd "$binding_dir"
+            tr -d '\r' < "$checksums_path" | "${checksum_command[@]}"
+          )
+          echo "RUSTY_V8_ARCHIVE=$archive_path" >> "$GITHUB_ENV"
+          echo "RUSTY_V8_SRC_BINDING_PATH=$binding_path" >> "$GITHUB_ENV"
+
+      - name: Install Linux build dependencies
+        if: matrix.platform == 'linux'
+        shell: bash
+        run: sudo apt-get update && sudo apt-get install --yes --no-install-recommends binutils libcap-dev pkg-config
+
+      - name: Cache Cargo registry and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            upstream-source/codex-rs/target
+          key: upstream-${{ matrix.target }}-${{ needs.detect.outputs.upstream_tag }}-${{ hashFiles('upstream-source/codex-rs/Cargo.lock') }}
+          restore-keys: upstream-${{ matrix.target }}-
+
+      - name: Build Linux release package
+        if: matrix.platform == 'linux'
+        shell: bash
+        env:
+          CODEXMARATHON_OUTPUT: ${{ github.workspace }}/dist/release
+          CODEXMARATHON_RUNTIME_DIR: ${{ github.workspace }}/upstream-source/codex-rs
+          CODEXMARATHON_TARGET: ${{ matrix.target }}
+          CODEXMARATHON_VERSION: ${{ needs.detect.outputs.release_tag }}
+          CODEXMARATHON_UPSTREAM_COMMIT: ${{ needs.source.outputs.upstream_commit }}
+        run: scripts/build-release.sh
+
+      - name: Build Windows release package
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        env:
+          CODEXMARATHON_OUTPUT: ${{ github.workspace }}/dist/release
+          CODEXMARATHON_RUNTIME_DIR: ${{ github.workspace }}/upstream-source/codex-rs
+          CODEXMARATHON_TARGET: ${{ matrix.target }}
+          CODEXMARATHON_VERSION: ${{ needs.detect.outputs.release_tag }}
+          CODEXMARATHON_UPSTREAM_COMMIT: ${{ needs.source.outputs.upstream_commit }}
+        run: ./scripts/build-release.ps1
+
+      - name: Upload release package
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: dist/release/${{ needs.detect.outputs.release_tag }}-${{ matrix.target }}.${{ matrix.extension }}
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish CodexMarathon release
+    needs: [detect, source, build]
+    if: needs.detect.outputs.should_publish == 'true' && needs.build.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download prepared source and provenance
+        uses: actions/download-artifact@v4
+        with:
+          name: prepared-source-${{ needs.detect.outputs.release_tag }}
+          path: release-assets
+
+      - name: Download platform packages
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Create release if still absent
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.detect.outputs.release_tag }}
+          UPSTREAM_TAG: ${{ needs.detect.outputs.upstream_tag }}
+          UPSTREAM_COMMIT: ${{ needs.source.outputs.upstream_commit }}
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $RELEASE_TAG was published by another run; leaving it unchanged."
+            exit 0
+          fi
+
+          (
+            cd release-assets
+            sha256sum * > SHA256SUMS
+          )
+
+          cat > release-notes.md <<EOF
+          CodexMarathon built from OpenAI Codex [$UPSTREAM_TAG](https://github.com/openai/codex/releases/tag/$UPSTREAM_TAG) at commit \`$UPSTREAM_COMMIT\`.
+
+          The attached provenance manifest records the exact upstream commit, CodexMarathon customization commit, generated patch digest, and prepared source-tree digest. The source archive is the exact tree used by both platform builds.
+
+          Packages include the CLI and its sibling runtime executables. Linux: \`codex\`, \`codex-code-mode-host\`, \`codex-responses-api-proxy\`, and \`bwrap\`. Windows additionally includes \`codex-command-runner.exe\` and \`codex-windows-sandbox-setup.exe\`.
+          EOF
+
+          gh release create "$RELEASE_TAG" release-assets/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "CodexMarathon ${RELEASE_TAG#codexmarathon-}" \
+            --notes-file release-notes.md
