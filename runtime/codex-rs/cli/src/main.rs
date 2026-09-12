@@ -171,9 +171,6 @@ enum Subcommand {
     /// Manage native CodexMarathon accounts and switching.
     Marathon(marathon::MarathonCommand),
 
-    /// Start Codex as an MCP server (stdio).
-    McpServer(McpServerCommand),
-
     /// [experimental] Run the app server or related tooling.
     AppServer(AppServerCommand),
 
