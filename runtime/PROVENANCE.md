@@ -5,12 +5,13 @@ control implementation, protocol development, and an explicitly opt-in
 self-contained diagnostic package. The normal companion release uses the
 user's separately installed Codex executable. The imported source is a pinned
 snapshot of the public
-`Loongphy/codext` repository:
+`openai/codex` repository:
 
-- Repository: <https://github.com/Loongphy/codext>
-- Source commit: `10c0989f282050b8617103d904788d994de8c971`
+- Repository: <https://github.com/openai/codex>
+- Source tag: `rust-v0.154.0`
+- Source commit: `6b9826e3aa83b1a5947db50f4332cb9c65f1b340`
 - Imported tree: `runtime/codex-rs/`
-- Import date: 2026-09-04
+- Import date: 2026-09-12
 - Refresh rule: update the pinned commit, copy the complete `codex-rs/`
   workspace, rerun the focused runtime build/tests, and record the new commit
   and any local patch in this file and `PATCH_LEDGER.md`.

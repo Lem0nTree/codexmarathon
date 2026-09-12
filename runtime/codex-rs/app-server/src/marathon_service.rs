@@ -2,9 +2,8 @@
 //!
 //! This service composes the existing AuthManager, ThreadManager and turn
 //! watcher with Marathon's secret-free registry and opaque snapshot vault. It
-//! is intentionally a small manual-control surface: it reports status,
-//! enables/disables Marathon, and performs an explicit account switch at an
-//! idle boundary. Automatic recovery is outside this service.
+//! reports status, enables/disables Marathon, performs explicit account
+//! switches, and coordinates quota-triggered switches at an idle boundary.
 
 use codex_app_server_protocol::{
     MarathonAccount, MarathonAutoResetSetResponse, MarathonEnabledSetResponse,
@@ -12,14 +11,26 @@ use codex_app_server_protocol::{
 };
 use codex_core::ThreadManager;
 use codex_login::{AuthDotJson, AuthManager, AuthReloadStatus, AuthTransitionSnapshot};
+use codex_protocol::protocol::RateLimitSnapshot;
 use codexmarathon_runtime::{
     AccountStore, AutoResetStore, CredentialHealth, DomainError, FileAccountRegistry,
     FileSnapshotVault, MarathonConfig, SnapshotVault,
 };
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex as StdMutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use thiserror::Error;
 use tokio::sync::{Mutex, watch};
+
+const AUTO_FAILOVER_USED_PERCENT: f64 = 90.0;
+const AUTO_FAILOVER_TELEMETRY_TTL: chrono::Duration = chrono::Duration::minutes(5);
+
+#[derive(Clone, Copy, Debug)]
+struct CachedQuota {
+    used_percent: f64,
+    observed_at: chrono::DateTime<chrono::Utc>,
+    is_weekly: bool,
+}
 
 #[derive(Debug, Error)]
 pub(crate) enum MarathonServiceError {
@@ -57,6 +68,8 @@ pub(crate) struct MarathonService {
     vault: Arc<FileSnapshotVault>,
     auto_reset: Arc<AutoResetStore>,
     auth_generation: AtomicU64,
+    quota_by_account: StdMutex<std::collections::BTreeMap<String, CachedQuota>>,
+    auto_failover_in_flight: AtomicBool,
 }
 
 impl MarathonService {
@@ -79,6 +92,8 @@ impl MarathonService {
             vault: Arc::new(FileSnapshotVault::new(config.vault_dir())),
             auto_reset: Arc::new(AutoResetStore::new(config.auto_reset_state_path())),
             auth_generation: AtomicU64::new(1),
+            quota_by_account: StdMutex::new(std::collections::BTreeMap::new()),
+            auto_failover_in_flight: AtomicBool::new(false),
         })
     }
 
@@ -106,6 +121,92 @@ impl MarathonService {
                     .join("auto-reset.json"),
             )),
             auth_generation: AtomicU64::new(1),
+            quota_by_account: StdMutex::new(std::collections::BTreeMap::new()),
+            auto_failover_in_flight: AtomicBool::new(false),
+        }
+    }
+
+    /// Cache one provider-authored observation for the current identity and
+    /// schedule one idle-boundary switch when less than ten percent remains.
+    pub(crate) fn observe_rate_limits(self: &Arc<Self>, snapshot: &RateLimitSnapshot) {
+        let Some(account_id) = self
+            .auth_manager
+            .auth_cached()
+            .and_then(|auth| auth.get_account_id())
+        else {
+            return;
+        };
+        let Some(used_percent) = quota_used_percent(snapshot) else {
+            return;
+        };
+        let now = chrono::Utc::now();
+        let Ok(mut quotas) = self.quota_by_account.lock() else {
+            return;
+        };
+        quotas.insert(
+            account_id.clone(),
+            CachedQuota {
+                used_percent,
+                observed_at: now,
+                is_weekly: snapshot.secondary.is_some(),
+            },
+        );
+        drop(quotas);
+
+        if !quota_requires_failover(used_percent)
+            || !try_begin_auto_failover(&self.auto_failover_in_flight)
+        {
+            return;
+        }
+        let service = Arc::clone(self);
+        tokio::spawn(async move {
+            service.run_auto_failover(account_id).await;
+            service.auto_failover_in_flight.store(false, Ordering::Release);
+        });
+    }
+
+    async fn run_auto_failover(&self, source_account_id: String) {
+        let mut running_turns = self.running_turns.clone();
+        while *running_turns.borrow() != 0 {
+            if running_turns.changed().await.is_err() {
+                return;
+            }
+        }
+        let Ok(state) = self.registry.state() else {
+            return;
+        };
+        let now = chrono::Utc::now();
+        let target = {
+            let Ok(quotas) = self.quota_by_account.lock() else {
+                return;
+            };
+            select_auto_target(&state, &quotas, &self.vault, &source_account_id, now)
+        };
+        let Some(target) = target else {
+            tracing::debug!(
+                source_account_id,
+                "automatic Marathon failover is parked: no fresh eligible target telemetry"
+            );
+            return;
+        };
+        // `switch` re-checks the running-turn count while holding the shared
+        // auth-transition mutex, closing the race with a newly starting turn.
+        // A parked UsageLimit continuation remains TUI-owned: its existing
+        // auth-reload completion path takes and submits that value once, and
+        // only after this switch has installed and verified the new identity.
+        match self.switch(&target).await {
+            Ok(response) if response.outcome == MarathonSwitchOutcome::Committed => {}
+            Ok(response) => tracing::debug!(
+                target,
+                ?response.outcome,
+                reason = ?response.reason,
+                "automatic Marathon failover did not commit"
+            ),
+            Err(error) => tracing::warn!(
+                target,
+                %error,
+                "automatic Marathon failover failed"
+            ),
         }
     }
 
@@ -119,6 +220,8 @@ impl MarathonService {
             .auth_cached()
             .and_then(|auth| auth.get_account_id());
         let active_turn_count = (*self.running_turns.borrow()).min(u32::MAX as usize) as u32;
+        let now = chrono::Utc::now();
+        let quotas = self.quota_by_account.lock().ok();
         let accounts = state
             .accounts
             .values()
@@ -135,7 +238,15 @@ impl MarathonService {
                     active: state.active_account_id == account.id,
                     credential_present,
                     credential_health: credential_health_label(account.credential_health),
-                    weekly_quota_remaining_percent: None,
+                    weekly_quota_remaining_percent: quotas
+                        .as_ref()
+                        .and_then(|quotas| quotas.get(&account.id))
+                        .filter(|quota| quota.is_weekly)
+                        .filter(|quota| {
+                            quota.observed_at <= now
+                                && now - quota.observed_at < AUTO_FAILOVER_TELEMETRY_TTL
+                        })
+                        .map(|quota| (100.0 - quota.used_percent).max(0.0)),
                     reset_action_available: false,
                 }
             })
@@ -398,6 +509,63 @@ impl MarathonService {
     }
 }
 
+fn try_begin_auto_failover(in_flight: &AtomicBool) -> bool {
+    !in_flight.swap(true, Ordering::AcqRel)
+}
+
+fn quota_requires_failover(used_percent: f64) -> bool {
+    used_percent > AUTO_FAILOVER_USED_PERCENT
+}
+
+fn quota_used_percent(snapshot: &RateLimitSnapshot) -> Option<f64> {
+    // Secondary is the longer (normally weekly) provider window. Values are
+    // percentage consumed, so <10 remaining is the strict >90 boundary.
+    let used = snapshot
+        .secondary
+        .as_ref()
+        .or(snapshot.primary.as_ref())?
+        .used_percent;
+    used.is_finite().then_some(used.clamp(0.0, 100.0))
+}
+
+fn select_auto_target(
+    state: &codexmarathon_runtime::RegistryState,
+    quotas: &std::collections::BTreeMap<String, CachedQuota>,
+    vault: &FileSnapshotVault,
+    source_account_id: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<String> {
+    if !state.enabled {
+        return None;
+    }
+    state
+        .accounts
+        .values()
+        .filter(|account| account.id != source_account_id)
+        .filter(|account| account.credential_health == CredentialHealth::Healthy)
+        .filter(|account| {
+            let credential_ref = if account.credential_ref.is_empty() {
+                account.id.as_str()
+            } else {
+                account.credential_ref.as_str()
+            };
+            vault.contains(credential_ref).unwrap_or(false)
+        })
+        .filter_map(|account| {
+            let quota = quotas.get(&account.id)?;
+            (quota.observed_at <= now
+                && now - quota.observed_at < AUTO_FAILOVER_TELEMETRY_TTL
+                && quota.used_percent <= AUTO_FAILOVER_USED_PERCENT)
+                .then_some((account.id.clone(), quota.used_percent))
+        })
+        .min_by(|left, right| {
+            left.1
+                .total_cmp(&right.1)
+                .then_with(|| left.0.cmp(&right.0))
+        })
+        .map(|(account_id, _)| account_id)
+}
+
 fn resolve_target(
     accounts: &std::collections::BTreeMap<String, codexmarathon_runtime::AccountRecord>,
     target: &str,
@@ -478,6 +646,148 @@ mod tests {
     use super::*;
     use chrono::Utc;
     use tempfile::tempdir;
+
+    fn rate_limits(primary: f64, secondary: Option<f64>) -> RateLimitSnapshot {
+        let window = |used_percent| codex_protocol::protocol::RateLimitWindow {
+            used_percent,
+            window_minutes: Some(10_080),
+            resets_at: None,
+        };
+        RateLimitSnapshot {
+            limit_id: Some("codex".to_string()),
+            limit_name: None,
+            primary: Some(window(primary)),
+            secondary: secondary.map(window),
+            credits: None,
+            individual_limit: None,
+            spend_control_reached: None,
+            plan_type: None,
+            rate_limit_reached_type: None,
+        }
+    }
+
+    #[test]
+    fn failover_starts_only_below_ten_percent_remaining() {
+        assert_eq!(
+            quota_used_percent(&rate_limits(1.0, Some(89.9))),
+            Some(89.9)
+        );
+        assert_eq!(
+            quota_used_percent(&rate_limits(1.0, Some(90.0))),
+            Some(90.0)
+        );
+        assert_eq!(
+            quota_used_percent(&rate_limits(90.0, None)),
+            Some(90.0)
+        );
+        assert!(!quota_requires_failover(90.0));
+        assert!(quota_requires_failover(90.1));
+    }
+
+    #[test]
+    fn repeated_threshold_observations_start_exactly_one_transition() {
+        let in_flight = AtomicBool::new(false);
+        assert!(try_begin_auto_failover(&in_flight));
+        assert!(!try_begin_auto_failover(&in_flight));
+        assert!(!try_begin_auto_failover(&in_flight));
+    }
+
+    #[test]
+    fn auto_target_requires_fresh_healthy_credentials_and_prefers_capacity() {
+        let directory = tempdir().expect("tempdir");
+        let vault = FileSnapshotVault::new(directory.path().join("vault"));
+        let mut state = codexmarathon_runtime::RegistryState::default();
+        for (id, health) in [
+            ("account-a", CredentialHealth::Healthy),
+            ("account-b", CredentialHealth::Healthy),
+            ("account-c", CredentialHealth::Healthy),
+            ("account-d", CredentialHealth::Invalid),
+        ] {
+            let mut account = codexmarathon_runtime::AccountRecord::new(id, "").expect("account");
+            account.credential_health = health;
+            state.accounts.insert(id.to_string(), account);
+            let snapshot = codexmarathon_runtime::AuthSnapshot::for_account(id, b"{}")
+                .expect("snapshot");
+            vault.save(id, &snapshot).expect("vault save");
+        }
+        let mut no_credentials =
+            codexmarathon_runtime::AccountRecord::new("account-e", "").expect("account");
+        no_credentials.credential_health = CredentialHealth::Healthy;
+        state
+            .accounts
+            .insert(no_credentials.id.clone(), no_credentials);
+        let now = Utc::now();
+        let quotas = std::collections::BTreeMap::from([
+            (
+                "account-a".to_string(),
+                CachedQuota {
+                    used_percent: 90.0,
+                    observed_at: now,
+                    is_weekly: true,
+                },
+            ),
+            (
+                "account-b".to_string(),
+                CachedQuota {
+                    used_percent: 40.0,
+                    observed_at: now,
+                    is_weekly: true,
+                },
+            ),
+            (
+                "account-c".to_string(),
+                CachedQuota {
+                    used_percent: 20.0,
+                    observed_at: now,
+                    is_weekly: true,
+                },
+            ),
+            (
+                "account-d".to_string(),
+                CachedQuota {
+                    used_percent: 0.0,
+                    observed_at: now,
+                    is_weekly: true,
+                },
+            ),
+            (
+                "account-e".to_string(),
+                CachedQuota {
+                    used_percent: 0.0,
+                    observed_at: now,
+                    is_weekly: true,
+                },
+            ),
+        ]);
+        assert_eq!(
+            select_auto_target(&state, &quotas, &vault, "account-a", now).as_deref(),
+            Some("account-c")
+        );
+
+        let stale = now - AUTO_FAILOVER_TELEMETRY_TTL;
+        let quotas = std::collections::BTreeMap::from([
+            (
+                "account-a".to_string(),
+                CachedQuota {
+                    used_percent: 90.0,
+                    observed_at: now,
+                    is_weekly: true,
+                },
+            ),
+            (
+                "account-b".to_string(),
+                CachedQuota {
+                    used_percent: 20.0,
+                    observed_at: stale,
+                    is_weekly: true,
+                },
+            ),
+        ]);
+        assert_eq!(
+            select_auto_target(&state, &quotas, &vault, "account-a", now),
+            None
+        );
+    }
 
     #[test]
     fn switching_is_deferred_while_a_turn_is_active() {

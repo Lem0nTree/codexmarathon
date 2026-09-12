@@ -447,6 +447,41 @@ mod tests {
     }
 
     #[test]
+    fn proactive_threshold_is_strictly_more_than_ninety_percent_used() {
+        let now = DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .expect("time")
+            .with_timezone(&Utc);
+        let evaluate_active = |used_percent| {
+            evaluate(
+                PolicyInput {
+                    accounts: vec![
+                        account("account-a", used_percent, used_percent),
+                        account("account-b", 10.0, 10.0),
+                    ],
+                    active_account_id: Some("account-a".to_string()),
+                    trigger: PolicyTrigger::ProactiveThreshold,
+                    thresholds: None,
+                    cooldown_until: None,
+                    pending_target_id: None,
+                    now,
+                },
+                PolicyConfig::default(),
+            )
+        };
+
+        assert_eq!(
+            evaluate_active(90.0).kind,
+            PolicyDecisionType::Stay,
+            "exactly ten percent remaining must not trigger failover"
+        );
+        assert_eq!(
+            evaluate_active(90.1).kind,
+            PolicyDecisionType::Transition,
+            "less than ten percent remaining must trigger failover"
+        );
+    }
+
+    #[test]
     fn stale_accounts_do_not_authorize_a_switch() {
         let now = DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
             .expect("time")

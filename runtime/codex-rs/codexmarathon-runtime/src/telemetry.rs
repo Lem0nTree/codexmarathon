@@ -172,8 +172,8 @@ impl AccountTelemetry {
     /// Return whether any window crosses its configured threshold.
     pub fn threshold_reached(&self, thresholds: Thresholds) -> bool {
         self.windows().into_iter().any(|window| match window.kind {
-            WindowKind::Primary => window.used_percent >= thresholds.primary_percent,
-            WindowKind::Secondary => window.used_percent >= thresholds.secondary_percent,
+            WindowKind::Primary => window.used_percent > thresholds.primary_percent,
+            WindowKind::Secondary => window.used_percent > thresholds.secondary_percent,
         })
     }
 
@@ -252,7 +252,7 @@ impl Default for Thresholds {
     fn default() -> Self {
         Self {
             primary_percent: 90.0,
-            secondary_percent: 95.0,
+            secondary_percent: 90.0,
         }
     }
 }

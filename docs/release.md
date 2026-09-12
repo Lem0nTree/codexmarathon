@@ -1,8 +1,42 @@
 # Release validation
 
 CodexMarathon releases are custom Codex CLI builds with native Marathon
-controls compiled into the `codex` executable. The release does not include a
-separate controller, Go binary, or companion archive.
+controls compiled into the `codex` executable. There is no separate Marathon
+controller or Go binary. Release archives do include every sibling executable
+the Codex CLI package expects:
+
+- Linux: `codex`, `codex-code-mode-host`, `codex-responses-api-proxy`, and
+  `bwrap`.
+- Windows: `codex.exe`, `codex-code-mode-host.exe`,
+  `codex-responses-api-proxy.exe`, `codex-command-runner.exe`, and
+  `codex-windows-sandbox-setup.exe`.
+
+Do not publish a CLI-only archive. Code mode and platform sandboxing depend on
+those resources.
+
+## Automated upstream releases
+
+`.github/workflows/upstream-release.yml` polls the latest published stable
+release from `openai/codex` every six hours. It maps a tag such as
+`rust-v0.154.0` to `codexmarathon-v0.154.0` and exits successfully when that
+repository release already exists. A concurrency group and a second lookup
+immediately before publication protect against duplicate releases.
+
+For a new release, the workflow reconstructs the maintained customization
+delta from the exact baseline in `.github/upstream-base.txt`, applies it to the
+upstream tag, and stops before building if Git reports a conflict. A clean port
+is archived once and used for native Linux x64 and Windows x64 builds.
+Publication requires both packages and the Marathon command smoke test. Only
+the final publish job has `contents: write`.
+
+Each release carries the platform packages, the exact prepared source archive,
+the generated full-index customization patch, a JSON provenance manifest, and
+SHA-256 checksums for every asset. The manifest records the upstream and
+customization commits plus the patch, source-tree, and source-archive digests.
+
+Run the workflow manually with `port_only` enabled to check a particular
+published stable tag without building or publishing. A failed port uploads a
+14-day diagnostic artifact and never guesses at conflict resolution.
 
 ## Required checks
 
@@ -13,15 +47,16 @@ python3 scripts/verify_provenance.py --root .
 cd runtime/codex-rs
 cargo fmt --all -- --check
 cargo test --locked -p codexmarathon-runtime
-cargo build --locked --release -p codex-cli
+cd ../..
+scripts/build-release.sh
 ```
 
-The resulting executable is `runtime/codex-rs/target/release/codex`. Verify
-that its Marathon surface is present:
+The build script creates a complete archive under `dist/release` and verifies
+the Marathon command surface. For an additional local check:
 
 ```bash
-runtime/codex-rs/target/release/codex marathon --help
-runtime/codex-rs/target/release/codex marathon status
+dist/release/codex marathon --help
+dist/release/codex marathon status
 ```
 
 ## Live acceptance
@@ -45,4 +80,4 @@ explicitly reviewed and enabled.
 The embedded Codex source and local Marathon additions are documented in
 [`runtime/PROVENANCE.md`](../runtime/PROVENANCE.md) and
 [`runtime/PATCH_LEDGER.md`](../runtime/PATCH_LEDGER.md). Do not package local
-credentials, Cargo target output, or developer caches in a release.
+credentials, unrelated Cargo target output, or developer caches in a release.

@@ -12,7 +12,6 @@ use codex_extension_items::ExtensionItem;
 use codex_extension_items::sleep::SleepItem;
 use codex_features::Feature;
 use codex_history::RolloutItem;
-use codex_history::RolloutLine;
 use codex_login::CodexAuth;
 use codex_protocol::AgentPath;
 use codex_protocol::config_types::CollaborationMode;
@@ -87,12 +86,14 @@ async fn idle_response_items_include_pending_mailbox_in_first_request() -> anyho
             responses::user_message_item("automatic response item"),
         )))
         .await?;
-    assert!(matches!(submission, StartIfIdleSubmission::Started { .. }));
+    let StartIfIdleSubmission::Started { turn_id } = submission else {
+        panic!("automatic input should start a turn");
+    };
     wait_for_turn_complete(test.codex.as_ref()).await;
 
     let request = response.single_request();
     let request_body = request.body_json();
-    responses::assert_root_turn(&request_body, /*expected*/ None)?;
+    responses::assert_root_turn(&request_body, Some(&turn_id))?;
     responses::assert_parent_turn(&request_body, /*expected*/ None)?;
     let user_messages = request.message_input_texts("user");
     assert!(
@@ -721,7 +722,7 @@ async fn any_new_input_interrupts_sleep() {
         .expect("read rollout");
     let persisted_sleep_items = rollout
         .lines()
-        .filter_map(|line| serde_json::from_str::<RolloutLine>(line).ok())
+        .filter_map(|line| codex_rollout::parse_rollout_line(line).ok())
         .filter_map(|line| match line.item {
             RolloutItem::EventMsg(EventMsg::ItemCompleted(event)) => match event.item {
                 TurnItem::Extension(ExtensionItem::Sleep(item)) => Some(item),
@@ -1102,8 +1103,8 @@ async fn injected_response_item_reopens_turn_after_final_answer() {
     responses::assert_root_turn(&first, Some(first_turn_id))
         .expect("initial root should be trusted");
     let second: Value = from_slice(&requests[1]).expect("parse second request");
-    responses::assert_root_turn(&second, /*expected*/ None)
-        .expect("external injection should invalidate the active turn root");
+    responses::assert_root_turn(&second, Some(first_turn_id))
+        .expect("external injection should preserve the active turn root");
     let relevant_user_input = message_input_texts(&second, "user")
         .into_iter()
         .filter(|text| {

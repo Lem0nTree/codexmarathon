@@ -1,3 +1,4 @@
+use super::ApplicationRequirements;
 use super::ApprovalsReviewer;
 use super::AskForApproval;
 use super::BrowserUseConfig;
@@ -209,6 +210,24 @@ pub struct AppToolsConfig {
     pub tools: HashMap<String, AppToolConfig>,
 }
 
+/// Approval settings for a connected account within an app.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export_to = "v2/")]
+pub struct AppLinkConfig {
+    pub approvals_reviewer: Option<ApprovalsReviewer>,
+    pub default_tools_approval_mode: Option<AppToolApproval>,
+}
+
+/// Account settings for a single app.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export_to = "v2/")]
+pub struct AppLinksConfig {
+    #[serde(default, flatten)]
+    pub links: HashMap<String, AppLinkConfig>,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "snake_case")]
 #[ts(export_to = "v2/")]
@@ -221,6 +240,8 @@ pub struct AppConfig {
     pub default_tools_approval_mode: Option<AppToolApproval>,
     pub default_tools_enabled: Option<bool>,
     pub tools: Option<AppToolsConfig>,
+    /// Per-account approval settings keyed by link ID.
+    pub links: Option<AppLinksConfig>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
@@ -412,6 +433,8 @@ pub struct ConfigRequirements {
     pub enforce_residency: Option<ResidencyRequirement>,
     #[experimental("configRequirements/read.network")]
     pub network: Option<NetworkRequirements>,
+    #[experimental("configRequirements/read.application")]
+    pub application: Option<ApplicationRequirements>,
     pub auto_review: Option<AutoReviewRequirements>,
     pub models: Option<ModelsRequirements>,
     #[schemars(with = "Option<String>")]
@@ -482,6 +505,7 @@ pub struct ComputerUseRequirements {
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct BrowserUseRequirements {
+    pub allow_webmcp: Option<bool>,
     pub allow_history_access: Option<bool>,
     pub disable_auto_review: Option<bool>,
     pub allow_global_persistent_approval: Option<bool>,

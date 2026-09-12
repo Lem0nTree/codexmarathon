@@ -6,6 +6,7 @@ use codex_core::config::Config;
 use codex_core::config::TokenBudgetConfig;
 use codex_extension_api::ExtensionRegistryBuilder;
 use codex_features::Feature;
+use codex_login::CodexAuth;
 use codex_model_provider_info::built_in_model_providers;
 use codex_protocol::config_types::AutoCompactTokenLimitScope;
 use codex_protocol::items::TurnItem;
@@ -235,8 +236,12 @@ async fn token_budget_context_is_only_emitted_with_full_context() -> Result<()> 
     Ok(())
 }
 
+#[test_case("features.token_budget.enabled = true"; "token_budget")]
+#[test_case("features.context_management.experimental_mode = true"; "experimental_mode")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn token_budget_guidance_precedes_standalone_context_window() -> Result<()> {
+async fn token_budget_guidance_precedes_standalone_context_window(
+    activation: &'static str,
+) -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
@@ -249,18 +254,29 @@ async fn token_budget_guidance_precedes_standalone_context_window() -> Result<()
     )
     .await;
     let guidance_message = "Preserve important state before compaction.";
+    let backend_url = format!("{}/backend-api/codex", server.uri());
     let test = test_codex()
+        .with_model_info_override("gpt-5.2", |model| {
+            model.supports_experimental_context = true;
+        })
+        .with_auth(CodexAuth::from_external_chatgpt_tokens(
+            "header.e30.signature",
+            "account-123",
+            Some("plus"),
+        )?)
+        .with_pre_build_hook(move |home| {
+            std::fs::write(
+                home.join("config.toml"),
+                format!(
+                    "{activation}\nfeatures.token_budget.guidance_message = {guidance_message:?}\n"
+                ),
+            )
+            .expect("write token-budget guidance configuration");
+        })
         .with_config(move |config| {
+            config.model_provider.base_url = Some(backend_url);
             config.update_plan_enabled = true;
             config.model_context_window = Some(CONFIGURED_CONTEXT_WINDOW);
-            config.token_budget = Some(TokenBudgetConfig {
-                guidance_message: Some(guidance_message.to_string()),
-                ..TokenBudgetConfig::default()
-            });
-            config
-                .features
-                .enable(Feature::TokenBudget)
-                .expect("test config should allow token budget");
         })
         .build_with_auto_env(&server)
         .await?;
@@ -287,6 +303,64 @@ async fn token_budget_guidance_precedes_standalone_context_window() -> Result<()
         })
         .expect("context-window guidance should be present");
     assert!(guidance_index < context_window_index);
+
+    Ok(())
+}
+
+#[test_case("OpenAI", "/backend-api/codex", None, true, true; "codex_backend")]
+#[test_case("OpenAI", "/backend-api/codex", None, false, false; "unsupported_model")]
+#[test_case("Custom", "/backend-api/codex", None, true, false; "custom_provider")]
+#[test_case("OpenAI", "/v1", None, true, false; "non_codex_endpoint")]
+#[test_case("OpenAI", "/backend-api/codex", Some("test-provider-token"), true, false; "provider_credentials")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn experimental_context_requires_capable_model_and_codex_backend(
+    provider_name: &'static str,
+    base_path: &'static str,
+    bearer_token: Option<&'static str>,
+    supports_context: bool,
+    expected_enabled: bool,
+) -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let response = mount_sse_once(&server, sse_completed("resp-1")).await;
+    let base_url = format!("{}{base_path}", server.uri());
+    let test = test_codex()
+        .with_model_info_override("gpt-5.2", move |model| {
+            model.supports_experimental_context = supports_context;
+        })
+        .with_auth(CodexAuth::from_external_chatgpt_tokens(
+            "header.e30.signature",
+            "account-123",
+            Some("plus"),
+        )?)
+        .with_config(move |config| {
+            config.model_provider.name = provider_name.to_string();
+            config.model_provider.base_url = Some(base_url);
+            config.model_provider.experimental_bearer_token = bearer_token.map(Into::into);
+            config.model_context_window = Some(CONFIGURED_CONTEXT_WINDOW);
+            config
+                .features
+                .enable(Feature::ContextManagement)
+                .expect("test config should allow experimental context");
+        })
+        .build_with_auto_env(&server)
+        .await?;
+
+    test.submit_turn("inspect experimental context activation")
+        .await?;
+
+    let request = response.single_request();
+    assert_eq!(
+        tool_names(&request)
+            .iter()
+            .any(|name| name == "new_context"),
+        expected_enabled
+    );
+    assert_eq!(
+        !token_budget_contexts(&request).is_empty(),
+        expected_enabled
+    );
 
     Ok(())
 }
@@ -380,8 +454,10 @@ async fn token_budget_explicit_default_template_overrides_model_defaults() -> Re
     Ok(())
 }
 
+#[test_case(Feature::TokenBudget; "explicit_activation")]
+#[test_case(Feature::ContextManagement; "experimental_activation")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn token_budget_defaults_follow_the_active_model() -> Result<()> {
+async fn token_budget_defaults_follow_the_active_model(activation: Feature) -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
@@ -390,8 +466,15 @@ async fn token_budget_defaults_follow_the_active_model() -> Result<()> {
         vec![sse_completed("resp-1"), sse_completed("resp-2")],
     )
     .await;
+    let backend_url = format!("{}/backend-api/codex", server.uri());
     let test = test_codex()
+        .with_auth(CodexAuth::from_external_chatgpt_tokens(
+            "header.e30.signature",
+            "account-123",
+            Some("plus"),
+        )?)
         .with_model_info_override("gpt-5.2", |model_info| {
+            model_info.supports_experimental_context = true;
             let mut defaults = model_token_budget_config();
             defaults.guidance_message = "Use first-model context-window guidance.".to_string();
             model_info
@@ -410,11 +493,12 @@ async fn token_budget_defaults_follow_the_active_model() -> Result<()> {
                 .token_budget = Some(defaults);
         })
         .with_model("gpt-5.2")
-        .with_config(|config| {
+        .with_config(move |config| {
+            config.model_provider.base_url = Some(backend_url);
             config.model_context_window = Some(CONFIGURED_CONTEXT_WINDOW);
             config
                 .features
-                .enable(Feature::TokenBudget)
+                .enable(activation)
                 .expect("test config should allow token budget");
         })
         .build_with_auto_env(&server)
@@ -442,6 +526,7 @@ async fn token_budget_defaults_follow_the_active_model() -> Result<()> {
 
     let requests = responses.requests();
     assert_eq!(requests.len(), 2);
+    assert_eq!(requests[1].body_json()["model"], "gpt-5.4");
     assert!(requests[0].body_contains_text("Use first-model context-window guidance."));
     assert!(
         requests[1].body_contains_text("Use first-model context-window guidance."),

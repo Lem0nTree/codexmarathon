@@ -1,8 +1,11 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
 use anyhow::Context;
 use anyhow::Result;
+use codex_config::HookStateToml;
+use codex_config::McpServerConfig;
 use codex_config::test_support::CloudConfigBundleFixture;
 use codex_core::StartThreadOptions;
 use codex_core::TurnInput;
@@ -13,7 +16,6 @@ use codex_core::config::Constrained;
 use codex_core::config::ThreadStoreConfig;
 use codex_features::Feature;
 use codex_history::RolloutItem;
-use codex_history::RolloutLine;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::built_in_model_providers;
 use codex_plugin::PluginHookSource;
@@ -26,6 +28,7 @@ use codex_protocol::models::ResponseItem;
 use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::HookEventName;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
@@ -64,8 +67,10 @@ use core_test_support::test_codex::test_codex;
 use core_test_support::test_codex::turn_permission_fields;
 use core_test_support::test_target_os;
 use core_test_support::wait_for_event;
+use core_test_support::wait_for_mcp_server;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
+use serde_json::json;
 use std::sync::Arc;
 use std::time::Duration;
 use tempfile::TempDir;
@@ -1140,7 +1145,7 @@ fn rollout_hook_prompt_texts(text: &str) -> Result<Vec<String>> {
         if trimmed.is_empty() {
             continue;
         }
-        let rollout: RolloutLine = serde_json::from_str(trimmed).context("parse rollout line")?;
+        let rollout = codex_rollout::parse_rollout_line(trimmed).context("parse rollout line")?;
         if let RolloutItem::ResponseItem(envelope) = rollout.item
             && let ResponseItem::Message { role, content, .. } = envelope.item
             && role == "user"
@@ -1843,7 +1848,11 @@ async fn async_hook_finishing_while_idle_waits_for_the_next_turn(
     assert_ne!(first_turn_id, second_turn_id);
     responses::assert_root_turn(
         &requests[1].body_json(),
-        (!automatic_continuation).then_some(second_turn_id.as_str()),
+        Some(if automatic_continuation {
+            first_turn_id.as_str()
+        } else {
+            second_turn_id.as_str()
+        }),
     )?;
     assert_eq!(
         warning_event
@@ -2641,8 +2650,12 @@ async fn blocked_user_prompt_submit_persists_additional_context_for_next_turn() 
     Ok(())
 }
 
+#[test_case::test_case(/*thread_context_enabled*/ true; "retained context enabled")]
+#[test_case::test_case(/*thread_context_enabled*/ false; "retained context disabled")]
 #[tokio::test]
-async fn blocked_queued_prompt_does_not_strand_earlier_accepted_prompt() -> Result<()> {
+async fn blocked_queued_prompt_does_not_strand_earlier_accepted_prompt(
+    thread_context_enabled: bool,
+) -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let (gate_completed_tx, gate_completed_rx) = oneshot::channel();
@@ -2685,7 +2698,13 @@ async fn blocked_queued_prompt_does_not_strand_earlier_accepted_prompt() -> Resu
             write_user_prompt_submit_hook(home, "blocked queued prompt", BLOCKED_PROMPT_CONTEXT)
                 .expect("failed to write user prompt submit hook test fixture");
         })
-        .with_config(trust_discovered_hooks);
+        .with_config(move |config| {
+            trust_discovered_hooks(config);
+            config
+                .features
+                .set_enabled(Feature::GuardianThreadContext, thread_context_enabled)
+                .expect("test context mode");
+        });
     let test = builder.build_with_streaming_server(&server).await?;
 
     test.codex
@@ -2738,6 +2757,30 @@ async fn blocked_queued_prompt_does_not_strand_earlier_accepted_prompt() -> Resu
     assert!(
         !second_user_texts.contains(&"blocked queued prompt".to_string()),
         "second request should not include the blocked queued prompt",
+    );
+
+    let history = test.codex.conversation_history_snapshot().await;
+    assert_eq!(history.retained_context().is_some(), thread_context_enabled);
+    let retained = serde_json::to_value(history.retained_context().cloned().unwrap_or_default())?;
+    assert_eq!(
+        retained["user_messages"]
+            .as_array()
+            .expect("retained user messages")
+            .iter()
+            .map(|message| (message["order"].clone(), message["text"].clone()))
+            .collect::<Vec<_>>(),
+        if thread_context_enabled {
+            vec![
+                (json!(0), json!("initial prompt")),
+                (json!(1), json!("accepted queued prompt")),
+            ]
+        } else {
+            Vec::new()
+        },
+    );
+    assert_eq!(
+        retained["next_order"],
+        json!(if thread_context_enabled { 3 } else { 0 })
     );
 
     let hook_inputs = read_user_prompt_submit_hook_inputs(test.codex_home_path())?;
@@ -4030,6 +4073,282 @@ async fn post_tool_use_block_decision_rejects_code_mode_tool_promise() -> Result
 async fn post_tool_use_exit_two_rejects_code_mode_tool_promise() -> Result<()> {
     assert_post_tool_use_blocks_code_mode_tool_result("exit_2", "blocked nested result by exit two")
         .await
+}
+
+enum CleanupHookDeclaration {
+    Inline,
+    File,
+}
+
+enum CleanupHookResponse {
+    Success,
+    McpError,
+}
+
+enum CleanupPluginState {
+    Enabled,
+    Disabled,
+}
+
+enum CleanupHooksFeature {
+    Enabled,
+    Disabled,
+}
+
+#[test_case::test_matrix(
+    [("computer-use", "node_repl"), ("unified-computer-use", "cua_repl")],
+    [CleanupHookDeclaration::Inline, CleanupHookDeclaration::File],
+    [CleanupHookResponse::Success, CleanupHookResponse::McpError],
+    [CleanupPluginState::Enabled],
+    [CleanupHooksFeature::Enabled]
+)]
+#[test_case::test_matrix(
+    [("computer-use", "node_repl"), ("unified-computer-use", "cua_repl")],
+    [CleanupHookDeclaration::Inline],
+    [CleanupHookResponse::Success],
+    [CleanupPluginState::Disabled],
+    [CleanupHooksFeature::Enabled]
+)]
+#[test_case::test_matrix(
+    [("computer-use", "node_repl"), ("unified-computer-use", "cua_repl")],
+    [CleanupHookDeclaration::Inline],
+    [CleanupHookResponse::Success],
+    [CleanupPluginState::Enabled, CleanupPluginState::Disabled],
+    [CleanupHooksFeature::Disabled]
+)]
+#[tokio::test]
+async fn local_bundled_cleanup_hook_runs_without_saved_trust(
+    plugin: (&'static str, &'static str),
+    declaration: CleanupHookDeclaration,
+    hook_response: CleanupHookResponse,
+    plugin_state: CleanupPluginState,
+    hooks_feature: CleanupHooksFeature,
+) -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let (plugin_name, mcp_server_name) = plugin;
+    let plugin_enabled = matches!(plugin_state, CleanupPluginState::Enabled);
+    let hooks_enabled = matches!(hooks_feature, CleanupHooksFeature::Enabled);
+    let hook_response = match hook_response {
+        CleanupHookResponse::Success => {
+            serde_json::json!({ "content": [{ "type": "text", "text": "{}" }] })
+        }
+        CleanupHookResponse::McpError => serde_json::json!({
+            "isError": true,
+            "content": [{
+                "type": "text",
+                "text": r#"{"decision":"block","reason":"error output must not continue the turn"}"#,
+            }],
+        }),
+    };
+    let server = start_mock_server().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/repl"))
+        .respond_with(move |request: &wiremock::Request| {
+            let request: Value = serde_json::from_slice(&request.body).expect("MCP request");
+            let result = match request["method"].as_str() {
+                Some("initialize") => serde_json::json!({
+                    "protocolVersion": request["params"]["protocolVersion"],
+                    "capabilities": { "tools": {} },
+                    "serverInfo": { "name": mcp_server_name, "version": "1.0.0" },
+                }),
+                Some("notifications/initialized") => return wiremock::ResponseTemplate::new(202),
+                Some("tools/list") => serde_json::json!({ "tools": [
+                    { "name": "turn_ended", "inputSchema": { "type": "object" } },
+                    { "name": "regular_stop", "inputSchema": { "type": "object" } },
+                ] }),
+                Some("tools/call") => hook_response.clone(),
+                method => panic!("unexpected MCP request: {method:?}"),
+            };
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": request["id"],
+                "result": result,
+            }))
+        })
+        .mount(&server)
+        .await;
+    let response = mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-1"),
+            ev_assistant_message("msg-1", "done"),
+            ev_completed("resp-1"),
+        ]),
+    )
+    .await;
+
+    let home = Arc::new(TempDir::new()?);
+    if !hooks_enabled {
+        fs::write(
+            home.path().join("hooks.json"),
+            serde_json::to_vec(&serde_json::json!({ "hooks": { "Stop": [{ "hooks": [{
+                "type": "mcp_tool",
+                "server": mcp_server_name,
+                "tool": "regular_stop",
+            }] }] } }))?,
+        )?;
+    }
+    let plugin_root = home
+        .path()
+        .join(format!("plugins/cache/openai-bundled/{plugin_name}/local"));
+    fs::create_dir_all(plugin_root.join(".codex-plugin"))?;
+    let hooks = serde_json::json!({ "hooks": { "Stop": [{ "hooks": [{
+        "type": "mcp_tool",
+        "server": mcp_server_name,
+        "tool": "turn_ended",
+        "input": {
+            "hook_event_name": "${hook_event_name}",
+            "session_id": "${session_id}",
+            "turn_id": "${turn_id}",
+        },
+    }] }] } });
+    let (manifest_hooks, source_relative_path) = match declaration {
+        CleanupHookDeclaration::Inline => (hooks, "plugin.json#hooks[0]"),
+        CleanupHookDeclaration::File => {
+            fs::create_dir_all(plugin_root.join("hooks"))?;
+            fs::write(
+                plugin_root.join("hooks/hooks.json"),
+                serde_json::to_vec(&hooks)?,
+            )?;
+            (serde_json::json!("./hooks/hooks.json"), "hooks/hooks.json")
+        }
+    };
+    fs::write(
+        plugin_root.join(".codex-plugin/plugin.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "name": plugin_name,
+            "hooks": manifest_hooks,
+        }))?,
+    )?;
+    let hook_key = codex_hooks::hook_key(
+        &format!("{plugin_name}@openai-bundled:{source_relative_path}"),
+        HookEventName::Stop,
+        /*group_index*/ 0,
+        /*handler_index*/ 0,
+    );
+    fs::write(
+        home.path().join("config.toml"),
+        format!(
+            "[features]\nhooks = {hooks_enabled}\n\n[plugins.\"{plugin_name}@openai-bundled\"]\nenabled = {plugin_enabled}\n\n[hooks.state.\"{hook_key}\"]\nenabled = false\n"
+        ),
+    )?;
+    let repl_url = format!("{}/repl", server.uri());
+    let mut builder = test_codex().with_home(home).with_config(move |config| {
+        for feature in [Feature::Plugins, Feature::CodexHooks] {
+            config.features.enable(feature).expect("enable feature");
+        }
+        if !hooks_enabled {
+            trust_discovered_hooks(config);
+            config
+                .features
+                .disable(Feature::CodexHooks)
+                .expect("disable regular hooks");
+        }
+        config
+            .features
+            .disable(Feature::ExecutorCapabilityDiscovery)
+            .expect("disable executor capability discovery");
+        let repl: McpServerConfig = serde_json::from_value(serde_json::json!({
+            "url": repl_url,
+            "environment_id": super::rmcp_client::remote_aware_environment_id(),
+        }))
+        .expect("valid MCP configuration");
+        config
+            .mcp_servers
+            .set(
+                [(String::from(mcp_server_name), repl)]
+                    .into_iter()
+                    .collect(),
+            )
+            .expect("configure MCP server");
+    });
+    let test = builder.build_with_auto_env(&server).await?;
+    assert!(!test.config.bypass_hook_trust);
+    assert_eq!(
+        test.config.features.enabled(Feature::CodexHooks),
+        hooks_enabled
+    );
+    let mut expected_hook_states = HashMap::from([(
+        hook_key,
+        HookStateToml {
+            enabled: Some(false),
+            trusted_hash: None,
+        },
+    )]);
+    if !hooks_enabled {
+        let regular_hooks = codex_hooks::list_hooks(codex_hooks::HooksConfig {
+            feature_enabled: true,
+            config_layer_stack: Some(test.config.config_layer_stack.clone()),
+            ..Default::default()
+        });
+        assert_eq!(regular_hooks.hooks.len(), 1);
+        for hook in regular_hooks.hooks {
+            expected_hook_states.insert(
+                hook.key,
+                HookStateToml {
+                    enabled: None,
+                    trusted_hash: Some(hook.current_hash),
+                },
+            );
+        }
+    }
+    assert_eq!(
+        codex_hooks::hook_states_from_stack(Some(&test.config.config_layer_stack)),
+        expected_hook_states
+    );
+    wait_for_mcp_server(&test.codex, mcp_server_name).await?;
+    test.codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "finish this turn".into(),
+            text_elements: Vec::new(),
+        }]))
+        .await?;
+    let mut hook_notifications = Vec::new();
+    wait_for_event(&test.codex, |event| {
+        if matches!(event, EventMsg::HookStarted(_) | EventMsg::HookCompleted(_)) {
+            hook_notifications.push(event.clone());
+        }
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+    assert!(
+        hook_notifications.is_empty(),
+        "unexpected cleanup hook notifications: {hook_notifications:?}"
+    );
+    assert_eq!(response.requests().len(), 1);
+
+    let calls = server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|request| request.url.path() == "/repl")
+        .filter_map(|request| serde_json::from_slice::<Value>(&request.body).ok())
+        .filter(|request| request["method"] == "tools/call")
+        .map(|request| {
+            serde_json::json!({
+                "name": request["params"]["name"],
+                "arguments": request["params"]["arguments"],
+            })
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        calls,
+        if plugin_enabled {
+            vec![serde_json::json!({
+                "name": "turn_ended",
+                "arguments": {
+                    "hook_event_name": "Stop",
+                    "session_id": test.session_configured.thread_id.to_string(),
+                    "turn_id": response.single_request().body_json()["client_metadata"]["turn_id"],
+                },
+            })]
+        } else {
+            Vec::new()
+        }
+    );
+    Ok(())
 }
 
 #[tokio::test]

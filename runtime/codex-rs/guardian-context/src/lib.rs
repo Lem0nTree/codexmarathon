@@ -14,11 +14,20 @@ use std::sync::LazyLock;
 
 use codex_protocol::models::ResponseItem;
 
+use authorization::RootConversationSection;
+use authorization::TrustedUserAnswersSection;
+use retained_instructions::RetainedUserInstructionsSection;
 use transcript::ConversationTranscriptSection;
+
+pub use authorization::GuardianRootMessage;
+pub use composition::ComposedContext;
 
 pub use entry::ConversationTranscriptEntry;
 pub use entry::ConversationTranscriptEntryKind;
 pub use history::TranscriptHistory;
+pub use retention::UserMessageCost;
+pub use retention::UserMessageSelection;
+pub use retention::select_user_messages;
 pub use transcript::ConversationTranscriptConfig;
 pub use transcript::ConversationTranscriptOptions;
 pub use transcript::MANUAL_APPROVAL_DEVELOPER_PREFIX;
@@ -27,8 +36,18 @@ pub use transcript::TranscriptRetentionConfig;
 pub use transcript::collect_transcript;
 pub use truncation::truncate_text;
 
+mod verified_answers;
+pub use verified_answers::RenderedVerifiedAnswers;
+pub use verified_answers::render_verified_answer;
+pub use verified_answers::render_verified_answers;
+
+mod retained_instructions;
+
+mod authorization;
+mod composition;
 mod entry;
 mod history;
+mod retention;
 mod transcript;
 mod truncation;
 
@@ -72,6 +91,10 @@ pub struct SectionInput<'a> {
     pub history: &'a dyn SectionHistory,
     /// Evidence sources and per-entry limits for this collection.
     pub transcript: &'a ConversationTranscriptConfig,
+    /// Bounded root evidence resolved by the host; empty when not applicable.
+    pub root_conversation: &'a [GuardianRootMessage],
+    /// Bounded, role-labeled answers selected from the host-owned context snapshot.
+    pub trusted_user_answers: &'a [String],
 }
 
 /// Supplies repeatable, zero-copy access to a host-owned conversation snapshot.
@@ -82,6 +105,11 @@ pub struct SectionInput<'a> {
 pub trait SectionHistory: Send + Sync {
     /// Returns borrowed response items in their original conversation order.
     fn items(&self) -> Box<dyn Iterator<Item = &ResponseItem> + Send + '_>;
+
+    /// Bounded host-owned facts from the same snapshot as the current items.
+    fn retained_context(&self) -> Option<&codex_history::RetainedContext> {
+        None
+    }
 }
 
 impl SectionHistory for Vec<ResponseItem> {
@@ -149,6 +177,9 @@ pub struct SectionRegistry {
 pub fn default_registry() -> &'static SectionRegistry {
     static REGISTRY: LazyLock<SectionRegistry> = LazyLock::new(|| {
         let mut registry = SectionRegistry::default();
+        registry.register(RootConversationSection);
+        registry.register(RetainedUserInstructionsSection);
+        registry.register(TrustedUserAnswersSection);
         registry.register(ConversationTranscriptSection);
         registry
     });
@@ -174,11 +205,26 @@ impl SectionRegistry {
     }
 }
 
-/// Ordered transcript evidence produced by one section contributor.
+/// Ordered evidence with a stable section identity and source-specific content.
+///
+/// Variants preserve provenance: transcript entries carry their original roles,
+/// root messages remain line-role-labeled, and answers are host-verified fragments.
+/// All currently supported sections are delivered as user-role evidence. Source
+/// attribution never promotes their contents to developer instructions.
 #[derive(Clone, Debug, PartialEq)]
-pub struct ContextSection {
-    /// Structured evidence before consumer-specific selection and rendering.
-    pub items: Vec<ConversationTranscriptEntry>,
+pub enum ContextSection {
+    ConversationTranscript {
+        items: Vec<ConversationTranscriptEntry>,
+    },
+    RootConversation {
+        items: Vec<String>,
+    },
+    TrustedUserAnswers {
+        items: Vec<String>,
+    },
+    RetainedUserInstructions {
+        items: Vec<String>,
+    },
 }
 
 #[cfg(test)]

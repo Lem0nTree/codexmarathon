@@ -8,6 +8,7 @@ use super::step_settings::StepSettingsUpdate;
 use super::turn_context::TurnContext;
 use crate::config::Config;
 use crate::config::ConstraintResult;
+use crate::context::GuardianNodeReplPolicy;
 use crate::exec_policy::AllowPrefixRules;
 use crate::guardian::BUNDLED_GUARDIAN_POLICY_TEMPLATE;
 use codex_features::Feature;
@@ -47,17 +48,12 @@ fn check_legacy_turn_safety(
             || ignored_models.is_some_and(|models| models.contains(&model.slug))
     };
 
-    // tools::approvals and guardian::review still route approvals using the
-    // originating turn's policy, reviewer, and required-model classification.
+    // Approval policy and required-model classification still have consumers
+    // using the originating turn. The reviewer is captured separately.
     if destination.constrained_approval_policy() != current.constrained_approval_policy()
         || destination.approval_policy() != turn_context.approval_policy()
     {
         return Err("the destination changes the admitted approval policy".to_string());
-    }
-    if destination.approvals_reviewer() != current.approvals_reviewer()
-        || destination.approvals_reviewer() != turn_context.config.approvals_reviewer
-    {
-        return Err("the destination changes the admitted approvals reviewer".to_string());
     }
     if required_review
         != requirements
@@ -111,11 +107,17 @@ fn check_legacy_model_safety(
     // TurnMetadataState pins both node REPL flags. Guardian prompt/evidence
     // construction also reads node_repl_auto_review_required from the turn.
     if retained_models.iter().any(|model| {
-        model.node_repl_auto_review_required != destination.node_repl_auto_review_required
+        model.computer_use_review_required() != destination.computer_use_review_required()
     }) {
         return Err(
             "the destination changes the admitted node REPL review requirement".to_string(),
         );
+    }
+    if retained_models
+        .iter()
+        .any(|model| model.guardian != destination.guardian)
+    {
+        return Err("the destination changes the admitted Guardian coverage".to_string());
     }
     if retained_models
         .iter()
@@ -134,7 +136,7 @@ fn check_legacy_model_safety(
         return Err("the destination changes the explicit Guardian reviewer model".to_string());
     }
 
-    if admitted_config.features.enabled(Feature::GuardianV2)
+    if (admitted_config.features.enabled(Feature::GuardianV2) || destination.guardian.is_some())
         && admitted_config.features.enabled(Feature::GuardianApproval)
     {
         // GuardianV2Extension::on_tool_start reads the parent ModelInfo from
@@ -173,6 +175,17 @@ fn check_legacy_model_safety(
     // catalog refresh. V1 uses the admitted config; V2 can use the live config.
     // An unchanged explicit reviewer override prevents both fallback paths.
     if destination.auto_review_model_override.is_none() {
+        let destination_node_repl_policy =
+            GuardianNodeReplPolicy::from_model_messages(destination.model_messages.as_ref());
+        for model in retained_models {
+            let policy = GuardianNodeReplPolicy::from_model_messages(model.model_messages.as_ref());
+            if policy != destination_node_repl_policy {
+                return Err(
+                    "the destination changes the Guardian parent-fallback node REPL policy"
+                        .to_string(),
+                );
+            }
+        }
         for config in [admitted_config, live_config] {
             let destination_policy =
                 config.resolve_guardian_policy(destination.model_messages.as_ref());
@@ -225,7 +238,12 @@ impl Session {
         turn_id: &str,
         update: TurnSettingsUpdate,
     ) -> TurnSettingsUpdateOutcome {
-        if !self.features.enabled(Feature::StepModelSwitching) {
+        let reviewer_only = update.approvals_reviewer.is_some()
+            && update.model.is_none()
+            && update.effort.is_none()
+            && update.summary.is_none()
+            && update.service_tier.is_none();
+        if !reviewer_only && !self.features.enabled(Feature::StepModelSwitching) {
             return TurnSettingsUpdateOutcome::Rejected {
                 reason: "turn settings updates require the step_model_switching feature"
                     .to_string(),
@@ -253,12 +271,14 @@ impl Session {
             return TurnSettingsUpdateOutcome::TargetUnavailable;
         };
         let TurnSettingsUpdate {
+            approvals_reviewer,
             model,
             effort,
             summary,
             service_tier,
         } = update;
         let update = StepSettingsUpdate {
+            approvals_reviewer,
             model,
             effort,
             reasoning_summary: summary,
@@ -301,6 +321,11 @@ impl Session {
             )
             .map_err(|error| error.to_string())
             .and_then(|()| {
+                // A reviewer-only patch cannot change any model-owned authority.
+                // Managed reviewer restrictions were checked above.
+                if reviewer_only {
+                    return Ok(());
+                }
                 check_legacy_turn_safety(
                     &turn_context,
                     &current,

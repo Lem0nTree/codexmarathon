@@ -1,8 +1,9 @@
-//! Rate-limit warning, prompt, and notice surfaces for `ChatWidget`.
+//! Rate-limit warning, prompt, and notice surfaces, plus quota-aware account refresh cadence.
 
 use super::*;
 pub(super) const WORKSPACE_NUDGE_VIEW_ID: &str = "workspace-usage-nudge";
 use crate::bottom_pane::ActionableBanner;
+use crate::model_catalog::LUNA_RESERVE_MODEL;
 use codex_app_server_protocol::CodexErrorInfo as AppServerCodexErrorInfo;
 use uuid::Uuid;
 
@@ -11,11 +12,11 @@ pub(super) struct PendingCreditsNudge {
     credit_type: AddCreditsNudgeCreditType,
 }
 
-pub(super) const NUDGE_MODEL_SLUG: &str = "gpt-5.6-luna";
+pub(super) const NUDGE_MODEL_SLUG: &str = crate::model_catalog::LUNA_MODEL;
 pub(super) const RATE_LIMIT_SWITCH_PROMPT_THRESHOLD: f64 = 90.0;
 pub(super) const RATE_LIMIT_SWITCH_PROMPT_VIEW_ID: &str = "rate-limit-switch-prompt";
 
-const RATE_LIMIT_WARNING_THRESHOLDS: [f64; 3] = [75.0, 90.0, 95.0];
+const RATE_LIMIT_WARNING_THRESHOLDS: [f64; 4] = [50.0, 75.0, 90.0, 95.0];
 const PRIMARY_LIMIT_FALLBACK_LABEL: &str = "usage";
 const SECONDARY_LIMIT_FALLBACK_LABEL: &str = "secondary usage";
 
@@ -28,6 +29,7 @@ pub(super) struct RateLimitWarningState {
 impl RateLimitWarningState {
     pub(super) fn take_warnings(
         &mut self,
+        plan_type: Option<PlanType>,
         secondary_used_percent: Option<f64>,
         secondary_window_minutes: Option<i64>,
         primary_used_percent: Option<f64>,
@@ -47,7 +49,14 @@ impl RateLimitWarningState {
             while self.secondary_index < RATE_LIMIT_WARNING_THRESHOLDS.len()
                 && secondary_used_percent >= RATE_LIMIT_WARNING_THRESHOLDS[self.secondary_index]
             {
-                highest_secondary = Some(RATE_LIMIT_WARNING_THRESHOLDS[self.secondary_index]);
+                let threshold = RATE_LIMIT_WARNING_THRESHOLDS[self.secondary_index];
+                if threshold != 50.0
+                    || (matches!(plan_type, Some(PlanType::Plus | PlanType::Team))
+                        && secondary_window_minutes
+                            .is_some_and(|minutes| is_approximate_window(minutes, 5 * 60)))
+                {
+                    highest_secondary = Some(threshold);
+                }
                 self.secondary_index += 1;
             }
             if let Some(threshold) = highest_secondary {
@@ -65,7 +74,14 @@ impl RateLimitWarningState {
             while self.primary_index < RATE_LIMIT_WARNING_THRESHOLDS.len()
                 && primary_used_percent >= RATE_LIMIT_WARNING_THRESHOLDS[self.primary_index]
             {
-                highest_primary = Some(RATE_LIMIT_WARNING_THRESHOLDS[self.primary_index]);
+                let threshold = RATE_LIMIT_WARNING_THRESHOLDS[self.primary_index];
+                if threshold != 50.0
+                    || (matches!(plan_type, Some(PlanType::Plus | PlanType::Team))
+                        && primary_window_minutes
+                            .is_some_and(|minutes| is_approximate_window(minutes, 5 * 60)))
+                {
+                    highest_primary = Some(threshold);
+                }
                 self.primary_index += 1;
             }
             if let Some(threshold) = highest_primary {
@@ -170,11 +186,43 @@ fn has_usable_workspace_credits(credits: &CreditsSnapshot) -> bool {
 }
 
 impl ChatWidget {
+    /// Poll more often near exhaustion for every ChatGPT account, independently of experiments.
+    pub(crate) fn rate_limit_refresh_interval(&self) -> Option<std::time::Duration> {
+        if !self.should_prefetch_rate_limits() {
+            return None;
+        }
+        // Ignore unrelated model buckets; watch ordinary usage and the selected model's bucket.
+        let used_percent = self
+            .rate_limit_snapshots_by_limit_id
+            .iter()
+            .filter(|(limit_id, snapshot)| {
+                limit_id.as_str() == "codex" || snapshot.limit_name == self.current_model()
+            })
+            .flat_map(|(_, snapshot)| snapshot.primary.iter().chain(snapshot.secondary.iter()))
+            .map(|window| window.used_percent)
+            .filter(|percent| percent.is_finite())
+            .max_by(f64::total_cmp)
+            .unwrap_or_default();
+        let seconds = if used_percent >= 99.0 {
+            5
+        } else if used_percent >= 90.0 {
+            15
+        } else if used_percent >= 75.0 {
+            30
+        } else {
+            60
+        };
+        Some(std::time::Duration::from_secs(seconds))
+    }
+
     pub(crate) fn hold_rate_limit_recovery(&mut self) -> bool {
         std::mem::replace(&mut self.input_queue.rate_limit_recovery_pending, true)
     }
 
     pub(crate) fn finish_rate_limit_recovery(&mut self) {
+        if self.waiting_for_luna_reserve() {
+            return;
+        }
         if std::mem::take(&mut self.input_queue.rate_limit_recovery_pending) {
             // Marathon keeps the native synthetic turn parked until its
             // controller has committed an identity-changing transition and
@@ -218,10 +266,6 @@ impl ChatWidget {
                 .limit_id
                 .clone()
                 .unwrap_or_else(|| "codex".to_string());
-            let limit_label = snapshot
-                .limit_name
-                .clone()
-                .unwrap_or_else(|| limit_id.clone());
             if matches!(source, RateLimitSnapshotSource::RollingUpdate)
                 && snapshot.credits.is_none()
             {
@@ -235,6 +279,10 @@ impl ChatWidget {
                         balance: credits.balance.clone(),
                     });
             }
+            let limit_label = snapshot
+                .limit_name
+                .clone()
+                .unwrap_or_else(|| limit_id.clone());
             let preserved_individual_limit =
                 if matches!(source, RateLimitSnapshotSource::RollingUpdate)
                     && snapshot.individual_limit.is_none()
@@ -289,6 +337,7 @@ impl ChatWidget {
             let should_warn_about_rate_limit_usage = is_codex_limit && !has_workspace_credits;
             let warnings = if should_warn_about_rate_limit_usage {
                 self.rate_limit_warnings.take_warnings(
+                    self.plan_type,
                     snapshot
                         .secondary
                         .as_ref()
@@ -334,19 +383,25 @@ impl ChatWidget {
                 self.rate_limit_switch_prompt = RateLimitSwitchPromptState::Pending;
             }
 
+            // /wham/usage identifies ordinary and additional model limits separately. Streamed
+            // updates still drive warnings/recovery above, but must not overwrite status data.
+            if matches!(source, RateLimitSnapshotSource::AccountUsage) {
+                let mut display = rate_limit_snapshot_display_for_limit(
+                    &snapshot,
+                    limit_label.clone(),
+                    Local::now(),
+                );
+                if display.individual_limit.is_none() {
+                    display.individual_limit = preserved_individual_limit;
+                }
+                self.rate_limit_snapshots_by_limit_id
+                    .insert(limit_id.clone(), display);
+            }
             let has_exhausted_quota = Self::rate_limit_snapshot_has_exhausted_quota(&snapshot);
             let has_available_quota = Self::rate_limit_snapshot_has_available_quota(&snapshot);
             let should_resume_paused_queue =
                 is_codex_limit && !has_exhausted_quota && has_available_quota;
             let should_pause_queue = is_codex_limit && has_exhausted_quota;
-
-            let mut display =
-                rate_limit_snapshot_display_for_limit(&snapshot, limit_label, Local::now());
-            if display.individual_limit.is_none() {
-                display.individual_limit = preserved_individual_limit;
-            }
-            self.rate_limit_snapshots_by_limit_id
-                .insert(limit_id, display);
 
             if !warnings.is_empty() {
                 for warning in warnings {
@@ -439,7 +494,7 @@ impl ChatWidget {
 
     #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn should_prefetch_rate_limits(&self) -> bool {
-        self.config.model_provider.requires_openai_auth && self.has_chatgpt_account
+        self.requires_openai_auth && self.has_chatgpt_account
     }
 
     fn lower_cost_preset(&self) -> Option<ModelPreset> {
@@ -451,7 +506,7 @@ impl ChatWidget {
     }
 
     fn rate_limit_switch_prompt_hidden(&self) -> bool {
-        self.config
+        self.local_settings
             .notices
             .hide_rate_limit_model_nudge
             .unwrap_or(false)
@@ -461,7 +516,9 @@ impl ChatWidget {
         if self.has_applicable_backend_banner() {
             return;
         }
-        if self.rate_limit_switch_prompt_hidden() || self.current_model() == NUDGE_MODEL_SLUG {
+        if self.rate_limit_switch_prompt_hidden()
+            || matches!(self.current_model(), NUDGE_MODEL_SLUG | LUNA_RESERVE_MODEL)
+        {
             self.rate_limit_switch_prompt = RateLimitSwitchPromptState::Idle;
             return;
         }
@@ -786,7 +843,7 @@ impl ChatWidget {
     }
 
     pub(crate) fn set_rate_limit_switch_prompt_hidden(&mut self, hidden: bool) {
-        self.config.notices.hide_rate_limit_model_nudge = Some(hidden);
+        self.local_settings.notices.hide_rate_limit_model_nudge = Some(hidden);
         if hidden {
             self.rate_limit_switch_prompt = RateLimitSwitchPromptState::Idle;
         }
