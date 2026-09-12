@@ -8,6 +8,11 @@ target="${CODEXMARATHON_TARGET:-$(rustc -vV | awk '/^host:/ {print $2}')}"
 version="${CODEXMARATHON_VERSION:-codexmarathon-dev}"
 
 case "$target" in
+  aarch64-unknown-linux-gnu)
+    # rusty_v8 does not publish the sandboxed code-mode-host archive for Linux ARM64.
+    # The primary Codex CLI and its sandbox helper remain fully native on this target.
+    binaries=(codex bwrap)
+    ;;
   *linux*)
     binaries=(codex codex-code-mode-host codex-responses-api-proxy bwrap)
     ;;
@@ -25,10 +30,11 @@ mkdir -p "${output_dir}"
   export CODEX_BWRAP_SHA256
   CODEX_BWRAP_SHA256="$(sha256sum "target/${target}/release/bwrap" | awk '{print $1}')"
   export STABLE_GIT_COMMIT="${CODEXMARATHON_UPSTREAM_COMMIT:-unknown}"
-  cargo build --locked --release --target "$target" \
-    --bin codex \
-    --bin codex-code-mode-host \
-    --bin codex-responses-api-proxy
+  cargo_build_args=(cargo build --locked --release --target "$target" --bin codex)
+  if [[ "$target" != "aarch64-unknown-linux-gnu" ]]; then
+    cargo_build_args+=(--bin codex-code-mode-host --bin codex-responses-api-proxy)
+  fi
+  "${cargo_build_args[@]}"
 )
 
 for binary in "${binaries[@]}"; do
