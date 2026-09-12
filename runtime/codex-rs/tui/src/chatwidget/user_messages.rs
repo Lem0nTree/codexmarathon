@@ -122,15 +122,15 @@ impl ThreadComposerState {
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ThreadInputState {
+    pub(crate) questions: Option<crate::bottom_pane::QuestionState>,
     pub(super) composer: Option<ThreadComposerState>,
     pub(super) safety_buffering_prompt: Option<UserMessage>,
-    pub(super) pending_steers: VecDeque<UserMessage>,
-    pub(super) pending_steer_history_records: VecDeque<UserMessageHistoryRecord>,
-    pub(super) pending_steer_compare_keys: VecDeque<PendingSteerCompareKey>,
+    pub(crate) pending_steers: VecDeque<PendingSteer>,
     pub(super) rejected_steers_queue: VecDeque<UserMessage>,
     pub(super) rejected_steer_history_records: VecDeque<UserMessageHistoryRecord>,
     pub(super) queued_user_messages: VecDeque<QueuedUserMessage>,
     pub(super) queued_user_message_history_records: VecDeque<UserMessageHistoryRecord>,
+    pub(crate) recovered_queue: bool,
     pub(super) user_turn_pending_start: bool,
     pub(super) submit_pending_steers_after_interrupt: bool,
     pub(super) current_collaboration_mode: CollaborationMode,
@@ -170,8 +170,10 @@ impl From<&str> for UserMessage {
     }
 }
 
-#[derive(Debug)]
-pub(super) struct PendingSteer {
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct PendingSteer {
+    /// Preserved across request retries and thread switches until this submission commits.
+    pub(crate) client_id: String,
     pub(super) user_message: UserMessage,
     pub(super) history_record: UserMessageHistoryRecord,
     pub(super) compare_key: PendingSteerCompareKey,
@@ -695,10 +697,7 @@ impl ChatWidget {
         }
     }
 
-    /// Build the compare key for a submitted pending steer without invoking the
-    /// expensive request-serialization path. Pending steers only need to match the
-    /// committed app-server `UserMessage` item emitted after input drains, which
-    /// preserves flattened text and total image count.
+    /// Build the legacy content key for app servers that do not echo submission IDs.
     pub(super) fn pending_steer_compare_key_from_items(
         items: &[UserInput],
     ) -> PendingSteerCompareKey {

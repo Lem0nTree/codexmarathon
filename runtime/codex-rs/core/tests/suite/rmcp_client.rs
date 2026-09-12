@@ -119,6 +119,9 @@ use tokio::time::Instant;
 use tokio::time::sleep;
 use wiremock::MockServer;
 
+#[path = "mcp_oauth_refresh_tests.rs"]
+mod oauth_refresh_tests;
+
 static OPENAI_PNG: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAD0AAAA9CAYAAAAeYmHpAAAE6klEQVR4Aeyau44UVxCGx1fZsmRLlm3Zoe0XcGQ5cUiCCIgJeS9CHgAhMkISQnIuGQgJEkBcxLW+nqnZ6uqqc+nuWRC7q/P3qetf9e+MtOwyX25O4Nep6JPyop++0qev9HrfgZ+F6r2DuB/vHOrt/UIkqdDHYvujOW6fO7h/CNEI+a5jc+pBR8uy0jVFsziYu5HtfSUk+Io34q921hLNctFSX0gwww+S8wce8K1LfCU+cYW4888aov8NxqvQILUPPReLOrm6zyLxa4i+6VZuFbJo8d1MOHZm+7VUtB/aIvhPWc/3SWg49JcwFLlHxuXKjtyloo+YNhuW3VS+WPBuUEMvCFKjEDVgFBQHXrnazpqiSxNZCkQ1kYiozsbm9Oz7l4i2Il7vGccGNWAc3XosDrZe/9P3ZnMmzHNEQw4smf8RQ87XEAMsC7Az0Au+dgXerfH4+sHvEc0SYGic8WBBUGqFH2gN7yDrazy7m2pbRTeRmU3+MjZmr1h6LJgPbGy23SI6GlYT0brQ71IY8Us4PNQCm+zepSbaD2BY9xCaAsD9IIj/IzFmKMSdHHonwdZATbTnYREf6/VZGER98N9yCWIvXQwXDoDdhZJoT8jwLnJXDB9w4Sb3e6nK5ndzlkTLnP3JBu4LKkbrYrU69gCVceV0JvpyuW1xlsUVngzhwMetn/XamtTORF9IO5YnWNiyeF9zCAfqR3fUW+vZZKLtgP+ts8BmQRBREAdRDhH3o8QuRh/YucNFz2BEjxbRN6LGzphfKmvP6v6QhqIQyZ8XNJ0W0X83MR1PEcJBNO2KC2Z1TW/v244scp9FwRViZxIOBF0Lctk7ZVSavdLvRlV1hz/ysUi9sr8CIcB3nvWBwA93ykTz18eAYxQ6N/K2DkPA1lv3iXCwmDUT7YkjIby9siXueIJj9H+pzSqJ9oIuJWTUgSSt4WO7o/9GGg0viR4VinNRUDoIj34xoCd6pxD3aK3zfdbnx5v1J3ZNNEJsE0sBG7N27ReDrJc4sFxz7dI/ZAbOmmiKvHBitQXpAdR6+F7v+/ol/tOouUV01EeMZQF2BoQDn6dP4XNr+j9GZEtEK1/L8pFw7bd3a53tsTa7WD+054jOFmPg1XBKPQgnqFfmFcy32ZRvjmiIIQTYFvyDxQ8nH8WIwwGwlyDjDznnilYyFr6njrlZwsKkBpO59A7OwgdzPEWRm+G+oeb7IfyNuzjEEVLrOVxJsxvxwF8kmCM6I2QYmJunz4u4TrADpfl7mlbRTWQ7VmrBzh3+C9f6Grc3YoGN9dg/SXFthpRsT6vobfXRs2VBlgBHXVMLHjDNbIZv1sZ9+X3hB09cXdH1JKViyG0+W9bWZDa/r2f9zAFR71sTzGpMSWz2iI4YssWjWo3REy1MDGjdwe5e0dFSiAC1JakBvu4/CUS8Eh6dqHdU0Or0ioY3W5ClSqDXAy7/6SRfgw8vt4I+tbvvNtFT2kVDhY5+IGb1rCqYaXNF08vSALsXCPmt0kQNqJT1p5eI1mkIV/BxCY1z85lOzeFbPBQHURkkPTlwTYK9gTVE25l84IbFFN+YJDHjdpn0gq6mrHht0dkcjbM4UL9283O5p77GN+SPW/QwVB4IUYg7Or+Kp7naR6qktP98LNF2UxWo9yObPIT9KYg+hK4i56no4rfnM0qeyFf6AwAAAP//trwR3wAAAAZJREFUAwBZ0sR75itw5gAAAABJRU5ErkJggg==";
 
 fn assert_wall_time_line(line: &str) {
@@ -2767,7 +2770,9 @@ async fn stdio_image_responses_are_sanitized_for_text_only_model() -> anyhow::Re
                 input_modalities: vec![InputModality::Text],
                 used_fallback_model_metadata: false,
                 supports_search_tool: false,
+                supports_experimental_context: false,
                 use_responses_lite: false,
+                guardian: None,
                 node_repl_auto_review_required: false,
                 node_repl_disabled: false,
                 auto_review_model_override: None,
@@ -3771,7 +3776,8 @@ async fn streamable_http_with_oauth_round_trip_impl() -> anyhow::Result<()> {
         "expired-access-token",
         refresh_token,
         OAuthCredentialExpiry::Expired,
-    )?;
+    )
+    .await?;
     let discovered_credential_name =
         credential_config.oauth_credential_name(discovered_server_name);
     write_fallback_oauth_tokens(
@@ -3781,7 +3787,8 @@ async fn streamable_http_with_oauth_round_trip_impl() -> anyhow::Result<()> {
         expected_token,
         refresh_token,
         OAuthCredentialExpiry::Valid,
-    )?;
+    )
+    .await?;
 
     // Phase 4: configure Codex with the OAuth-backed Streamable HTTP MCP
     // server and build the fixture in the active local or remote-aware mode.
@@ -3789,6 +3796,10 @@ async fn streamable_http_with_oauth_round_trip_impl() -> anyhow::Result<()> {
         .with_model_info_override("gpt-5.4", |model| model.supports_search_tool = false)
         .with_home(temp_home.clone())
         .with_config(move |config| {
+            config
+                .features
+                .enable(Feature::McpOAuthRefreshCoordination)
+                .expect("test config should allow coordinated MCP OAuth refresh");
             config.mcp_oauth_credentials_store_mode = OAuthCredentialsStoreMode::Auto;
             insert_mcp_server(
                 config,
@@ -3954,12 +3965,15 @@ async fn streamable_http_with_oauth_round_trip_impl() -> anyhow::Result<()> {
     .await
     .context("the newly discovered OAuth server did not recover after its store was unlocked")??;
 
-    assert!(codex_rmcp_client::delete_oauth_tokens(
-        discovered_credential_name.as_ref(),
-        http_server.url(),
-        OAuthCredentialsStoreMode::File,
-        codex_config::types::AuthKeyringBackendKind::default(),
-    )?);
+    assert!(
+        codex_rmcp_client::delete_oauth_tokens(
+            discovered_credential_name.as_ref(),
+            http_server.url(),
+            OAuthCredentialsStoreMode::File,
+            codex_config::types::AuthKeyringBackendKind::default(),
+        )
+        .await?
+    );
     fixture.codex.refresh_runtime_config(refreshed_config).await;
     let logged_out_startup = tokio::time::timeout(
         Duration::from_secs(5),
@@ -3987,7 +4001,8 @@ async fn streamable_http_with_oauth_round_trip_impl() -> anyhow::Result<()> {
         expected_token,
         refresh_token,
         OAuthCredentialExpiry::Valid,
-    )?;
+    )
+    .await?;
 
     // Phase 6: submit the user turn that should invoke the OAuth-backed tool.
     fixture
@@ -4428,7 +4443,7 @@ enum OAuthCredentialExpiry {
     Expired,
 }
 
-fn write_fallback_oauth_tokens(
+async fn write_fallback_oauth_tokens(
     server_name: &str,
     server_url: &str,
     client_id: &str,
@@ -4465,6 +4480,7 @@ fn write_fallback_oauth_tokens(
         OAuthCredentialsStoreMode::File,
         codex_config::types::AuthKeyringBackendKind::default(),
     )
+    .await
 }
 
 struct EnvVarGuard {

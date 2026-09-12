@@ -56,12 +56,22 @@ struct ShellSnapshot {
     environment: HashMap<String, String>,
 }
 
+// Keep a bounded metric label alongside the original RPC error.
+type CaptureResult = Result<ShellSnapshot, (&'static str, JSONRPCErrorError)>;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CapturePurpose {
+    Execution,
+    Prewarm,
+}
+
 impl ShellSnapshotCache {
     pub(crate) async fn prepare(
         &self,
         params: &ExecParams,
         prepared: &mut PreparedExecRequest,
         telemetry: &ExecServerTelemetry,
+        purpose: CapturePurpose,
     ) -> Result<(), JSONRPCErrorError> {
         let Some(request) = params.shell_snapshot.as_ref() else {
             return Ok(());
@@ -91,7 +101,7 @@ impl ShellSnapshotCache {
             }
         };
 
-        let snapshot = {
+        let (snapshot, attempt) = {
             let mut entries = self.entries.lock().await;
             let position = entries.iter().position(|entry| {
                 &entry.request == request
@@ -103,7 +113,8 @@ impl ShellSnapshotCache {
                 let mut entry = entries.remove(position)?;
                 // Share each failed attempt during backoff. After the retry
                 // budget is exhausted, keep falling back until eviction.
-                if entry.attempts < MAX_SNAPSHOT_ATTEMPTS
+                if purpose == CapturePurpose::Execution
+                    && entry.attempts < MAX_SNAPSHOT_ATTEMPTS
                     && let Some(Err(retry_at)) = entry.snapshot.get()
                     && Instant::now() >= *retry_at
                 {
@@ -111,8 +122,9 @@ impl ShellSnapshotCache {
                     entry.snapshot = Arc::new(OnceCell::new());
                 }
                 let snapshot = Arc::clone(&entry.snapshot);
+                let attempt = entry.attempts;
                 entries.push_back(entry);
-                Some(snapshot)
+                Some((snapshot, attempt))
             });
             if let Some(snapshot) = cached {
                 snapshot
@@ -131,26 +143,54 @@ impl ShellSnapshotCache {
                     entries.pop_front();
                 }
 
-                snapshot
+                (snapshot, 1)
             }
         };
-        let Ok(snapshot) = snapshot
-            .get_or_init(|| async {
-                let started_at = std::time::Instant::now();
-                let result = capture_snapshot(params, prepared, shell_type).await;
-                telemetry.shell_snapshot_captured(
-                    started_at.elapsed(),
-                    result.as_ref().map(|_| ()).map_err(|_| "capture_failed"),
-                );
-                result.map_err(|err| {
-                    tracing::warn!("failed to capture shell snapshot: {err:?}");
-                    Instant::now() + SNAPSHOT_RETRY_BACKOFF
-                })
-            })
-            .await
-        else {
+        let capture = async {
+            let attempt = attempt.to_string();
+            let purpose = match purpose {
+                CapturePurpose::Execution => "execution",
+                CapturePurpose::Prewarm => "prewarm",
+            };
+            let started_at = std::time::Instant::now();
+            let result = capture_snapshot(params, prepared, shell_type).await;
+            telemetry.shell_snapshot_captured(
+                started_at.elapsed(),
+                result.as_ref().map(|_| ()).map_err(|(reason, _)| *reason),
+                &[
+                    ("purpose", purpose),
+                    ("attempt", &attempt),
+                    ("shell", request.shell.name.as_str()),
+                    ("sandbox", prepared.sandbox.as_metric_tag()),
+                ],
+            );
+            result.map_err(|(_, error)| error)
+        };
+        let snapshot = match purpose {
+            CapturePurpose::Execution => {
+                snapshot
+                    .get_or_init(|| async {
+                        capture.await.map_err(|err| {
+                            tracing::warn!("failed to capture shell snapshot: {err:?}");
+                            Instant::now() + SNAPSHOT_RETRY_BACKOFF
+                        })
+                    })
+                    .await
+            }
+            CapturePurpose::Prewarm => {
+                // Leave the cell uninitialized on failure: a waiting real command
+                // can capture immediately, without spending its retry budget.
+                snapshot
+                    .get_or_try_init(|| async { capture.await.map(Ok) })
+                    .await?
+            }
+        };
+        let Ok(snapshot) = snapshot else {
             return Ok(());
         };
+        if purpose == CapturePurpose::Prewarm {
+            return Ok(());
+        }
 
         let request_overrides = params
             .env
@@ -214,15 +254,22 @@ async fn capture_snapshot(
     params: &ExecParams,
     prepared: &PreparedExecRequest,
     shell_type: ShellType,
-) -> Result<ShellSnapshot, JSONRPCErrorError> {
-    let script = snapshot_state_and_environment_script(shell_type)
-        .ok_or_else(|| invalid_params("unsupported shell snapshot script".to_string()))?;
+) -> CaptureResult {
+    let script = snapshot_state_and_environment_script(shell_type).ok_or_else(|| {
+        (
+            "unsupported_shell",
+            invalid_params("unsupported shell snapshot script".to_string()),
+        )
+    })?;
     let shell_start = prepared.command.len() - params.argv.len();
     let mut argv = prepared.command.clone();
     argv[shell_start + 2] = script;
-    let (program, args) = argv
-        .split_first()
-        .ok_or_else(|| internal_error("missing shell snapshot command".to_string()))?;
+    let (program, args) = argv.split_first().ok_or_else(|| {
+        (
+            "missing_command",
+            internal_error("missing shell snapshot command".to_string()),
+        )
+    })?;
 
     let mut command = Command::new(program);
     command
@@ -237,59 +284,86 @@ async fn capture_snapshot(
     if let Some(arg0) = &prepared.arg0 {
         command.arg0(arg0);
     }
-    let mut child = command
-        .spawn()
-        .map_err(|err| internal_error(format!("cannot capture shell snapshot: {err}")))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| internal_error("missing shell snapshot output".to_string()))?;
+    let mut child = command.spawn().map_err(|err| {
+        (
+            "spawn_failed",
+            internal_error(format!("cannot capture shell snapshot: {err}")),
+        )
+    })?;
+    let stdout = child.stdout.take().ok_or_else(|| {
+        (
+            "missing_output",
+            internal_error("missing shell snapshot output".to_string()),
+        )
+    })?;
     let capture = async {
         let mut output = Vec::new();
         stdout
             .take((MAX_SNAPSHOT_BYTES + 1) as u64)
             .read_to_end(&mut output)
             .await
-            .map_err(|err| internal_error(format!("cannot read shell snapshot: {err}")))?;
+            .map_err(|err| {
+                (
+                    "read_failed",
+                    internal_error(format!("cannot read shell snapshot: {err}")),
+                )
+            })?;
         if output.len() > MAX_SNAPSHOT_BYTES {
-            return Err(internal_error(format!(
-                "shell snapshot exceeds {MAX_SNAPSHOT_BYTES} bytes"
-            )));
+            return Err((
+                "too_large",
+                internal_error(format!("shell snapshot exceeds {MAX_SNAPSHOT_BYTES} bytes")),
+            ));
         }
-        let status = child
-            .wait()
-            .await
-            .map_err(|err| internal_error(format!("cannot finish shell snapshot: {err}")))?;
+        let status = child.wait().await.map_err(|err| {
+            (
+                "wait_failed",
+                internal_error(format!("cannot finish shell snapshot: {err}")),
+            )
+        })?;
         if !status.success() {
-            return Err(internal_error(format!(
-                "shell snapshot capture exited with {status}"
-            )));
+            return Err((
+                "nonzero_exit",
+                internal_error(format!("shell snapshot capture exited with {status}")),
+            ));
         }
         Ok(output)
     };
     let output = tokio::time::timeout(SNAPSHOT_TIMEOUT, capture)
         .await
-        .map_err(|_| internal_error("shell snapshot capture timed out".to_string()))??;
+        .map_err(|_| {
+            (
+                "timeout",
+                internal_error("shell snapshot capture timed out".to_string()),
+            )
+        })??;
 
     parse_snapshot(&output, params.env_policy.as_ref())
 }
 
-fn parse_snapshot(
-    output: &[u8],
-    env_policy: Option<&ExecEnvPolicy>,
-) -> Result<ShellSnapshot, JSONRPCErrorError> {
-    let separator = output
-        .iter()
-        .position(|byte| *byte == 0)
-        .ok_or_else(|| internal_error("shell snapshot is missing its environment".to_string()))?;
+fn parse_snapshot(output: &[u8], env_policy: Option<&ExecEnvPolicy>) -> CaptureResult {
+    let separator = output.iter().position(|byte| *byte == 0).ok_or_else(|| {
+        (
+            "missing_environment",
+            internal_error("shell snapshot is missing its environment".to_string()),
+        )
+    })?;
     let state = &output[..separator];
     let marker = b"# Snapshot file";
     let start = state
         .windows(marker.len())
         .position(|window| window == marker)
-        .ok_or_else(|| internal_error("shell snapshot is missing its state marker".to_string()))?;
-    let state = std::str::from_utf8(&state[start..])
-        .map_err(|err| internal_error(format!("shell snapshot state is not UTF-8: {err}")))?;
+        .ok_or_else(|| {
+            (
+                "missing_state",
+                internal_error("shell snapshot is missing its state marker".to_string()),
+            )
+        })?;
+    let state = std::str::from_utf8(&state[start..]).map_err(|err| {
+        (
+            "invalid_utf8",
+            internal_error(format!("shell snapshot state is not UTF-8: {err}")),
+        )
+    })?;
 
     let mut environment = output[separator + 1..]
         .split(|byte| *byte == 0)

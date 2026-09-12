@@ -26,6 +26,7 @@ use codex_protocol::approvals::GuardianAssessmentDecisionSource as CoreGuardianA
 use codex_protocol::approvals::GuardianCommandSource as CoreGuardianCommandSource;
 use codex_protocol::items::AgentMessageContent as CoreAgentMessageContent;
 pub use codex_protocol::items::AgentMessageDelivery;
+pub use codex_protocol::items::AsyncUserInputQuestion;
 use codex_protocol::items::CollabAgentTool as CoreCollabAgentTool;
 use codex_protocol::items::CollabAgentToolCallStatus as CoreCollabAgentToolCallStatus;
 use codex_protocol::items::CommandExecutionStatus as CoreCommandExecutionStatus;
@@ -255,6 +256,8 @@ pub enum ThreadItem {
         memory_citation: Option<MemoryCitation>,
         #[serde(default)]
         delivery: Option<AgentMessageDelivery>,
+        #[serde(default)]
+        questions: Option<Vec<AsyncUserInputQuestion>>,
     },
     #[serde(rename_all = "camelCase")]
     #[ts(rename_all = "camelCase")]
@@ -576,7 +579,7 @@ impl From<GuardianCommandSource> for CoreGuardianCommandSource {
 pub struct GuardianCommandReviewAction {
     pub source: GuardianCommandSource,
     pub command: String,
-    pub cwd: AbsolutePathBuf,
+    pub cwd: LegacyAppPathString,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
@@ -593,8 +596,8 @@ pub struct GuardianExecveReviewAction {
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct GuardianApplyPatchReviewAction {
-    pub cwd: AbsolutePathBuf,
-    pub files: Vec<AbsolutePathBuf>,
+    pub cwd: LegacyAppPathString,
+    pub files: Vec<LegacyAppPathString>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
@@ -636,7 +639,7 @@ pub enum GuardianApprovalReviewAction {
     Command {
         source: GuardianCommandSource,
         command: String,
-        cwd: AbsolutePathBuf,
+        cwd: LegacyAppPathString,
     },
     #[serde(rename_all = "camelCase")]
     #[ts(rename_all = "camelCase")]
@@ -658,8 +661,8 @@ pub enum GuardianApprovalReviewAction {
     #[serde(rename_all = "camelCase")]
     #[ts(rename_all = "camelCase")]
     ApplyPatch {
-        cwd: AbsolutePathBuf,
-        files: Vec<AbsolutePathBuf>,
+        cwd: LegacyAppPathString,
+        files: Vec<LegacyAppPathString>,
     },
     #[serde(rename_all = "camelCase")]
     #[ts(rename_all = "camelCase")]
@@ -881,6 +884,7 @@ impl From<CoreTurnItem> for ThreadItem {
                     phase: agent.phase,
                     memory_citation: agent.memory_citation.map(Into::into),
                     delivery: agent.delivery,
+                    questions: agent.questions,
                 }
             }
             CoreTurnItem::FunctionCallOutput(output) => ThreadItem::FunctionCallOutput {

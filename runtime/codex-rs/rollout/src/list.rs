@@ -20,7 +20,6 @@ use super::SESSIONS_SUBDIR;
 use super::compression;
 use super::rollout_file_name::RolloutFileName;
 use crate::RolloutItem;
-use crate::RolloutLine;
 use crate::protocol::EventMsg;
 use crate::state_db;
 use codex_file_search as file_search;
@@ -28,6 +27,7 @@ use codex_protocol::RolloutId;
 use codex_protocol::SanitizedGitUrl;
 use codex_protocol::ThreadId;
 use codex_protocol::items::TurnItem;
+use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::ThreadHistoryMode;
@@ -50,6 +50,8 @@ pub struct ThreadsPage {
 /// Summary information for a thread rollout file.
 #[derive(Debug, PartialEq, Default)]
 pub struct ThreadItem {
+    /// Originator recorded at creation, if available.
+    pub originator: Option<String>,
     /// Absolute path to the rollout file.
     pub path: PathBuf,
     /// Thread ID from session metadata.
@@ -62,6 +64,8 @@ pub struct ThreadItem {
     pub section: Option<codex_state::ThreadSection>,
     /// Canonical project assignment in SQLite-owned metadata.
     pub project_id: Option<String>,
+    /// Saved Daybreak choice in SQLite-owned metadata, when available.
+    pub daybreak_enabled: Option<bool>,
     /// Working directory from session metadata.
     pub cwd: Option<PathBuf>,
     /// Git branch from session metadata.
@@ -82,6 +86,10 @@ pub struct ThreadItem {
     pub agent_role: Option<String>,
     /// Model provider from session metadata.
     pub model_provider: Option<String>,
+    /// Latest persisted model in SQLite-owned metadata, when available.
+    pub model: Option<String>,
+    /// Latest persisted reasoning effort in SQLite-owned metadata, when available.
+    pub reasoning_effort: Option<ReasoningEffort>,
     /// CLI version from session metadata.
     pub cli_version: Option<String>,
     /// RFC3339 timestamp string for when the session was created, if available.
@@ -102,6 +110,7 @@ pub type ConversationsPage = ThreadsPage;
 
 #[derive(Default)]
 struct HeadTailSummary {
+    originator: Option<String>,
     saw_session_meta: bool,
     thread_id: Option<ThreadId>,
     first_user_message: Option<String>,
@@ -811,6 +820,7 @@ async fn build_thread_item(
     // Apply filters: must have session meta and a discoverable preview.
     if summary.saw_session_meta && summary.preview.is_some() {
         let HeadTailSummary {
+            originator,
             thread_id,
             first_user_message,
             preview,
@@ -833,12 +843,14 @@ async fn build_thread_item(
             summary_updated_at = updated_at.or_else(|| created_at.clone());
         }
         return Some(ThreadItem {
+            originator,
             path,
             thread_id,
             first_user_message,
             preview,
             section: None,
             project_id: None,
+            daybreak_enabled: None,
             cwd,
             git_branch,
             git_sha,
@@ -849,6 +861,8 @@ async fn build_thread_item(
             agent_nickname,
             agent_role,
             model_provider,
+            model: None,
+            reasoning_effort: None,
             cli_version,
             created_at,
             recency_at: summary_updated_at.clone(),
@@ -1121,7 +1135,7 @@ async fn read_head_summary(path: &Path, head_limit: usize) -> io::Result<HeadTai
         }
         lines_scanned += 1;
 
-        let parsed: Result<RolloutLine, _> = serde_json::from_str(trimmed);
+        let parsed = crate::parse_rollout_line(trimmed);
         let rollout_line = match parsed {
             Ok(rollout_line) => rollout_line,
             Err(_) => {
@@ -1140,6 +1154,8 @@ async fn read_head_summary(path: &Path, head_limit: usize) -> io::Result<HeadTai
         match rollout_line.item {
             RolloutItem::SessionMeta(session_meta_line) => {
                 if !summary.saw_session_meta {
+                    summary.originator = (!session_meta_line.meta.originator.is_empty())
+                        .then(|| session_meta_line.meta.originator.clone());
                     summary.source = Some(session_meta_line.meta.source.clone());
                     summary.history_mode = session_meta_line.meta.history_mode;
                     summary.parent_thread_id = session_meta_line.meta.parent_thread_id;
@@ -1174,7 +1190,12 @@ async fn read_head_summary(path: &Path, head_limit: usize) -> io::Result<HeadTai
             RolloutItem::TurnContext(_) => {
                 // Not included in `head`; skip.
             }
-            RolloutItem::WorldState(_) | RolloutItem::SecurityRiskScore(_) => {
+            RolloutItem::TokenUsageRecord(_) => {
+                // Not included in `head`; skip.
+            }
+            RolloutItem::RetainedContext(_)
+            | RolloutItem::WorldState(_)
+            | RolloutItem::SecurityRiskScore(_) => {
                 // Not included in `head`; skip.
             }
             RolloutItem::RealtimeItem(_) => {
@@ -1229,7 +1250,7 @@ pub async fn read_head_for_summary(path: &Path) -> io::Result<Vec<serde_json::Va
         if trimmed.is_empty() {
             continue;
         }
-        if let Ok(rollout_line) = serde_json::from_str::<RolloutLine>(trimmed) {
+        if let Ok(rollout_line) = crate::parse_rollout_line(trimmed) {
             match rollout_line.item {
                 RolloutItem::SessionMeta(session_meta_line) => {
                     if let Ok(value) = serde_json::to_value(session_meta_line) {
@@ -1249,8 +1270,10 @@ pub async fn read_head_for_summary(path: &Path) -> io::Result<Vec<serde_json::Va
                 RolloutItem::InterAgentCommunicationMetadata { .. }
                 | RolloutItem::Compacted(_)
                 | RolloutItem::TurnContext(_)
+                | RolloutItem::TokenUsageRecord(_)
                 | RolloutItem::WorldState(_)
                 | RolloutItem::RealtimeItem(_)
+                | RolloutItem::RetainedContext(_)
                 | RolloutItem::SecurityRiskScore(_)
                 | RolloutItem::EventMsg(_) => {}
             }
@@ -1286,7 +1309,7 @@ pub async fn read_session_meta_line(path: &Path) -> io::Result<SessionMetaLine> 
         if trimmed.is_empty() {
             continue;
         }
-        let Ok(rollout_line) = serde_json::from_str::<RolloutLine>(trimmed) else {
+        let Ok(rollout_line) = crate::parse_rollout_line(trimmed) else {
             if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
                 crate::recorder::reject_unknown_thread_history_mode(&value)?;
             }
@@ -1303,8 +1326,10 @@ pub async fn read_session_meta_line(path: &Path) -> io::Result<SessionMetaLine> 
             RolloutItem::InterAgentCommunicationMetadata { .. }
             | RolloutItem::Compacted(_)
             | RolloutItem::TurnContext(_)
+            | RolloutItem::TokenUsageRecord(_)
             | RolloutItem::WorldState(_)
             | RolloutItem::RealtimeItem(_)
+            | RolloutItem::RetainedContext(_)
             | RolloutItem::SecurityRiskScore(_)
             | RolloutItem::EventMsg(_) => {}
         }

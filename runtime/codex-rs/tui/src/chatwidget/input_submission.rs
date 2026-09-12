@@ -36,10 +36,12 @@ impl ChatWidget {
     fn submit_shell_command(&mut self, command: &str) -> QueueDrain {
         let cmd = command.trim();
         if cmd.is_empty() {
-            self.add_to_history(history_cell::new_info_event(
-                USER_SHELL_COMMAND_HELP_TITLE.to_string(),
-                Some(USER_SHELL_COMMAND_HELP_HINT.to_string()),
-            ));
+            self.app_event_tx.send(AppEvent::InsertHistoryCell(Box::new(
+                history_cell::new_info_event(
+                    USER_SHELL_COMMAND_HELP_TITLE.to_string(),
+                    Some(USER_SHELL_COMMAND_HELP_HINT.to_string()),
+                ),
+            )));
             QueueDrain::Continue
         } else {
             self.submit_op(AppCommand::run_user_shell_command(cmd.to_string()));
@@ -105,13 +107,13 @@ impl ChatWidget {
         .1
     }
 
-    fn submit_user_message_with_history_and_shell_escape_policy(
+    pub(super) fn submit_user_message_with_history_and_shell_escape_policy(
         &mut self,
         user_message: UserMessage,
         history_record: UserMessageHistoryRecord,
         shell_escape_policy: ShellEscapePolicy,
     ) -> (bool, Option<AppCommand>) {
-        if self.misalignment_policy_violation {
+        if self.has_misalignment_policy_violation() {
             return (false, None);
         }
         if self.input_queue.rate_limit_recovery_pending {
@@ -345,7 +347,9 @@ impl ChatWidget {
         } else {
             None
         };
+        let client_user_message_id = uuid::Uuid::new_v4().to_string();
         let pending_steer = (!render_in_history).then(|| PendingSteer {
+            client_id: client_user_message_id.clone(),
             user_message: UserMessage {
                 text: text.clone(),
                 local_images: local_images.clone(),
@@ -364,6 +368,7 @@ impl ChatWidget {
         let service_tier = self.service_tier_update_for_core();
         let active_permission_profile = self.config.permissions.active_permission_profile();
         let op = AppCommand::user_turn(
+            client_user_message_id,
             items,
             self.config.cwd.to_path_buf(),
             AskForApproval::from(self.config.permissions.approval_policy.value()),

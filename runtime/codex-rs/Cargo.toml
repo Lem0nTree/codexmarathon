@@ -9,6 +9,7 @@ members = [
     "bwrap",
     "build-info",
     "ansi-escape",
+    "attachment-store",
     "async-utils",
     "app-server",
     "app-server-transport",
@@ -36,6 +37,7 @@ members = [
     "collaboration-mode-templates",
     "connectors",
     "config",
+    "config-schema",
     "context-fragments",
     "shell-command",
     "shell-escalation",
@@ -77,14 +79,16 @@ members = [
     "lmstudio",
     "login",
     "codex-mcp",
-    "mcp-server",
     "memories/read",
     "memories/write",
     "model-provider-info",
+    "mxc-sandbox",
     "models-manager",
     "network-proxy",
     "ollama",
     "process-hardening",
+    "realtime-webrtc",
+    "voice-host",
     "protocol",
     "prompts",
     "rollout",
@@ -95,10 +99,12 @@ members = [
     "sandboxing",
     "stdio-to-uds",
     "otel",
+    "otel-trace-websocket",
     "tui",
     "tools",
     "v8-poc",
     "websocket-client",
+    "windows-sandbox-service",
     "worktree",
     "workload-identity",
     "utils/absolute-path",
@@ -107,6 +113,7 @@ members = [
     "utils/cargo-bin",
     "git-utils",
     "utils/cache",
+    "utils/git-discovery",
     "utils/image",
     "utils/json-to-toml",
     "utils/home-dir",
@@ -143,7 +150,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.152.0"
+version = "0.154.0"
 # Track the edition for all workspace crates in one place. Individual
 # crates can still override this value, but keeping it here means new
 # crates created with `cargo new -w ...` automatically inherit the 2024
@@ -153,6 +160,7 @@ license = "Apache-2.0"
 
 [workspace.dependencies]
 # Internal
+codex-realtime-webrtc = { path = "realtime-webrtc" }
 app_test_support = { path = "app-server/tests/common" }
 codex-analytics = { path = "analytics" }
 codex-agent-graph-store = { path = "agent-graph-store" }
@@ -160,6 +168,7 @@ codex-agent-identity = { path = "agent-identity" }
 codex-agent-roles = { path = "agent-roles" }
 codex-ansi-escape = { path = "ansi-escape" }
 codex-api = { path = "codex-api" }
+codex-attachment-store = { path = "attachment-store" }
 codex-aws-auth = { path = "aws-auth" }
 codex-app-server = { path = "app-server" }
 codex-app-server-transport = { path = "app-server-transport" }
@@ -172,6 +181,7 @@ codex-apply-patch = { path = "apply-patch" }
 codex-arg0 = { path = "arg0" }
 codex-async-utils = { path = "async-utils" }
 codex-backend-client = { path = "backend-client" }
+codex-build-info = { path = "build-info" }
 codex-chatgpt = { path = "chatgpt" }
 codex-client = { path = "codex-client" }
 codex-collaboration-mode-templates = { path = "collaboration-mode-templates" }
@@ -228,12 +238,13 @@ codex-memories-read = { path = "memories/read" }
 codex-memories-write = { path = "memories/write" }
 codex-mcp = { path = "codex-mcp" }
 codex-mcp-extension = { path = "ext/mcp" }
-codex-mcp-server = { path = "mcp-server" }
 codex-model-provider-info = { path = "model-provider-info" }
 codex-models-manager = { path = "models-manager" }
+codex-mxc-sandbox = { path = "mxc-sandbox" }
 codex-network-proxy = { path = "network-proxy" }
 codex-ollama = { path = "ollama" }
 codex-otel = { path = "otel" }
+codex-otel-trace-websocket = { path = "otel-trace-websocket" }
 codex-plugin = { path = "plugin" }
 codex-model-provider = { path = "model-provider" }
 codex-process-hardening = { path = "process-hardening" }
@@ -267,6 +278,7 @@ codex-utils-cargo-bin = { path = "utils/cargo-bin" }
 codex-utils-cli = { path = "utils/cli" }
 codex-utils-elapsed = { path = "utils/elapsed" }
 codex-utils-fuzzy-match = { path = "utils/fuzzy-match" }
+codex-utils-git-discovery = { path = "utils/git-discovery" }
 codex-utils-home-dir = { path = "utils/home-dir" }
 codex-utils-image = { path = "utils/image" }
 codex-utils-json-to-toml = { path = "utils/json-to-toml" }
@@ -279,6 +291,7 @@ codex-utils-pty = { path = "utils/pty" }
 codex-utils-redacted-string = { path = "utils/redacted-string" }
 codex-utils-rustls-provider = { path = "utils/rustls-provider" }
 codex-utils-sandbox-summary = { path = "utils/sandbox-summary" }
+codex-worktree = { path = "worktree" }
 codex-utils-sleep-inhibitor = { path = "utils/sleep-inhibitor" }
 codex-utils-stream-parser = { path = "utils/stream-parser" }
 codex-utils-string = { path = "utils/string" }
@@ -289,12 +302,14 @@ codex-windows-sandbox = { path = "windows-sandbox-rs" }
 codexmarathon-runtime = { path = "codexmarathon-runtime" }
 codexmarathon-runtime-adapter = { path = "../codexmarathon-adapter" }
 core_test_support = { path = "core/tests/common" }
-mcp_test_support = { path = "mcp-server/tests/common" }
 
 # External
+learning_mode_windows = { git = "https://github.com/microsoft/mxc", rev = "6cd3d58f05d3447e67109cfb75e042803b843ca4" }
+wxc_common = { git = "https://github.com/microsoft/mxc", rev = "6cd3d58f05d3447e67109cfb75e042803b843ca4" }
 age = "0.11.1"
 ansi-to-tui = "8.0.1"
 anyhow = "1"
+appcontainer_common = { git = "https://github.com/microsoft/mxc", rev = "6cd3d58f05d3447e67109cfb75e042803b843ca4" }
 arboard = { version = "3", features = ["wayland-data-control"] }
 arc-swap = "1.9.0"
 assert_cmd = "2"
@@ -407,7 +422,7 @@ rcgen = { version = "0.14.7", default-features = false, features = [
 regex = "1.12.3"
 regex-lite = "0.1.8"
 reqwest = { version = "0.12", features = ["cookies"] }
-rmcp = { version = "=3.1.3", default-features = false }
+rmcp = { version = "=3.2.0", default-features = false }
 runfiles = { git = "https://github.com/dzbarsky/rules_rust", rev = "b56cbaa8465e74127f1ea216f813cd377295ad81" }
 rustix = { version = "1.1.4", features = ["net"] }
 rustls = { version = "0.23", default-features = false, features = [
@@ -464,6 +479,7 @@ tempfile = "3.23.0"
 test-log = "0.2.19"
 textwrap = "0.16.2"
 thiserror = "2.0.17"
+tikv-jemallocator = "=0.7.0"
 time = "0.3.47"
 tiny_http = "0.12"
 tokio = "1"

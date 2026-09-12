@@ -1,3 +1,4 @@
+use crate::ApplicationRequirementsToml;
 use codex_features::FeatureToml;
 use codex_protocol::config_types::ApprovalsReviewer;
 use codex_protocol::config_types::ForcedLoginMethod;
@@ -14,8 +15,10 @@ use serde::de::value::Error as ValueDeserializerError;
 use serde::de::value::StrDeserializer;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::convert::Infallible;
 use std::fmt;
 use std::path::PathBuf;
+use std::str::FromStr;
 use wildmatch::WildMatchPattern;
 
 use super::requirements_exec_policy::RequirementsExecPolicyToml;
@@ -187,6 +190,7 @@ pub struct ConfigRequirements {
     pub enforce_residency: ConstrainedWithSource<Option<ResidencyRequirement>>,
     /// Managed network constraints derived from requirements.
     pub network: Option<Sourced<NetworkConstraints>>,
+    pub application: Option<Sourced<ApplicationRequirementsToml>>,
     /// Managed filesystem constraints derived from requirements.
     pub filesystem: Option<Sourced<FilesystemConstraints>>,
     /// Managed instructions included independently of ordinary developer instructions.
@@ -245,6 +249,7 @@ impl Default for ConfigRequirements {
                 /*source*/ None,
             ),
             network: None,
+            application: None,
             filesystem: None,
             additional_developer_instructions: None,
             guardian_policy_config_source: None,
@@ -426,6 +431,28 @@ pub struct NetworkRequirementsToml {
     pub managed_allowed_domains_only: Option<bool>,
     pub unix_sockets: Option<NetworkUnixSocketPermissionsToml>,
     pub allow_local_binding: Option<bool>,
+    /// Requirements-only header injections. These annotate matching requests
+    /// without changing whether non-matching requests are allowed.
+    pub header_injections: Option<Vec<NetworkHeaderInjectionToml>>,
+}
+
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct NetworkHeaderInjectionToml {
+    pub host: String,
+    pub methods: Vec<String>,
+    pub path_prefixes: Vec<String>,
+    pub headers: BTreeMap<String, String>,
+}
+
+impl std::fmt::Debug for NetworkHeaderInjectionToml {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NetworkHeaderInjectionToml")
+            .field("host", &self.host)
+            .field("methods", &self.methods)
+            .field("path_prefixes", &self.path_prefixes)
+            .field("header_names", &self.headers.keys().collect::<Vec<_>>())
+            .finish()
+    }
 }
 
 #[derive(Deserialize)]
@@ -448,6 +475,7 @@ struct RawNetworkRequirementsToml {
     #[serde(default)]
     allow_unix_sockets: Option<Vec<String>>,
     allow_local_binding: Option<bool>,
+    header_injections: Option<Vec<NetworkHeaderInjectionToml>>,
 }
 
 impl<'de> Deserialize<'de> for NetworkRequirementsToml {
@@ -470,6 +498,7 @@ impl<'de> Deserialize<'de> for NetworkRequirementsToml {
             unix_sockets,
             allow_unix_sockets,
             allow_local_binding,
+            header_injections,
         } = raw;
 
         if domains.is_some() && (allowed_domains.is_some() || denied_domains.is_some()) {
@@ -497,6 +526,7 @@ impl<'de> Deserialize<'de> for NetworkRequirementsToml {
             unix_sockets: unix_sockets
                 .or_else(|| legacy_unix_socket_permissions_from_list(allow_unix_sockets)),
             allow_local_binding,
+            header_injections,
         })
     }
 }
@@ -548,6 +578,7 @@ pub struct NetworkConstraints {
     pub managed_allowed_domains_only: Option<bool>,
     pub unix_sockets: Option<NetworkUnixSocketPermissionsToml>,
     pub allow_local_binding: Option<bool>,
+    pub header_injections: Option<Vec<NetworkHeaderInjectionToml>>,
 }
 
 impl<'de> Deserialize<'de> for NetworkConstraints {
@@ -573,6 +604,7 @@ impl From<NetworkRequirementsToml> for NetworkConstraints {
             managed_allowed_domains_only,
             unix_sockets,
             allow_local_binding,
+            header_injections,
         } = value;
         Self {
             enabled,
@@ -585,6 +617,7 @@ impl From<NetworkRequirementsToml> for NetworkConstraints {
             managed_allowed_domains_only,
             unix_sockets,
             allow_local_binding,
+            header_injections,
         }
     }
 }
@@ -822,11 +855,53 @@ impl FeatureRequirementsToml {
 #[derive(Deserialize, Debug, Clone, Default, PartialEq, Eq)]
 pub struct AppToolRequirementToml {
     pub approval_mode: Option<AppToolApproval>,
+    /// Opt-in analytics extraction for this exact tool, not a tool argument.
+    /// The highest-priority rule wins as a whole, including unsupported formats.
+    pub analytics_result_source: Option<AppToolResultSourceRequirementToml>,
+}
+
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AppToolResultSourceRequirementToml {
+    /// Result format to parse; currently only `detailed_message_search_v1` is supported.
+    pub format: AppToolResultSourceFormat,
+    /// Source kind emitted alongside each extracted ID.
+    #[serde(rename = "type")]
+    pub source_type: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AppToolResultSourceFormat {
+    DetailedMessageSearchV1,
+    /// Keep unknown formats so higher-priority rules still override lower ones.
+    Unknown(String),
+}
+
+impl FromStr for AppToolResultSourceFormat {
+    type Err = Infallible;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Ok(match value {
+            "detailed_message_search_v1" => Self::DetailedMessageSearchV1,
+            _ => Self::Unknown(value.to_string()),
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for AppToolResultSourceFormat {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(D::Error::custom)
+    }
 }
 
 impl AppToolRequirementToml {
     pub fn is_empty(&self) -> bool {
-        self.approval_mode.is_none()
+        self.approval_mode.is_none() && self.analytics_result_source.is_none()
     }
 }
 
@@ -897,6 +972,9 @@ pub(crate) fn merge_app_requirements_descending(
             if base_tool.approval_mode.is_none() {
                 base_tool.approval_mode = incoming_tool.approval_mode;
             }
+            if base_tool.analytics_result_source.is_none() {
+                base_tool.analytics_result_source = incoming_tool.analytics_result_source;
+            }
         }
     }
 }
@@ -940,6 +1018,7 @@ pub struct ConfigRequirementsToml {
     pub enforce_residency: Option<ResidencyRequirement>,
     #[serde(rename = "experimental_network")]
     pub network: Option<NetworkRequirementsToml>,
+    pub application: Option<ApplicationRequirementsToml>,
     pub permissions: Option<PermissionsRequirementsToml>,
     pub auto_review: Option<AutoReviewRequirementsToml>,
     pub models: Option<ModelsRequirementsToml>,
@@ -1042,6 +1121,7 @@ pub struct ConfigRequirementsWithSources {
     pub rules: Option<Sourced<RequirementsExecPolicyToml>>,
     pub enforce_residency: Option<Sourced<ResidencyRequirement>>,
     pub network: Option<Sourced<NetworkRequirementsToml>>,
+    pub application: Option<Sourced<ApplicationRequirementsToml>>,
     pub permissions: Option<Sourced<PermissionsRequirementsToml>>,
     pub auto_review: Option<Sourced<AutoReviewRequirementsToml>>,
     pub models: Option<Sourced<ModelsRequirementsToml>>,
@@ -1102,6 +1182,7 @@ impl ConfigRequirementsWithSources {
             rules: _,
             enforce_residency: _,
             network: _,
+            application: _,
             permissions: _,
             auto_review: _,
             models: _,
@@ -1154,6 +1235,7 @@ impl ConfigRequirementsWithSources {
                 rules,
                 enforce_residency,
                 network,
+                application,
                 permissions,
                 models,
                 additional_developer_instructions,
@@ -1237,6 +1319,7 @@ impl ConfigRequirementsWithSources {
             rules,
             enforce_residency,
             network,
+            application,
             permissions,
             auto_review,
             models,
@@ -1279,6 +1362,7 @@ impl ConfigRequirementsWithSources {
             rules: rules.map(|sourced| sourced.value),
             enforce_residency: enforce_residency.map(|sourced| sourced.value),
             network: network.map(|sourced| sourced.value),
+            application: application.map(|sourced| sourced.value),
             permissions: permissions.map(|sourced| sourced.value),
             auto_review: auto_review.map(|sourced| sourced.value),
             models: models.map(|sourced| sourced.value),
@@ -1417,6 +1501,10 @@ impl ConfigRequirementsToml {
             && self.rules.is_none()
             && self.enforce_residency.is_none()
             && self.network.is_none()
+            && self
+                .application
+                .as_ref()
+                .is_none_or(|application| application.network.is_none())
             && self.permissions.is_none()
             && self.auto_review.as_ref().is_none_or(|auto_review| {
                 auto_review.ignore_rules.as_ref().is_none_or(Vec::is_empty)
@@ -1603,6 +1691,7 @@ impl TryFrom<ConfigRequirementsWithSources> for ConfigRequirements {
             rules,
             enforce_residency,
             network,
+            application,
             permissions,
             auto_review,
             models: _,
@@ -1962,6 +2051,7 @@ impl TryFrom<ConfigRequirementsWithSources> for ConfigRequirements {
             exec_policy,
             enforce_residency,
             network,
+            application,
             filesystem,
             additional_developer_instructions,
             guardian_policy_config_source,
@@ -2140,6 +2230,7 @@ mod tests {
             rules,
             enforce_residency,
             network,
+            application,
             permissions,
             auto_review,
             models,
@@ -2200,6 +2291,7 @@ mod tests {
             enforce_residency: enforce_residency
                 .map(|value| Sourced::new(value, RequirementSource::Unknown)),
             network: network.map(|value| Sourced::new(value, RequirementSource::Unknown)),
+            application: application.map(|value| Sourced::new(value, RequirementSource::Unknown)),
             permissions: permissions.map(|value| Sourced::new(value, RequirementSource::Unknown)),
             auto_review: auto_review.map(|value| Sourced::new(value, RequirementSource::Unknown)),
             models: models.map(|value| Sourced::new(value, RequirementSource::Unknown)),
@@ -2390,6 +2482,7 @@ mod tests {
         assert_eq!(
             requirements.browser_use,
             Some(BrowserUseRequirementsToml {
+                allow_webmcp: None,
                 allow_history_access: Some(false),
                 disable_auto_review: Some(true),
                 allow_global_persistent_approval: Some(false),
@@ -2622,6 +2715,7 @@ mod tests {
             entries: BTreeMap::from([("personality".to_string(), true)]),
         };
         let browser_use = BrowserUseRequirementsToml {
+            allow_webmcp: None,
             allow_history_access: Some(false),
             disable_auto_review: Some(true),
             allow_global_persistent_approval: None,
@@ -2702,6 +2796,7 @@ mod tests {
             rules: None,
             enforce_residency: Some(enforce_residency),
             network: None,
+            application: None,
             permissions: None,
             auto_review: Some(auto_review.clone()),
             models: Some(models.clone()),
@@ -2786,6 +2881,7 @@ mod tests {
                 rules: None,
                 enforce_residency: Some(Sourced::new(enforce_residency, enforce_source)),
                 network: None,
+                application: None,
                 permissions: None,
                 auto_review: Some(Sourced::new(auto_review, source.clone())),
                 models: Some(Sourced::new(models, source.clone())),
@@ -2841,6 +2937,7 @@ mod tests {
                 rules: None,
                 enforce_residency: None,
                 network: None,
+                application: None,
                 permissions: None,
                 models: None,
                 guardian_policy_config: None,
@@ -2900,6 +2997,7 @@ mod tests {
                 rules: None,
                 enforce_residency: None,
                 network: None,
+                application: None,
                 permissions: None,
                 models: None,
                 guardian_policy_config: None,
@@ -3093,6 +3191,7 @@ allowed_approvals_reviewers = ["user"]
                                 "calendar/list_events".to_string(),
                                 AppToolRequirementToml {
                                     approval_mode: Some(AppToolApproval::Approve),
+                                    analytics_result_source: None,
                                 },
                             )]),
                         }),
@@ -3100,6 +3199,56 @@ allowed_approvals_reviewers = ["user"]
                 )]),
             })
         );
+        Ok(())
+    }
+
+    #[test]
+    fn app_tool_result_source_requirements_parse_and_merge() -> Result<()> {
+        let rule = r#"
+            [apps.connector_123123.tools."messages/search"]
+            analytics_result_source = { format = "detailed_message_search_v1", type = "message_room" }
+            "#;
+        let requirements: ConfigRequirementsToml = from_str(rule)?;
+        assert!(!requirements.is_empty());
+        let source = requirements.apps.expect("apps should be present");
+
+        for higher_rule in [
+            None,
+            Some(("unsupported", "other_resource")),
+            Some(("detailed_message_search_v1", "other_resource")),
+        ] {
+            let mut merged = source.clone();
+            merged
+                .apps
+                .get_mut("connector_123123")
+                .expect("app should be present")
+                .tools
+                .as_mut()
+                .expect("tools should be present")
+                .tools
+                .get_mut("messages/search")
+                .expect("tool should be present")
+                .analytics_result_source = higher_rule.map(|(format, source_type)| {
+                from_str(&format!("format = {format:?}\ntype = {source_type:?}"))
+                    .expect("complete source rule should parse, including unknown formats")
+            });
+            let expected = if higher_rule.is_none() {
+                source.clone()
+            } else {
+                merged.clone()
+            };
+
+            merge_app_requirements_descending(&mut merged, source.clone());
+
+            assert_eq!(merged, expected);
+        }
+
+        for incomplete_rule in [
+            r#"format = "detailed_message_search_v1""#,
+            r#"type = "message_room""#,
+        ] {
+            assert!(from_str::<AppToolResultSourceRequirementToml>(incomplete_rule).is_err());
+        }
         Ok(())
     }
 
@@ -3135,6 +3284,7 @@ allowed_approvals_reviewers = ["user"]
                             tool_name.to_string(),
                             AppToolRequirementToml {
                                 approval_mode: Some(approval_mode),
+                                analytics_result_source: None,
                             },
                         )]),
                     }),
@@ -4132,6 +4282,14 @@ command = "python3 /enterprise/hooks/pre.py"
             [experimental_network.unix_sockets]
             "/tmp/example.sock" = "allow"
             "/tmp/blocked.sock" = "deny"
+
+            [[experimental_network.header_injections]]
+            host = "api.example.com"
+            methods = ["POST"]
+            path_prefixes = ["/console/v1"]
+
+            [experimental_network.header_injections.headers]
+            "x-statsig-change-source" = "codex"
         "#;
 
         let source = RequirementSource::LegacyManagedConfigTomlFromMdm;
@@ -4189,6 +4347,21 @@ command = "python3 /enterprise/hooks/pre.py"
             })
         );
         assert_eq!(sourced_network.value.allow_local_binding, Some(false));
+        assert_eq!(
+            sourced_network.value.header_injections,
+            Some(vec![NetworkHeaderInjectionToml {
+                host: "api.example.com".to_string(),
+                methods: vec!["POST".to_string()],
+                path_prefixes: vec!["/console/v1".to_string()],
+                headers: BTreeMap::from([(
+                    "x-statsig-change-source".to_string(),
+                    "codex".to_string(),
+                )]),
+            }])
+        );
+        let debug = format!("{:?}", sourced_network.value.header_injections);
+        assert!(debug.contains("x-statsig-change-source"));
+        assert!(!debug.contains("codex"));
 
         Ok(())
     }

@@ -305,6 +305,17 @@ async fn parent_owned_thread_blocks_settings_shortcuts() {
 }
 
 #[tokio::test]
+async fn disconnect_restores_initial_prompt_without_submitting_it() {
+    let (mut chat, _events, mut ops) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.initial_user_message = Some("CLI prompt".into());
+    chat.restore_user_message_to_composer("typed draft".into());
+    chat.pause_for_disconnect();
+    chat.submit_initial_user_message_if_pending();
+    assert_eq!(chat.composer_text_with_pending(), "CLI prompt\ntyped draft");
+    assert_no_submit_op(&mut ops);
+}
+
+#[tokio::test]
 async fn parent_owned_thread_restores_pending_initial_prompt() {
     let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ Some("gpt-5")).await;
     let pending_prompt = "keep this startup prompt".to_string();
@@ -1232,7 +1243,7 @@ async fn startup_draft_handoff_keeps_vim_insert_mode_for_nonempty_drafts() {
         let startup_draft = startup_chat.bottom_pane.composer_draft_snapshot();
 
         let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-        chat.config.tui_vim_mode_default = true;
+        chat.local_settings.tui.vim_mode_default = true;
         chat.bottom_pane.set_vim_enabled(/*enabled*/ true);
         chat.restore_startup_draft(startup_draft);
         chat.bottom_pane
@@ -1745,18 +1756,21 @@ async fn restore_thread_input_state_applies_running_state_policy() {
         text_elements: Vec::new(),
     });
     let input_state = ThreadInputState {
+        questions: None,
         composer: Some(ThreadComposerState {
             text: "composer draft".to_string(),
             ..Default::default()
         }),
         safety_buffering_prompt: Some(UserMessage::from("buffered prompt")),
-        pending_steers: VecDeque::from([UserMessage::from("submitted to the interrupted turn")]),
-        pending_steer_history_records: VecDeque::from([pending_history.clone()]),
-        pending_steer_compare_keys: VecDeque::new(),
+        pending_steers: VecDeque::from([PendingSteer {
+            history_record: pending_history.clone(),
+            ..pending_steer("submitted to the interrupted turn")
+        }]),
         rejected_steers_queue: VecDeque::new(),
         rejected_steer_history_records: VecDeque::new(),
         queued_user_messages: VecDeque::from([UserMessage::from("already queued").into()]),
         queued_user_message_history_records: VecDeque::from([queued_history.clone()]),
+        recovered_queue: false,
         user_turn_pending_start: true,
         submit_pending_steers_after_interrupt: true,
         current_collaboration_mode: chat.current_collaboration_mode.clone(),
@@ -1789,6 +1803,21 @@ async fn restore_thread_input_state_applies_running_state_policy() {
         chat.safety_buffering_prompt,
         Some(UserMessage::from("buffered prompt"))
     );
+
+    chat.pause_for_disconnect();
+    chat.handle_disconnected_key(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT));
+    assert!(!chat.has_queued_follow_up_messages());
+    // Editing the last queued draft must not release the uncertain steer for replay.
+    assert!(chat.capture_thread_input_state().unwrap().recovered_queue);
+    chat.handle_disconnected_key(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT));
+    assert_eq!(
+        chat.composer_text_with_pending(),
+        "submitted history\nqueued history"
+    );
+    assert!(chat.input_queue.pending_steers.is_empty());
+    assert!(!chat.capture_thread_input_state().unwrap().recovered_queue);
+    assert_no_submit_op(&mut op_rx);
+    chat.set_queue_autosend_suppressed(/*suppressed*/ false);
 
     chat.restore_thread_input_state(
         Some(input_state),
@@ -2385,4 +2414,45 @@ async fn interrupt_prepends_queued_messages_before_existing_composer_text() {
     );
 
     let _ = drain_insert_history(&mut rx);
+}
+
+#[tokio::test]
+async fn reconnect_holds_only_recovered_input_until_manually_edited() {
+    for (recovered, pending_start) in [
+        (None, false),
+        (Some("review this old input"), false),
+        (Some("unacknowledged prompt"), true),
+    ] {
+        let (mut chat, _rx, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
+        if let Some(text) = recovered {
+            if pending_start {
+                chat.input_queue.user_turn_pending_start = true;
+                chat.safety_buffering_prompt = Some(UserMessage::from(text));
+            } else {
+                chat.input_queue
+                    .queued_user_messages
+                    .push_back(UserMessage::from(text).into());
+            }
+        }
+        chat.pause_for_disconnect();
+        let input = chat.capture_thread_input_state();
+        let (mut chat, _rx, mut ops) = make_chatwidget_manual(/*model_override*/ None).await;
+        chat.thread_id = Some(ThreadId::new());
+        chat.restore_reconnected_input(input);
+        chat.set_queue_autosend_suppressed(/*suppressed*/ false);
+        if let Some(text) = recovered {
+            assert!(!chat.maybe_send_next_queued_input());
+            chat.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT));
+            assert_eq!(chat.bottom_pane.composer_text(), text);
+            assert_no_submit_op(&mut ops);
+            chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+            assert_matches!(next_submit_op(&mut ops), Op::UserTurn { .. });
+            chat.input_queue.user_turn_pending_start = false;
+        }
+        chat.input_queue
+            .queued_user_messages
+            .push_back(UserMessage::from("new follow-up").into());
+        assert!(chat.maybe_send_next_queued_input());
+        assert_matches!(next_submit_op(&mut ops), Op::UserTurn { .. });
+    }
 }

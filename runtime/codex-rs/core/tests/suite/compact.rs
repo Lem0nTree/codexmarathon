@@ -6,7 +6,6 @@ use codex_core::compact::SUMMARY_PREFIX;
 use codex_core::config::Config;
 use codex_features::Feature;
 use codex_history::RolloutItem;
-use codex_history::RolloutLine;
 use codex_login::CodexAuth;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::built_in_model_providers;
@@ -367,7 +366,7 @@ fn replacement_history_from_rollout(path: &Path) -> Result<Vec<Value>> {
         .map(str::trim)
         .filter(|line| !line.is_empty())
     {
-        let entry: RolloutLine = serde_json::from_str(line)?;
+        let entry = codex_rollout::parse_rollout_line(line)?;
         if let RolloutItem::Compacted(compacted) = entry.item
             && let Some(items) = compacted.replacement_history
         {
@@ -723,7 +722,7 @@ async fn summarize_context_three_requests_and_instructions(
         if trimmed.is_empty() {
             continue;
         }
-        let Ok(entry): Result<RolloutLine, _> = serde_json::from_str(trimmed) else {
+        let Ok(entry) = codex_rollout::parse_rollout_line(trimmed) else {
             continue;
         };
         match entry.item {
@@ -989,7 +988,7 @@ async fn manual_compact_uses_custom_prompt() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn manual_compact_emits_api_and_local_token_usage_events() {
+async fn manual_compact_records_durable_and_local_token_usage() {
     skip_if_no_network!();
 
     let server = start_mock_server().await;
@@ -1008,7 +1007,9 @@ async fn manual_compact_emits_api_and_local_token_usage_events() {
         config.model_provider = model_provider;
         set_test_compact_prompt(config);
     });
-    let codex = builder.build(&server).await.unwrap().codex;
+    let test = builder.build(&server).await.unwrap();
+    let rollout_path = test.codex.rollout_path().expect("rollout path");
+    let codex = test.codex;
 
     // Trigger manual compact and collect TokenCount events for the compact turn.
     codex.submit(Op::Compact).await.unwrap();
@@ -1043,6 +1044,36 @@ async fn manual_compact_emits_api_and_local_token_usage_events() {
     assert!(
         last > 0,
         "second TokenCount should reflect a non-zero estimated context size after compaction"
+    );
+    let rollout_items = fs::read_to_string(rollout_path)
+        .expect("read rollout")
+        .lines()
+        .filter_map(|line| codex_rollout::parse_rollout_line(line).ok())
+        .map(|line| line.item)
+        .collect::<Vec<_>>();
+    let records = rollout_items
+        .iter()
+        .filter_map(|item| match item {
+            RolloutItem::TokenUsageRecord(record) => Some(record),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].response_id, "r1");
+    assert_eq!(records[0].usage.total_tokens, 0);
+    let compacted = rollout_items
+        .iter()
+        .find_map(|item| match item {
+            RolloutItem::Compacted(compacted) => Some(compacted),
+            _ => None,
+        })
+        .expect("compaction checkpoint");
+    assert_eq!(
+        (
+            compacted.compaction_response_id.as_deref(),
+            compacted.latest_token_usage_record.as_ref(),
+        ),
+        (Some("r1"), records.first().copied())
     );
 }
 
@@ -3398,7 +3429,7 @@ async fn pre_sampling_compact_recovers_comp_hash_after_resume() {
     let rollout = fs::read_to_string(&rollout_path).expect("read rollout");
     let persisted_comp_hash = rollout
         .lines()
-        .filter_map(|line| serde_json::from_str::<RolloutLine>(line).ok())
+        .filter_map(|line| codex_rollout::parse_rollout_line(line).ok())
         .find_map(|line| match line.item {
             RolloutItem::TurnContext(context) => context.comp_hash,
             _ => None,
@@ -3681,7 +3712,7 @@ async fn auto_compact_persists_rollout_entries() {
         if trimmed.is_empty() {
             continue;
         }
-        let Ok(entry): Result<RolloutLine, _> = serde_json::from_str(trimmed) else {
+        let Ok(entry) = codex_rollout::parse_rollout_line(trimmed) else {
             continue;
         };
         match entry.item {

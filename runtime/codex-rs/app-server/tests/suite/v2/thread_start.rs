@@ -325,7 +325,12 @@ async fn thread_start_creates_thread_and_emits_started() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
 
     let codex_home = TempDir::new()?;
-    create_config_toml_without_approval_policy(codex_home.path(), &server.uri())?;
+    create_config_toml(
+        codex_home.path(),
+        &server.uri(),
+        "sandbox_mode = \"read-only\"\nmodel_reasoning_effort = \"high\"",
+        "",
+    )?;
 
     // Start server and initialize.
     let mut mcp = TestAppServer::builder()
@@ -338,6 +343,7 @@ async fn thread_start_creates_thread_and_emits_started() -> Result<()> {
         .send_thread_start_request_with_auto_env(ThreadStartParams {
             model: Some("gpt-5.2".to_string()),
             thread_source: Some(ThreadSource::User),
+            service_name: Some("codex_work_desktop".to_string()),
             ..Default::default()
         })
         .await?;
@@ -364,6 +370,10 @@ async fn thread_start_creates_thread_and_emits_started() -> Result<()> {
         "new threads should start with an empty preview"
     );
     assert_eq!(model_provider, "mock_provider");
+    assert_eq!(
+        (thread.model.as_deref(), thread.reasoning_effort.clone()),
+        (Some("gpt-5.2"), Some(ReasoningEffort::High))
+    );
     assert!(
         thread.created_at > 0,
         "created_at should be a positive UNIX timestamp"
@@ -374,6 +384,7 @@ async fn thread_start_creates_thread_and_emits_started() -> Result<()> {
     );
     assert_eq!(thread.status, ThreadStatus::Idle);
     assert_eq!(thread.thread_source, Some(ThreadSource::User));
+    assert_eq!(thread.originator.as_deref(), Some("codex_work_desktop"));
     let thread_path = thread.path.clone().expect("thread path should be present");
     assert!(thread_path.is_absolute(), "thread path should be absolute");
     assert!(

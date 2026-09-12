@@ -33,8 +33,16 @@ use crate::config_types::ServiceTier;
 use crate::config_types::Verbosity;
 use crate::protocol::MultiAgentVersion;
 
+#[path = "openai_models/guardian.rs"]
+mod guardian;
+pub use guardian::GuardianModelPolicy;
+pub use guardian::GuardianReviewMode;
+pub use guardian::GuardianScope;
+
 #[path = "openai_models/guardian_v2.rs"]
 mod guardian_v2;
+#[path = "openai_models/reasoning_effort.rs"]
+mod reasoning_effort;
 
 pub use guardian_v2::GuardianV2ModelConfig;
 pub use guardian_v2::GuardianV2TranscriptModelConfig;
@@ -390,6 +398,11 @@ const fn is_true(value: &bool) -> bool {
 /// Model metadata returned by the Codex backend `/models` endpoint.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, TS, JsonSchema)]
 pub struct ModelInfo {
+    /// Model-owned approval coverage. Absent preserves legacy settings; an empty map disables
+    /// ordinary Guardian review. Keys are computer_use, shell, code_mode, file_changes, mcp, network,
+    /// and permissions. This does not override mandatory safety or administrator requirements.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guardian: Option<GuardianModelPolicy>,
     pub slug: String,
     pub display_name: String,
     pub description: Option<String>,
@@ -457,6 +470,9 @@ pub struct ModelInfo {
     pub used_fallback_model_metadata: bool,
     #[serde(default)]
     pub supports_search_tool: bool,
+    /// Whether experimental context management may be activated at session startup.
+    #[serde(default)]
+    pub supports_experimental_context: bool,
     #[serde(default)]
     pub use_responses_lite: bool,
     #[serde(default)]
@@ -623,6 +639,9 @@ pub struct CollaborationModeMessages {
 pub struct AutoReviewMessages {
     pub policy: Option<String>,
     pub policy_template: Option<String>,
+    /// Extra developer policy for `node_repl` and `cua_repl` reviews.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_repl_policy: Option<String>,
     pub rejection_instructions: Option<String>,
     pub timeout_instructions: Option<String>,
 }
@@ -958,7 +977,7 @@ mod tests {
         );
     }
 
-    fn test_model(spec: Option<ModelMessages>) -> ModelInfo {
+    pub(super) fn test_model(spec: Option<ModelMessages>) -> ModelInfo {
         ModelInfo {
             slug: "test-model".to_string(),
             display_name: "Test Model".to_string(),
@@ -995,7 +1014,9 @@ mod tests {
             input_modalities: default_input_modalities(),
             used_fallback_model_metadata: false,
             supports_search_tool: false,
+            supports_experimental_context: false,
             use_responses_lite: false,
+            guardian: None,
             node_repl_auto_review_required: false,
             node_repl_disabled: false,
             auto_review_model_override: None,
@@ -1005,7 +1026,6 @@ mod tests {
             multi_agent_reasoning_effort: None,
         }
     }
-
     fn personality_variables() -> ModelInstructionsVariables {
         ModelInstructionsVariables {
             personality_default: Some("default".to_string()),
@@ -1139,6 +1159,7 @@ mod tests {
                 "auto_review": {
                     "policy": "policy",
                     "policy_template": "",
+                    "node_repl_policy": "",
                     "rejection_instructions": "",
                     "timeout_instructions": ""
                 }
@@ -1151,6 +1172,7 @@ mod tests {
             Some(AutoReviewMessages {
                 policy: Some("policy".to_string()),
                 policy_template: None,
+                node_repl_policy: None,
                 rejection_instructions: None,
                 timeout_instructions: None,
             })
@@ -1160,6 +1182,7 @@ mod tests {
             Some(AutoReviewMessages {
                 policy: Some("policy".to_string()),
                 policy_template: Some(String::new()),
+                node_repl_policy: Some(String::new()),
                 rejection_instructions: Some(String::new()),
                 timeout_instructions: Some(String::new()),
             })
@@ -1559,6 +1582,7 @@ mod tests {
             auto_review: Some(AutoReviewMessages {
                 policy: Some("policy".to_string()),
                 policy_template: None,
+                node_repl_policy: None,
                 rejection_instructions: Some("rejection instructions".to_string()),
                 timeout_instructions: Some("timeout instructions".to_string()),
             }),
@@ -1752,6 +1776,7 @@ mod tests {
         assert!(!model.supports_image_detail_original);
         assert_eq!(model.web_search_tool_type, WebSearchToolType::Text);
         assert!(!model.supports_search_tool);
+        assert!(!model.supports_experimental_context);
         assert!(!model.use_responses_lite);
         assert!(!model.node_repl_auto_review_required);
         assert!(!model.node_repl_disabled);
@@ -2062,21 +2087,6 @@ mod tests {
             model.service_tier_for_request(Some("unsupported".to_string())),
             None
         );
-        assert_eq!(model.service_tier_for_request(/*service_tier*/ None), None);
-    }
-
-    #[test]
-    fn service_tier_for_request_does_not_apply_catalog_default() {
-        let model = ModelInfo {
-            default_service_tier: Some(ServiceTier::Fast.request_value().to_string()),
-            service_tiers: vec![ModelServiceTier {
-                id: ServiceTier::Fast.request_value().to_string(),
-                name: "Fast".to_string(),
-                description: "Priority processing.".to_string(),
-            }],
-            ..test_model(/*spec*/ None)
-        };
-
         assert_eq!(model.service_tier_for_request(/*service_tier*/ None), None);
     }
 }

@@ -148,6 +148,7 @@ fn startup_waiting_gate_is_only_for_fresh_or_exit_session_selection() {
             crate::resume_picker::SessionTarget {
                 path: Some(PathBuf::from("/tmp/restore")),
                 thread_id: ThreadId::new(),
+                cwd: None,
                 history_mode: None,
             }
         )),
@@ -158,6 +159,7 @@ fn startup_waiting_gate_is_only_for_fresh_or_exit_session_selection() {
             crate::resume_picker::SessionTarget {
                 path: Some(PathBuf::from("/tmp/fork")),
                 thread_id: ThreadId::new(),
+                cwd: None,
                 history_mode: None,
             }
         )),
@@ -170,11 +172,13 @@ fn startup_paused_goal_prompt_gate_is_only_for_quiet_resume() {
     let resume = SessionSelection::Resume(crate::resume_picker::SessionTarget {
         path: Some(PathBuf::from("/tmp/restore")),
         thread_id: ThreadId::new(),
+        cwd: None,
         history_mode: None,
     });
     let fork = SessionSelection::Fork(crate::resume_picker::SessionTarget {
         path: Some(PathBuf::from("/tmp/fork")),
         thread_id: ThreadId::new(),
+        cwd: None,
         history_mode: None,
     });
     let no_images: Vec<PathBuf> = Vec::new();
@@ -244,6 +248,7 @@ fn startup_waiting_gate_not_applied_for_resume_or_fork_session_selection() {
         crate::resume_picker::SessionTarget {
             path: Some(PathBuf::from("/tmp/restore")),
             thread_id: ThreadId::new(),
+            cwd: None,
             history_mode: None,
         },
     ));
@@ -258,6 +263,7 @@ fn startup_waiting_gate_not_applied_for_resume_or_fork_session_selection() {
         crate::resume_picker::SessionTarget {
             path: Some(PathBuf::from("/tmp/fork")),
             thread_id: ThreadId::new(),
+            cwd: None,
             history_mode: None,
         },
     ));
@@ -465,6 +471,16 @@ async fn startup_draft_delayed_approval_becomes_protected_on_redraw() -> Result<
     let mut tui = crate::tui::test_support::make_test_tui()?;
     let mut app_server =
         crate::start_embedded_app_server_for_picker(app.chat_widget.config_ref()).await?;
+    app.app_server_target = AppServerTarget::Remote {
+        endpoint: crate::RemoteAppServerEndpoint::WebSocket {
+            websocket_url: "ws://127.0.0.1:1".into(),
+            auth_token: None,
+        },
+    };
+    app.begin_reconnect();
+    assert!(app.startup_protected_input_boundary);
+    // The replacement connection replays the protected request after the old request was dropped.
+    app.reconnect.offline = false;
 
     let (mut startup_pane, _startup_app_event_rx) = startup_bottom_pane();
     startup_pane.set_composer_text("draft".to_string(), Vec::new(), Vec::new());
@@ -923,6 +939,8 @@ async fn known_thread_started_preserves_session_without_reading_unmaterialized_r
     );
     let notification = ThreadStartedNotification {
         thread: Thread {
+            originator: None,
+            environments: None,
             id: thread_id.to_string(),
             extra: None,
             session_id: thread_id.to_string(),
@@ -933,8 +951,11 @@ async fn known_thread_started_preserves_session_without_reading_unmaterialized_r
             section: None,
             section_entered_at: None,
             project_id: None,
+            daybreak_enabled: None,
             history_mode: Default::default(),
             model_provider: "notification-provider".to_string(),
+            model: None,
+            reasoning_effort: None,
             created_at: 1,
             updated_at: 2,
             recency_at: Some(2),
@@ -1195,6 +1216,7 @@ async fn owned_subagent_approval_before_thread_started_is_preserved() -> Result<
     )?;
     app_server
         .resume_thread(
+            &app.local_settings,
             app.config.clone(),
             child_thread_id,
             crate::app_server_session::ResumeModelSettings::RestoreFromThread,
@@ -1225,6 +1247,13 @@ async fn owned_subagent_approval_before_thread_started_is_preserved() -> Result<
 async fn startup_thread_start_failure_returns_error() {
     let (mut app, _app_event_rx, _op_rx) = make_test_app_with_channels().await;
     app.pending_startup_thread_start = true;
+    let mut tui = crate::tui::test_support::make_test_tui().expect("test tui");
+    app.insert_history_cell(
+        &mut tui,
+        Box::new(history_cell::StartupWarningsCell::new(vec![
+            "Skill manifest is invalid.".to_string(),
+        ])),
+    );
 
     let mut app_server = Box::pin(crate::start_embedded_app_server_for_picker(
         app.chat_widget.config_ref(),
@@ -1232,14 +1261,16 @@ async fn startup_thread_start_failure_returns_error() {
     .await
     .expect("embedded app server");
     let err = app
-        .handle_startup_thread_started(&mut app_server, Err("boom".to_string()))
+        .handle_startup_thread_started(&mut app_server, Err(color_eyre::eyre::eyre!("boom")))
         .await
         .expect_err("startup thread failure should exit instead of leaving chat unconfigured");
 
-    assert!(
-        err.to_string()
-            .contains("Failed to start a fresh session through the app server: boom")
-    );
+    insta::assert_snapshot!(err.to_string(), @"
+    Failed to start a fresh session through the app server: boom
+
+    Startup warnings:
+    Skill manifest is invalid.
+    ");
     assert!(!app.pending_startup_thread_start);
     assert_eq!(app.primary_thread_id, None);
 }
@@ -1310,6 +1341,7 @@ async fn ignore_same_thread_resume_reports_noop_for_current_thread() {
     let ignored = app.ignore_same_thread_resume(&crate::resume_picker::SessionTarget {
         path: Some(test_path_buf("/tmp/project")),
         thread_id,
+        cwd: None,
         history_mode: None,
     });
 
@@ -1335,9 +1367,79 @@ async fn ignore_same_thread_resume_allows_reattaching_displayed_inactive_thread(
     let ignored = app.ignore_same_thread_resume(&crate::resume_picker::SessionTarget {
         path: Some(test_path_buf("/tmp/project")),
         thread_id,
+        cwd: None,
         history_mode: None,
     });
 
     assert!(!ignored);
     assert!(app.transcript_cells.is_empty());
+}
+
+#[tokio::test]
+async fn ignore_same_thread_resume_allows_retrying_read_only_view() -> Result<()> {
+    let mut app = make_test_app().await;
+    let thread_id = ThreadId::new();
+    let session = test_thread_session(thread_id, test_path_buf("/tmp/project"));
+    app.chat_widget.handle_thread_session(session.clone());
+    let mut channel = ThreadEventChannel::new_with_session(
+        THREAD_EVENT_CHANNEL_CAPACITY,
+        session.clone(),
+        Vec::new(),
+    );
+    channel.mark_external_writer();
+    app.thread_event_channels.insert(thread_id, channel);
+    app.activate_thread_channel(thread_id).await;
+
+    assert!(
+        !app.ignore_same_thread_resume(&crate::resume_picker::SessionTarget {
+            path: Some(test_path_buf("/tmp/project")),
+            thread_id,
+            cwd: None,
+            history_mode: None,
+        })
+    );
+    let app_server =
+        crate::start_embedded_app_server_for_picker(app.chat_widget.config_ref()).await?;
+    let mut tui = crate::tui::test_support::make_test_tui()?;
+    app.render_thread_snapshot(
+        &mut tui,
+        &app_server,
+        thread_id,
+        ThreadEventSnapshot {
+            session: Some(session),
+            turns: vec![test_turn("running", TurnStatus::InProgress, Vec::new())],
+            events: Vec::new(),
+            input_state: None,
+        },
+        /*resume_restored_queue*/ false,
+    )?;
+    assert!(app.chat_widget.is_external_writer_view());
+    assert!(!app.chat_widget.is_task_running_for_test());
+    Ok(())
+}
+
+#[tokio::test]
+async fn external_writer_startup_keeps_initial_prompt_as_draft() -> Result<()> {
+    let (mut app, mut events, _operations) = make_test_app_with_channels().await;
+    let thread_id = ThreadId::new();
+    let prompt = "Continue after the other app closes";
+    set_test_initial_prompt(&mut app, prompt.to_string());
+    app.chat_widget.show_external_writer_thread();
+    app.enqueue_primary_thread_session(
+        test_thread_session(thread_id, test_path_buf("/tmp/project")),
+        Vec::new(),
+    )
+    .await?;
+
+    assert_eq!(app.chat_widget.composer_text_with_pending(), prompt);
+    assert!(!std::iter::from_fn(|| events.try_recv().ok()).any(|event| {
+        matches!(
+            event,
+            AppEvent::SubmitThreadOp {
+                op: Op::UserTurn { .. },
+                ..
+            } | AppEvent::CodexOp(Op::UserTurn { .. })
+        )
+    }));
+    Ok(())
 }

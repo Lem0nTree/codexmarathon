@@ -209,6 +209,14 @@ impl TurnAnalyticsMetadata for TestTurnMetadata {
     fn root_turn_id(&self) -> Option<String> {
         self.root_turn_id.lock().expect("root turn ID").clone()
     }
+
+    fn turn_trigger(&self) -> Option<String> {
+        None
+    }
+
+    fn codex_turn_source(&self) -> Option<String> {
+        None
+    }
 }
 
 fn test_turn_metadata(root_turn_id: Option<&str>) -> Arc<TestTurnMetadata> {
@@ -234,6 +242,8 @@ fn sample_thread_with_metadata(
     parent_thread_id: Option<String>,
 ) -> Thread {
     Thread {
+        originator: None,
+        environments: None,
         id: thread_id.to_string(),
         extra: None,
         session_id: format!("session-{thread_id}"),
@@ -244,8 +254,11 @@ fn sample_thread_with_metadata(
         section: None,
         section_entered_at: None,
         project_id: None,
+        daybreak_enabled: None,
         history_mode: Default::default(),
         model_provider: "openai".to_string(),
+        model: None,
+        reasoning_effort: None,
         created_at: 1,
         updated_at: 2,
         recency_at: Some(2),
@@ -472,6 +485,7 @@ fn sample_turn_resolved_config(thread_id: &str, turn_id: &str) -> TurnResolvedCo
         service_tier: None,
         approval_policy: AskForApproval::OnRequest,
         approvals_reviewer: ApprovalsReviewer::AutoReview,
+        guardian_v2_enabled: false,
         sandbox_network_access: true,
         collaboration_mode: ModeKind::Plan,
         personality: None,
@@ -848,6 +862,7 @@ fn plugin_measurements(rows: Vec<PluginMeasurementRow>) -> PluginMeasurementsInp
         thread_id: "thread-1".to_string(),
         turn_id: "turn-1".to_string(),
         item_id: "item-1".to_string(),
+        originator: "codex_cli_rs".to_string(),
         plugin_id: "sample@openai-curated".to_string(),
         execution_id: "execution-1".to_string(),
         operation: "security_scan".to_string(),
@@ -1007,7 +1022,7 @@ fn sample_permissions_approval_request(request_id: i64) -> ServerRequest {
             item_id: "permissions-1".to_string(),
             environment_id: None,
             started_at_ms: 1_000,
-            cwd: test_path_buf("/tmp").abs(),
+            cwd: test_path_buf("/tmp").abs().into(),
             reason: Some("need network".to_string()),
             permissions: RequestPermissionProfile {
                 network: Some(codex_app_server_protocol::AdditionalNetworkPermissions {
@@ -2784,6 +2799,7 @@ async fn plugin_measurement_batch_emits_directly_and_filters_invalid_rows() {
                     "execution_id": "execution-1",
                     "operation": "security_scan",
                     "measurement_name": "finding_count",
+                    "originator": "codex_cli_rs",
                     "number_value": 3.0,
                     "dimensions": {"severity": "high"},
                 },
@@ -2798,6 +2814,7 @@ async fn plugin_measurement_batch_emits_directly_and_filters_invalid_rows() {
                     "execution_id": "execution-1",
                     "operation": "security_scan",
                     "measurement_name": "files_scanned",
+                    "originator": "codex_cli_rs",
                     "number_value": 17.0,
                     "dimensions": null,
                 },
@@ -2918,6 +2935,92 @@ fn sampling_response(
         turn_id: turn_id.into(),
         response_id: response_id.into(),
         tool_call_ids: tool_call_ids.iter().map(|id| (*id).into()).collect(),
+    }
+}
+
+#[tokio::test]
+async fn collaborator_tool_events_keep_response_ids_when_completion_races_sampling() {
+    for response_first in [false, true] {
+        let mut reducer = AnalyticsReducer::default();
+        let mut events = Vec::new();
+        ingest_review_prerequisites(&mut reducer, &mut events).await;
+        reducer
+            .ingest(
+                AnalyticsFact::Notification(Box::new(sample_turn_started_notification(
+                    "thread-1", "turn-1",
+                ))),
+                &mut events,
+            )
+            .await;
+        let item = ThreadItem::CollabAgentToolCall {
+            id: "call-1".into(),
+            tool: CollabAgentTool::SendMessage,
+            status: CollabAgentToolCallStatus::Failed,
+            sender_thread_id: "thread-1".into(),
+            receiver_thread_ids: Vec::new(),
+            prompt: None,
+            model: None,
+            reasoning_effort: None,
+            agents_states: Default::default(),
+        };
+        reducer
+            .ingest(
+                AnalyticsFact::Notification(Box::new(ServerNotification::ItemStarted(
+                    ItemStartedNotification {
+                        thread_id: "thread-1".into(),
+                        turn_id: "turn-1".into(),
+                        started_at_ms: 1_000,
+                        item: item.clone(),
+                    },
+                ))),
+                &mut events,
+            )
+            .await;
+        let response = AnalyticsFact::Custom(CustomAnalyticsFact::CodeModeToolCall(
+            sampling_response("turn-1", "response-1", &["call-1"]),
+        ));
+        let completion = AnalyticsFact::Notification(Box::new(ServerNotification::ItemCompleted(
+            ItemCompletedNotification {
+                thread_id: "thread-1".into(),
+                turn_id: "turn-1".into(),
+                completed_at_ms: 1_010,
+                item,
+            },
+        )));
+        let facts = if response_first {
+            [response, completion]
+        } else {
+            [completion, response]
+        };
+        for fact in facts {
+            reducer.ingest(fact, &mut events).await;
+            assert!(events.is_empty(), "emitted before response correlation");
+        }
+        ingest_code_mode_facts(
+            &mut reducer,
+            &mut events,
+            [sampling_response("turn-1", "response-2", &[])],
+        )
+        .await;
+        let payload = serde_json::to_value(&events).expect("serialize collaborator event");
+        assert_eq!(payload.as_array().expect("events array").len(), 1);
+        let params = &payload[0]["event_params"];
+        assert_eq!(
+            json!({
+                "type": payload[0]["event_type"],
+                "item": params["item_id"],
+                "origin": params["originating_response_id"],
+                "subsequent": params["subsequent_response_id"],
+                "status": params["terminal_status"],
+            }),
+            json!({
+                "type": "codex_collab_agent_tool_call_event",
+                "item": "call-1",
+                "origin": "response-1",
+                "subsequent": "response-2",
+                "status": "failed",
+            }),
+        );
     }
 }
 
@@ -3171,7 +3274,7 @@ async fn guardian_completed_notification_publishes_review_event_with_thread_meta
                 GuardianApprovalReviewAction::Command {
                     source: AppServerGuardianCommandSource::Shell,
                     command: "echo hi".to_string(),
-                    cwd: test_path_buf("/tmp").abs(),
+                    cwd: test_path_buf("/tmp").abs().into(),
                 },
             ))),
             &mut events,
@@ -4648,6 +4751,8 @@ fn turn_event_serializes_expected_shape() {
             session_id: "session-thread-2".to_string(),
             turn_id: "turn-2".to_string(),
             root_turn_id: Some("turn-2".to_string()),
+            turn_trigger: Some("user".to_string()),
+            codex_turn_source: Some("composer".to_string()),
             app_server_client: sample_app_server_client_metadata(),
             runtime: sample_runtime_metadata(),
             submission_type: None,
@@ -4664,6 +4769,7 @@ fn turn_event_serializes_expected_shape() {
             service_tier: "flex".to_string(),
             approval_policy: "on-request".to_string(),
             approvals_reviewer: "auto_review".to_string(),
+            guardian_v2_enabled: true,
             sandbox_network_access: true,
             collaboration_mode: Some("plan"),
             personality: Some("pragmatic".to_string()),
@@ -4722,6 +4828,8 @@ fn turn_event_serializes_expected_shape() {
                 "session_id": "session-thread-2",
                 "turn_id": "turn-2",
                 "root_turn_id": "turn-2",
+                "turn_trigger": "user",
+                "codex_turn_source": "composer",
                 "submission_type": null,
                 "app_server_client": {
                     "product_client_id": "codex_cli_rs",
@@ -4749,6 +4857,7 @@ fn turn_event_serializes_expected_shape() {
                 "service_tier": "flex",
                 "approval_policy": "on-request",
                 "approvals_reviewer": "auto_review",
+                "guardian_v2_enabled": true,
                 "sandbox_network_access": true,
                 "collaboration_mode": "plan",
                 "personality": "pragmatic",
@@ -5073,6 +5182,16 @@ async fn turn_lifecycle_emits_turn_event() {
     );
     assert_eq!(payload["event_params"]["turn_id"], json!("turn-2"));
     assert_eq!(
+        (
+            payload["event_params"].get("turn_trigger"),
+            payload["event_params"].get("codex_turn_source"),
+        ),
+        (
+            Some(&serde_json::Value::Null),
+            Some(&serde_json::Value::Null)
+        )
+    );
+    assert_eq!(
         payload["event_params"]["app_server_client"],
         json!({
             "product_client_id": "codex-tui",
@@ -5092,6 +5211,7 @@ async fn turn_lifecycle_emits_turn_event() {
         })
     );
     assert!(payload["event_params"].get("product_client_id").is_none());
+    assert_eq!(payload["event_params"]["guardian_v2_enabled"], json!(false));
     assert_eq!(payload["event_params"]["ephemeral"], json!(false));
     assert_eq!(payload["event_params"]["workspace_kind"], json!(null));
     assert_eq!(payload["event_params"]["num_input_images"], json!(1));
@@ -5380,9 +5500,9 @@ async fn turn_event_counts_completed_tool_items() {
             "codex_file_change_event",
             "codex_mcp_tool_call_event",
             "codex_dynamic_tool_call_event",
-            "codex_collab_agent_tool_call_event",
             "codex_web_search_event",
             "codex_image_generation_event",
+            "codex_collab_agent_tool_call_event",
             "codex_control_tool_call_event",
         ]
         .map(|event_type| (event_type, "session-thread-2", "turn-2", "root-ancestor"))

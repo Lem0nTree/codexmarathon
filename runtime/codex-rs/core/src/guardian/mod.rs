@@ -1,21 +1,18 @@
-//! Guardian review decides whether an `on-request` approval should be granted
-//! automatically instead of shown to the user.
-//!
-//! High-level approach:
-//! 1. Reconstruct a compact transcript that preserves user intent plus the most
-//!    relevant recent assistant and tool context.
-//! 2. Ask a dedicated guardian review session to assess the exact planned
-//!    action and return strict JSON.
-//!    The guardian clones the parent config, so it inherits any managed
-//!    network proxy / allowlist that the parent turn already had.
-//! 3. Fail closed on timeout, execution failure, or malformed output.
-//! 4. Apply the guardian's explicit allow/deny outcome.
+//! Hosts approval decisions and the isolated synchronous reviewer.
+//! The extension chooses policy and evidence; core enforces permissions and mandatory
+//! review requirements. Each approval retains its issuing context and cancellation.
 
 mod approval_request;
+mod assessment;
+mod coverage;
+mod decision;
+mod feedback;
 mod metrics;
 mod prompt;
 mod review;
 mod review_session;
+mod reviewer_config;
+mod runtime;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -26,8 +23,6 @@ use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::GuardianAssessmentOutcome;
-use serde::Deserialize;
-use serde::Serialize;
 
 use crate::environment_selection::TurnEnvironmentSnapshot;
 use crate::session::step_context::StepContext;
@@ -40,6 +35,8 @@ pub(crate) use approval_request::GuardianMcpAnnotations;
 pub(crate) use approval_request::GuardianNetworkAccessTrigger;
 #[cfg(test)]
 pub(crate) use approval_request::guardian_approval_request_to_json;
+pub(crate) use decision::decide_approval;
+pub(crate) use decision::spawn_approval_decision;
 pub(crate) use prompt::BUNDLED_GUARDIAN_POLICY;
 pub(crate) use prompt::BUNDLED_GUARDIAN_POLICY_TEMPLATE;
 pub(crate) use prompt::guardian_truncate_text;
@@ -49,13 +46,11 @@ pub(crate) use review::is_basic_session_source;
 pub(crate) use review::new_guardian_review_id;
 #[cfg(test)]
 pub(crate) use review::record_guardian_denial_for_test;
-pub(crate) use review::review_approval_request;
-pub(crate) use review::review_approval_request_with_cancel;
 pub(crate) use review::routes_approval_policy_to_guardian;
 pub(crate) use review::routes_approval_to_guardian;
-pub(crate) use review::spawn_approval_request_review;
 pub(crate) use review_session::GuardianReviewSessionManager;
 pub(crate) use review_session::prompt_cache_key_override_for_review_session;
+pub(crate) use runtime::ReviewAction;
 
 pub(crate) const GUARDIAN_REVIEW_TIMEOUT: Duration = Duration::from_secs(90);
 pub(crate) const GUARDIAN_REVIEWER_NAME: &str = "guardian";
@@ -65,25 +60,26 @@ pub(crate) const MAX_RECENT_CYBER_AUTO_REVIEW_DENIALS_PER_TURN: u32 = 1;
 pub(crate) const MAX_RECENT_AUTO_REVIEW_DENIALS_PER_TURN: u32 = 10;
 pub(crate) const AUTO_REVIEW_DENIAL_WINDOW_SIZE: usize = 50;
 pub(crate) const AUTO_REVIEW_DENIED_ACTION_APPROVAL_DEVELOPER_PREFIX: &str =
-    "The user has manually approved a specific action that was previously `Rejected`.";
+    codex_guardian_context::MANUAL_APPROVAL_DEVELOPER_PREFIX;
 const GUARDIAN_MAX_MESSAGE_TRANSCRIPT_TOKENS: usize = 20_000;
 const GUARDIAN_MAX_TOOL_TRANSCRIPT_TOKENS: usize = 10_000;
 const GUARDIAN_MAX_MESSAGE_ENTRY_TOKENS: usize = 5_000;
 const GUARDIAN_MAX_TOOL_ENTRY_TOKENS: usize = 1_000;
+pub(crate) const GUARDIAN_MAX_ROOT_MESSAGE_TOKENS: usize = 900;
 pub(crate) const GUARDIAN_MAX_NODE_REPL_TOOL_RESULT_TOKENS: usize = 6_000;
+pub(crate) const GUARDIAN_MAX_ACTION_BYTES: usize = 50_000 * 4;
 const GUARDIAN_MAX_ACTION_STRING_TOKENS: usize = 16_000;
 const GUARDIAN_RECENT_ENTRY_LIMIT: usize = 40;
-const TRUNCATION_TAG: &str = "truncated";
 
 /// Captures review inputs from the issuing step without retaining its MCP bindings or tool router.
 /// Background network approvals and Unix interception use the active task's resolved settings.
 /// Startup reviewer prewarming intentionally uses turn-only inputs because it has no issuing step.
 ///
-/// MCP elicitation reviews still use turn-only inputs.
-/// TODO(sayan): See if we can find a way to model those as StepContext as well without holding
-/// step-scoped things past their lifetime (like MCP bindings)
+/// MCP elicitation reviews continue to use turn-only inputs.
 #[derive(Clone)]
 pub(crate) struct GuardianReviewContext {
+    /// The response currently handled in this execution context.
+    pub(crate) parent_response_id: Option<String>,
     turn: Arc<TurnContext>,
     environments: TurnEnvironmentSnapshot,
     // Model and reasoning inputs are carried for the follow-up Guardian and V2 migrations.
@@ -103,6 +99,10 @@ impl GuardianReviewContext {
         settings: &ResolvedStepSettings,
     ) -> Self {
         Self {
+            parent_response_id: turn
+                .extension_data
+                .get::<codex_api::ResponseId>()
+                .map(|id| id.0.clone()),
             environments: turn.environments.clone(),
             model_info: Arc::clone(&settings.model_info),
             reasoning_effort: settings.reasoning_effort().cloned(),
@@ -125,6 +125,11 @@ impl GuardianReviewContext {
 impl From<&Arc<StepContext>> for GuardianReviewContext {
     fn from(step: &Arc<StepContext>) -> Self {
         Self {
+            parent_response_id: step
+                .turn
+                .extension_data
+                .get::<codex_api::ResponseId>()
+                .map(|id| id.0.clone()),
             turn: Arc::clone(&step.turn),
             environments: step.environments.clone(),
             model_info: Arc::clone(&step.settings.model_info),
@@ -139,6 +144,10 @@ impl From<&Arc<StepContext>> for GuardianReviewContext {
 impl From<Arc<TurnContext>> for GuardianReviewContext {
     fn from(turn: Arc<TurnContext>) -> Self {
         Self {
+            parent_response_id: turn
+                .extension_data
+                .get::<codex_api::ResponseId>()
+                .map(|id| id.0.clone()),
             environments: turn.environments.clone(),
             model_info: Arc::clone(turn.model_info()),
             reasoning_effort: turn.reasoning_effort().cloned(),
@@ -156,14 +165,10 @@ impl From<&Arc<TurnContext>> for GuardianReviewContext {
     }
 }
 
-/// Structured output contract that the guardian reviewer must satisfy.
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
-pub(crate) struct GuardianAssessment {
-    pub(crate) risk_level: codex_protocol::protocol::GuardianRiskLevel,
-    pub(crate) user_authorization: codex_protocol::protocol::GuardianUserAuthorization,
-    pub(crate) outcome: GuardianAssessmentOutcome,
-    pub(crate) rationale: String,
-}
+pub use assessment::GuardianAssessment;
+pub use assessment::guardian_output_schema;
+pub use assessment::parse_guardian_assessment;
+pub use reviewer_config::build_guardian_review_session_config;
 
 #[derive(Debug, Default)]
 pub(crate) struct GuardianRejectionCircuitBreaker {
@@ -254,19 +259,9 @@ use prompt::GuardianPromptMode;
 #[cfg(test)]
 use prompt::GuardianTranscriptCursor;
 #[cfg(test)]
-use prompt::GuardianTranscriptEntry;
-#[cfg(test)]
-use prompt::GuardianTranscriptEntryKind;
-#[cfg(test)]
 use prompt::build_guardian_prompt_items;
 #[cfg(test)]
 use prompt::build_guardian_prompt_items_with_parent_turn;
-#[cfg(test)]
-use prompt::collect_guardian_transcript_entries;
-#[cfg(test)]
-use prompt::guardian_output_schema;
-#[cfg(test)]
-use prompt::parse_guardian_assessment;
 #[cfg(test)]
 use prompt::render_guardian_transcript_entries;
 #[cfg(test)]

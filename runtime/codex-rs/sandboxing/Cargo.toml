@@ -30,6 +30,8 @@ url = { workspace = true }
 which = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
+codex-mxc-sandbox = { workspace = true }
+codex-otel = { workspace = true }
 codex-utils-home-dir = { workspace = true }
 
 [dev-dependencies]
