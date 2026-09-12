@@ -272,6 +272,7 @@ impl ChatWidget {
             current_goal_status_indicator: None,
             current_goal_status: None,
             external_editor_state: ExternalEditorState::Closed,
+            last_rendered_user_message_display: None,
             pending_local_user_message_echo: None,
             last_non_retry_error: None,
             pending_auth_reload_attempt: None,

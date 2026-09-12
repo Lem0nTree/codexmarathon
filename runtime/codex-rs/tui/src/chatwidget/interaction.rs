@@ -564,7 +564,7 @@ impl ChatWidget {
             return false;
         }
 
-        match crate::clipboard_copy::copy_to_clipboard(&draft) {
+        match crate::clipboard_copy::copy_to_clipboard(&draft, CopyFormat::PlainText) {
             Ok(lease) => {
                 self.clipboard_lease = lease;
                 self.add_to_history(history_cell::new_info_event(

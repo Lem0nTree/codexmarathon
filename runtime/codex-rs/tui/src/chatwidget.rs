@@ -820,6 +820,7 @@ pub(crate) struct ChatWidget {
     current_goal_status_indicator: Option<GoalStatusIndicator>,
     current_goal_status: Option<GoalStatusState>,
     external_editor_state: ExternalEditorState,
+    last_rendered_user_message_display: Option<UserMessageDisplay>,
     pending_local_user_message_echo: Option<PendingLocalUserMessageEcho>,
     last_non_retry_error: Option<(String, String)>,
     // Attempt counter for an auth.json reload deferred until the running task finishes.
