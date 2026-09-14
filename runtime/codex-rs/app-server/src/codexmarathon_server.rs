@@ -47,11 +47,9 @@ pub(crate) fn spawn(
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())?;
 
-    let mut auth_config = NativeAuthConfig::new(
-        config.codex_home.to_path_buf(),
-        config.auth_route_config(),
-    )
-    .with_http_client_factory(config.http_client_factory());
+    let mut auth_config =
+        NativeAuthConfig::new(config.codex_home.to_path_buf(), config.auth_route_config())
+            .with_http_client_factory(config.http_client_factory());
     auth_config.forced_chatgpt_workspace_id = config.forced_chatgpt_workspace_id.clone();
     auth_config.chatgpt_base_url = Some(config.chatgpt_base_url.clone());
 
@@ -139,9 +137,7 @@ async fn serve_endpoint(
                         "invalid Windows Marathon named-pipe name",
                     ));
                 }
-                return server
-                    .serve_named_pipe(format!(r"\\.\pipe\{name}"))
-                    .await;
+                return server.serve_named_pipe(format!(r"\\.\pipe\{name}")).await;
             }
             #[cfg(not(windows))]
             {

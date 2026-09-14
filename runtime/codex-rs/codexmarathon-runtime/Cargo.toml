@@ -17,9 +17,13 @@ codex-login = { workspace = true }
 codex-protocol = { workspace = true }
 codexmarathon-runtime-adapter = { workspace = true }
 log = { workspace = true }
+libc = { workspace = true }
+rand = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 sqlx = { workspace = true }
 thiserror = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["io-util", "net", "rt", "sync", "time"] }
+zeroize = { workspace = true }

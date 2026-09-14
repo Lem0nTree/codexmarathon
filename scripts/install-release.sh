@@ -9,6 +9,7 @@ daemon_dir=$HOME/.local/bin
 unit_dir=$HOME/.config/systemd/user
 unit_dropin_dir=$unit_dir/codexmarathon-accountd.service.d
 unit_dropin=$unit_dropin_dir/10-codex-home.conf
+umask 077
 
 die() {
     printf 'CodexMarathon install: %s\n' "$1" >&2
@@ -16,11 +17,17 @@ die() {
 }
 
 normalize_path() {
-    normalized=$1
-    while [ "$normalized" != / ] && [ "${normalized%/}" != "$normalized" ]; do
-        normalized=${normalized%/}
+    normalized_path=$1
+    while :; do
+        case "$normalized_path" in
+            *//* ) normalized_path=${normalized_path%%//*}/${normalized_path#*//} ;;
+            *) break ;;
+        esac
     done
-    printf '%s' "$normalized"
+    while [ "$normalized_path" != / ] \
+        && [ "${normalized_path%/}" != "$normalized_path" ]; do
+        normalized_path=${normalized_path%/}
+    done
 }
 
 validate_codex_home() {
@@ -39,6 +46,21 @@ validate_codex_home() {
     [ "${#path}" -le 4096 ] || die 'CODEX_HOME is too long.'
 }
 
+validate_config_home() {
+    path=$1
+    [ -n "$path" ] || die 'XDG_CONFIG_HOME must not be empty.'
+    case "$path" in
+        /*) ;;
+        *) die "XDG_CONFIG_HOME must be an absolute path: $path" ;;
+    esac
+    case "$path" in
+        *[![:print:]]*) die 'XDG_CONFIG_HOME must contain printable characters only.' ;;
+        */../*|*/..|*/./*|*/.) die 'XDG_CONFIG_HOME must not contain . or .. path components.' ;;
+        /) die 'XDG_CONFIG_HOME must not be the filesystem root.' ;;
+    esac
+    [ "${#path}" -le 4096 ] || die 'XDG_CONFIG_HOME is too long.'
+}
+
 systemd_quote() {
     value=$1
     escaped=
@@ -54,24 +76,88 @@ systemd_quote() {
     printf '"%s"' "$escaped"
 }
 
+json_quote() {
+    value=$1
+    escaped=
+    while [ -n "$value" ]; do
+        character=${value%"${value#?}"}
+        value=${value#?}
+        case "$character" in
+            \\) escaped="${escaped}\\\\" ;;
+            \") escaped="${escaped}\\\"" ;;
+            *) escaped="${escaped}${character}" ;;
+        esac
+    done
+    printf '"%s"' "$escaped"
+}
+
+persist_home_config() {
+    if [ -L "$config_dir" ]; then
+        die 'persisted CodexMarathon config directory must not be a symbolic link.'
+    fi
+    mkdir -p "$config_dir" || die 'could not create persisted CodexMarathon config directory.'
+    [ -d "$config_dir" ] || die 'persisted CodexMarathon config path is not a directory.'
+    chmod 0700 "$config_dir" || die 'could not make persisted CodexMarathon config directory private.'
+
+    config_tmp=$(mktemp "$config_dir/.config.json.XXXXXX") || \
+        die 'could not create persisted CodexMarathon config file.'
+    if ! printf '{"version":1,"codex_home":%s}\n' "$(json_quote "$codex_home")" > "$config_tmp"; then
+        rm -f -- "$config_tmp"
+        die 'could not write persisted CodexMarathon config file.'
+    fi
+    chmod 0600 "$config_tmp" || {
+        rm -f -- "$config_tmp"
+        die 'could not make persisted CodexMarathon config file private.'
+    }
+    if ! mv -f -- "$config_tmp" "$config_file"; then
+        rm -f -- "$config_tmp"
+        die 'could not atomically install persisted CodexMarathon config file.'
+    fi
+}
+
 select_codex_home() {
     if [ "${CODEXMARATHON_CODEX_HOME+x}" = x ]; then
-        selected=$CODEXMARATHON_CODEX_HOME
+        normalize_path "$CODEXMARATHON_CODEX_HOME"
+        selected=$normalized_path
+        validate_codex_home "$selected"
+        if [ "${CODEX_HOME+x}" = x ]; then
+            normalize_path "$CODEX_HOME"
+            codex_environment_home=$normalized_path
+            validate_codex_home "$codex_environment_home"
+            [ "$selected" = "$codex_environment_home" ] || \
+                die 'CODEXMARATHON_CODEX_HOME and CODEX_HOME must resolve to the same path.'
+        fi
     elif [ "${CODEX_HOME+x}" = x ]; then
-        selected=$CODEX_HOME
+        normalize_path "$CODEX_HOME"
+        selected=$normalized_path
+        validate_codex_home "$selected"
     else
         selected=$HOME/.codex
+        normalize_path "$selected"
+        selected=$normalized_path
+        validate_codex_home "$selected"
     fi
-    selected=$(normalize_path "$selected")
-    validate_codex_home "$selected"
     printf '%s' "$selected"
 }
 
 codex_home=$(select_codex_home)
-default_codex_home=$(normalize_path "$HOME/.codex")
+normalize_path "$HOME/.codex"
+default_codex_home=$normalized_path
+validate_codex_home "$default_codex_home"
 [ "$default_codex_home" != / ] || die 'HOME must not be the filesystem root.'
 custom_codex_home=false
 [ "$codex_home" = "$default_codex_home" ] || custom_codex_home=true
+
+if [ "${XDG_CONFIG_HOME+x}" = x ]; then
+    config_home=$XDG_CONFIG_HOME
+else
+    config_home=$HOME/.config
+fi
+normalize_path "$config_home"
+config_home=$normalized_path
+validate_config_home "$config_home"
+config_dir=$config_home/codexmarathon
+config_file=$config_dir/config.json
 
 require_file() {
     [ -f "$package_dir/$1" ] || {
@@ -151,6 +237,8 @@ else
     rm -f -- "$unit_dropin"
     rmdir "$unit_dropin_dir" 2>/dev/null || true
 fi
+
+persist_home_config
 
 systemctl --user daemon-reload
 systemctl --user enable --now \

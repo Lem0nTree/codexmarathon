@@ -1120,6 +1120,14 @@ fn stage_str(stage: Stage) -> &'static str {
 }
 
 fn main() -> anyhow::Result<()> {
+    let marathon_home = codexmarathon_home::resolve()?;
+    if std::env::var_os("CODEX_HOME").is_none() {
+        // SAFETY: this is the first operation in the process, before Codex
+        // initializes logging, async runtimes, or any worker threads. Making
+        // the shared installer selection visible through the upstream
+        // CODEX_HOME contract keeps every CLI path on the same state root.
+        unsafe { std::env::set_var("CODEX_HOME", marathon_home.codex_home()) };
+    }
     codex_build_info::initialize!();
     let remote_control_disabled = codex_app_server::take_remote_control_disabled_env();
     arg0_dispatch_or_else(move |arg0_paths: Arg0DispatchPaths| async move {

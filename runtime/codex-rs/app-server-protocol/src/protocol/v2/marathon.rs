@@ -128,3 +128,22 @@ pub struct MarathonImportResponse {
     pub active: bool,
     pub replaced: bool,
 }
+
+/// Checkpoint an already-saved current account through native AuthManager.
+/// Optimistic identity/generation binding prevents saving a different account
+/// after a status/selection race. No snapshot or passphrase crosses this API.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase", export_to = "v2/")]
+pub struct MarathonCheckpointParams {
+    pub expected_account_id: String,
+    pub expected_auth_generation: u64,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase", export_to = "v2/")]
+pub struct MarathonCheckpointResponse {
+    pub account_id: String,
+    pub auth_generation: u64,
+}

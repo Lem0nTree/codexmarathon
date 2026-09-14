@@ -13,6 +13,8 @@ the product builds from the tracked copy under `runtime/codex-rs`.
 | M05 | Auth reload/success/failure, post-invalidation identity change, turn, and deduplicated recovery event translation | Existing AuthManager reload, model-transport invalidation/config refresh, recovery queue, and conversation/session manager |
 | M06 | Imported pinned Codex Rust workspace, `codexmarathon-runtime` bridge, and `codex-cli::codexmarathon` re-export | Later feature agents wire the bridge hooks to the concrete multi-account policy and controller lifecycle |
 | M07 | Native `CodexNativeRuntime`: shared AuthManager/turn-watch/auth-transition-lock composition, isolated native login/refresh handlers, active opaque snapshot read for Account A synchronization, atomic reload-plus-transport invalidation, and exact target-identity validation | Account rate-limit reads still come from the native app-server account processor; the listener/launcher remains Agent 6 work |
+| M08 | `codexmarathon-accountd` and its typed client: owner-only local metadata/quota API, durable event cursors, automatic user-systemd installation, and shared persisted Codex-home resolution | Native AuthManager remains the credential authority; accountd never reads or transports credential snapshots |
+| M09 | `codexmarathon-transfer`: password-encrypted selected-account export, bounded authenticated archive validation, fresh identity-bound vault references, cross-process locking, and atomic batch import | Native app-server checkpointing supplies the current saved identity without exposing credentials on an RPC or daemon API |
 
 ## Integration limitations
 

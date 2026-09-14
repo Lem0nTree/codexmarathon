@@ -6,6 +6,7 @@
 //! emits one typed app-server notification and waits for the TUI's typed
 //! acknowledgement.  It never carries prompt text and never owns a queue.
 
+use crate::outgoing_message::OutgoingMessageSender;
 use codex_app_server_protocol::CodexMarathonRecoveryLifecycleNotification;
 use codex_app_server_protocol::CodexMarathonRecoveryReleaseNotification;
 use codex_app_server_protocol::CodexMarathonRecoveryReleaseResultNotification;
@@ -16,7 +17,6 @@ use codexmarathon_runtime_adapter::protocol::{
     RecoveryCompletedPayload, RecoveryLifecycleEvent, RecoveryParkedPayload,
     RecoveryReleaseOutcome, RecoveryReleaseParams, RecoveryReleaseResult, RecoveryStartedPayload,
 };
-use crate::outgoing_message::OutgoingMessageSender;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::Mutex;
@@ -104,7 +104,10 @@ impl CodexMarathonRecoveryBridge {
                     .outcome
                     .filter(|value| !value.trim().is_empty())
                 else {
-                    tracing::warn!(recovery_id, "ignoring completed recovery event without outcome");
+                    tracing::warn!(
+                        recovery_id,
+                        "ignoring completed recovery event without outcome"
+                    );
                     return;
                 };
                 RecoveryLifecycleEvent::Completed(RecoveryCompletedPayload {
@@ -116,7 +119,11 @@ impl CodexMarathonRecoveryBridge {
                 })
             }
             _ => {
-                tracing::warn!(event_type, recovery_id, "ignoring unknown CodexMarathon recovery lifecycle event");
+                tracing::warn!(
+                    event_type,
+                    recovery_id,
+                    "ignoring unknown CodexMarathon recovery lifecycle event"
+                );
                 return;
             }
         };
@@ -124,10 +131,7 @@ impl CodexMarathonRecoveryBridge {
             .lifecycle
             .lock()
             .expect("CodexMarathon lifecycle mutex poisoned");
-        if !lifecycle
-            .seen
-            .insert((event_type, recovery_id))
-        {
+        if !lifecycle.seen.insert((event_type, recovery_id)) {
             return;
         }
         // Lifecycle events are finite and only metadata. Bound the queue so

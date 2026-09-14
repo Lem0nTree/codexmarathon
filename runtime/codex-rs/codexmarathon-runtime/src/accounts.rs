@@ -6,16 +6,19 @@
 //! journal read from becoming an accidental token read.
 
 use crate::errors::{DomainError, DomainResult};
-use crate::persistence::{atomic_write, ensure_private_dir, reject_unsafe_file};
+use crate::persistence::{atomic_write, ensure_private_dir, open_regular};
+use crate::state_lock::StateLock;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 /// Current on-disk account registry schema version.
-pub const REGISTRY_VERSION: u32 = 1;
+// v2 preserves the JSON shape but permits fresh, identity-bound vault refs.
+// Old v1 binaries reject v2 registries before attempting stale credential writes.
+pub const REGISTRY_VERSION: u32 = 2;
 
 /// Secret-free state of the credential snapshot referenced by an account.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -313,20 +316,61 @@ impl FileAccountRegistry {
         &self.path
     }
 
+    pub fn lock_exclusive(&self) -> DomainResult<StateLock> {
+        StateLock::exclusive(self.path.parent().ok_or(DomainError::UnsafePath)?)
+    }
+
+    /// Read one atomically published registry for a nonmutating preview.
+    /// Does not create directories or a lockfile. Its result is advisory;
+    /// writers must reload under StateLock before making any decision.
+    pub fn preview_state(&self) -> DomainResult<RegistryState> {
+        let _guard = self.gate.lock().map_err(|_| DomainError::InvalidRegistry)?;
+        self.load_unlocked()
+    }
+
+    /// Read within a caller-owned transaction, avoiding nested file locks.
+    pub fn state_locked(&self, lock: &StateLock) -> DomainResult<RegistryState> {
+        lock.check(self.path.parent().ok_or(DomainError::UnsafePath)?, false)?;
+        let _guard = self.gate.lock().map_err(|_| DomainError::InvalidRegistry)?;
+        self.load_unlocked()
+    }
+
+    /// One atomic commit point for a batch. Callers must fsync every new
+    /// immutable vault entry before publishing the registry that references it.
+    /// An error after rename/fsync may be ambiguous: reload, never roll back or
+    /// delete new entries based solely on this method's returned error.
+    pub fn replace_locked(&self, lock: &StateLock, state: RegistryState) -> DomainResult<()> {
+        lock.check(self.path.parent().ok_or(DomainError::UnsafePath)?, true)?;
+        let _guard = self.gate.lock().map_err(|_| DomainError::InvalidRegistry)?;
+        self.save_unlocked(state)
+    }
+
+    pub fn set_active_locked(&self, lock: &StateLock, account_id: &str) -> DomainResult<()> {
+        let mut state = self.state_locked(lock)?;
+        if !state.accounts.contains_key(account_id) {
+            return Err(DomainError::AccountNotFound);
+        }
+        state.active_account_id = account_id.to_owned();
+        self.replace_locked(lock, state)
+    }
+
     /// Read the full state for diagnostics and migration code.
     pub fn state(&self) -> DomainResult<RegistryState> {
+        let _state_lock = self.lock_exclusive()?;
         let _guard = self.gate.lock().map_err(|_| DomainError::InvalidRegistry)?;
         self.load_unlocked()
     }
 
     /// Return whether native Marathon transitions are enabled.
     pub fn enabled(&self) -> DomainResult<bool> {
+        let _state_lock = self.lock_exclusive()?;
         let _guard = self.gate.lock().map_err(|_| DomainError::InvalidRegistry)?;
         Ok(self.load_unlocked()?.enabled)
     }
 
     /// Persist the native Marathon enabled flag atomically.
     pub fn set_enabled(&self, enabled: bool) -> DomainResult<()> {
+        let _state_lock = self.lock_exclusive()?;
         let _guard = self.gate.lock().map_err(|_| DomainError::InvalidRegistry)?;
         let mut state = self.load_unlocked()?;
         state.enabled = enabled;
@@ -341,17 +385,21 @@ impl FileAccountRegistry {
         if self.path.as_os_str().is_empty() {
             return Err(DomainError::InvalidRegistry);
         }
-        reject_unsafe_file(&self.path)?;
-        let raw = match fs::read(&self.path) {
-            Ok(raw) => raw,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+        let file = match open_regular(&self.path, false, false) {
+            Ok(file) => file,
+            Err(DomainError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(RegistryState {
                     version: REGISTRY_VERSION,
                     ..RegistryState::default()
                 });
             }
-            Err(error) => return Err(error.into()),
+            Err(error) => return Err(error),
         };
+        let mut raw = Vec::new();
+        file.take(16 * 1024 * 1024 + 1).read_to_end(&mut raw)?;
+        if raw.len() > 16 * 1024 * 1024 {
+            return Err(DomainError::InvalidRegistry);
+        }
         if raw.is_empty() {
             return Ok(RegistryState {
                 version: REGISTRY_VERSION,
@@ -360,7 +408,9 @@ impl FileAccountRegistry {
         }
         let mut state: RegistryState =
             serde_json::from_slice(&raw).map_err(|_| DomainError::InvalidRegistry)?;
-        if state.version == 0 {
+        // Read legacy registries without rewriting during preview/export.
+        // The next authorized mutation publishes v2 atomically.
+        if state.version == 0 || state.version == 1 {
             state.version = REGISTRY_VERSION;
         }
         if state.version != REGISTRY_VERSION {
@@ -388,6 +438,13 @@ impl FileAccountRegistry {
         for account in state.accounts.values() {
             account.validate()?;
         }
+        if state
+            .accounts
+            .iter()
+            .any(|(key, account)| key != &account.id)
+        {
+            return Err(DomainError::InvalidRegistry);
+        }
         if !state.active_account_id.is_empty()
             && !state.accounts.contains_key(&state.active_account_id)
         {
@@ -395,6 +452,9 @@ impl FileAccountRegistry {
         }
         let mut raw = serde_json::to_vec_pretty(&state)?;
         raw.push(b'\n');
+        if raw.len() > 16 * 1024 * 1024 {
+            return Err(DomainError::InvalidRegistry);
+        }
         if let Some(parent) = self.path.parent() {
             ensure_private_dir(parent)?;
         }
@@ -404,6 +464,7 @@ impl FileAccountRegistry {
 
 impl AccountStore for FileAccountRegistry {
     fn register(&self, mut account: AccountRecord) -> DomainResult<()> {
+        let _state_lock = self.lock_exclusive()?;
         account.validate()?;
         let _guard = self.gate.lock().map_err(|_| DomainError::InvalidRegistry)?;
         let mut state = self.load_unlocked()?;
@@ -425,11 +486,22 @@ impl AccountStore for FileAccountRegistry {
     }
 
     fn upsert(&self, mut account: AccountRecord) -> DomainResult<()> {
+        let _state_lock = self.lock_exclusive()?;
         validate_account_id(&account.id)?;
         validate_alias(&account.alias)?;
         let _guard = self.gate.lock().map_err(|_| DomainError::InvalidRegistry)?;
         let mut state = self.load_unlocked()?;
         if let Some(existing) = state.accounts.get(&account.id) {
+            // A record read before a batch import must not resurrect its old
+            // vault reference. Intentional credential replacement uses a full
+            // registry transaction with a caller-owned StateLock.
+            if !account.credential_ref.is_empty()
+                && account.credential_ref != existing.credential_ref
+            {
+                return Err(DomainError::InvalidAccountRecord(
+                    "credential reference changed; retry",
+                ));
+            }
             if account.credential_ref.is_empty() {
                 account.credential_ref = existing.credential_ref.clone();
             }
@@ -461,6 +533,7 @@ impl AccountStore for FileAccountRegistry {
     }
 
     fn get(&self, account_id: &str) -> DomainResult<AccountRecord> {
+        let _state_lock = self.lock_exclusive()?;
         validate_account_id(account_id)?;
         let _guard = self.gate.lock().map_err(|_| DomainError::InvalidRegistry)?;
         self.load_unlocked()?
@@ -470,11 +543,13 @@ impl AccountStore for FileAccountRegistry {
     }
 
     fn list(&self) -> DomainResult<Vec<AccountRecord>> {
+        let _state_lock = self.lock_exclusive()?;
         let _guard = self.gate.lock().map_err(|_| DomainError::InvalidRegistry)?;
         Ok(self.load_unlocked()?.accounts.into_values().collect())
     }
 
     fn set_active(&self, account_id: &str) -> DomainResult<()> {
+        let _state_lock = self.lock_exclusive()?;
         validate_account_id(account_id)?;
         let _guard = self.gate.lock().map_err(|_| DomainError::InvalidRegistry)?;
         let mut state = self.load_unlocked()?;
@@ -486,6 +561,7 @@ impl AccountStore for FileAccountRegistry {
     }
 
     fn clear_active(&self) -> DomainResult<()> {
+        let _state_lock = self.lock_exclusive()?;
         let _guard = self.gate.lock().map_err(|_| DomainError::InvalidRegistry)?;
         let mut state = self.load_unlocked()?;
         state.active_account_id.clear();
@@ -493,12 +569,14 @@ impl AccountStore for FileAccountRegistry {
     }
 
     fn active(&self) -> DomainResult<Option<AccountRecord>> {
+        let _state_lock = self.lock_exclusive()?;
         let _guard = self.gate.lock().map_err(|_| DomainError::InvalidRegistry)?;
         let state = self.load_unlocked()?;
         Ok(state.accounts.get(&state.active_account_id).cloned())
     }
 
     fn remove(&self, account_id: &str, force: bool) -> DomainResult<()> {
+        let _state_lock = self.lock_exclusive()?;
         validate_account_id(account_id)?;
         let _guard = self.gate.lock().map_err(|_| DomainError::InvalidRegistry)?;
         let mut state = self.load_unlocked()?;
@@ -520,6 +598,76 @@ impl AccountStore for FileAccountRegistry {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn preview_does_not_create_state_and_stable_lock_excludes_other_instances() {
+        let directory = tempdir().expect("tempdir");
+        let state_dir = directory.path().join("missing");
+        let first = FileAccountRegistry::new(state_dir.join("accounts.json"));
+        assert!(first.preview_state().expect("preview").accounts.is_empty());
+        assert!(!state_dir.exists());
+        let second = FileAccountRegistry::new(first.path());
+        let lock = first.lock_exclusive().expect("lock");
+        assert!(
+            second
+                .register(AccountRecord::new("b", "B").expect("record"))
+                .is_err()
+        );
+        drop(lock);
+        second
+            .register(AccountRecord::new("b", "B").expect("record"))
+            .expect("unlocked");
+        assert_eq!(first.state().expect("state").accounts.len(), 1);
+    }
+
+    #[test]
+    fn stale_upsert_cannot_resurrect_a_replaced_credential_reference() {
+        let directory = tempdir().expect("tempdir");
+        let registry = FileAccountRegistry::new(directory.path().join("accounts.json"));
+        let old = AccountRecord::new("a", "A").expect("record");
+        registry.register(old.clone()).expect("register");
+        let lock = registry.lock_exclusive().expect("lock");
+        let mut state = registry.state_locked(&lock).expect("state");
+        state.accounts.get_mut("a").expect("account").credential_ref = "new-reference".into();
+        registry.replace_locked(&lock, state).expect("commit");
+        drop(lock);
+        assert!(registry.upsert(old).is_err());
+        assert_eq!(
+            registry.get("a").expect("account").credential_ref,
+            "new-reference"
+        );
+    }
+
+    #[test]
+    fn legacy_v1_reads_without_mutation_and_next_write_commits_v2() {
+        let directory = tempdir().expect("tempdir");
+        let path = directory.path().join("accounts.json");
+        let original = br#"{"version":1,"accounts":{},"enabled":false}"#;
+        std::fs::write(&path, original).expect("legacy fixture");
+        let registry = FileAccountRegistry::new(&path);
+        let preview = registry.preview_state().expect("v1 preview");
+        assert_eq!(preview.version, 2);
+        assert!(!preview.enabled);
+        assert_eq!(std::fs::read(&path).expect("unchanged file"), original);
+        registry
+            .register(AccountRecord::new("a", "A").expect("record"))
+            .expect("mutation");
+        let saved: RegistryState =
+            serde_json::from_slice(&std::fs::read(&path).expect("saved")).expect("JSON");
+        assert_eq!(saved.version, 2);
+        assert_ne!(
+            saved.version, 1,
+            "a v1-only loader must reject this registry"
+        );
+        let mut future = saved;
+        future.version = 3;
+        std::fs::write(&path, serde_json::to_vec(&future).expect("future JSON"))
+            .expect("future fixture");
+        assert!(matches!(
+            registry.preview_state(),
+            Err(DomainError::InvalidRegistry)
+        ));
+    }
 
     #[test]
     fn identifier_and_alias_rules_reject_path_and_control_data() {

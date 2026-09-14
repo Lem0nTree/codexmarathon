@@ -1157,6 +1157,9 @@ impl MessageProcessor {
             ClientRequest::MarathonImport { params, .. } => {
                 self.marathon_processor.import(params).await
             }
+            ClientRequest::MarathonCheckpoint { params, .. } => {
+                self.marathon_processor.checkpoint(params).await
+            }
             ClientRequest::ConfigRequirementsRead { params: _, .. } => self
                 .config_processor
                 .config_requirements_read()

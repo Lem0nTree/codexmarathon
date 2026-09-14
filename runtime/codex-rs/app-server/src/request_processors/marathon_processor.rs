@@ -1,8 +1,8 @@
 use crate::error_code::{internal_error, invalid_params};
 use crate::marathon_service::{MarathonService, MarathonServiceError};
 use codex_app_server_protocol::{
-    ClientResponsePayload, JSONRPCErrorError, MarathonAutoResetSetParams, MarathonEnabledSetParams,
-    MarathonImportParams, MarathonSwitchParams,
+    ClientResponsePayload, JSONRPCErrorError, MarathonAutoResetSetParams, MarathonCheckpointParams,
+    MarathonEnabledSetParams, MarathonImportParams, MarathonSwitchParams,
 };
 use std::sync::Arc;
 
@@ -62,6 +62,17 @@ impl MarathonRequestProcessor {
     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
         self.service
             .import_current(&params.alias)
+            .await
+            .map(|response| Some(response.into()))
+            .map_err(map_service_error)
+    }
+
+    pub(crate) async fn checkpoint(
+        &self,
+        params: MarathonCheckpointParams,
+    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
+        self.service
+            .checkpoint_current(&params.expected_account_id, params.expected_auth_generation)
             .await
             .map(|response| Some(response.into()))
             .map_err(map_service_error)

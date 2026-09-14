@@ -14,6 +14,7 @@
 
 use chrono::{DateTime, Utc};
 use codexmarathon_accountd_client as wire;
+use codexmarathon_home::HomeError;
 use codexmarathon_runtime::{
     AccountTelemetry, CredentialHealth, DomainError, FileAccountRegistry, QuotaSnapshotStore,
 };
@@ -113,6 +114,9 @@ pub enum AccountdError {
     #[error("accountd configuration is invalid: {0}")]
     InvalidConfig(&'static str),
 
+    #[error("accountd Codex home configuration is invalid")]
+    Home(#[source] HomeError),
+
     #[error("accountd protocol request is invalid")]
     InvalidRequest,
 
@@ -157,7 +161,7 @@ impl AccountdError {
             Self::StateUnavailable | Self::Persistence(_) | Self::CorruptState => {
                 "state_unavailable"
             }
-            Self::InvalidConfig(_) | Self::SocketConfig(_) => "invalid_config",
+            Self::InvalidConfig(_) | Self::Home(_) | Self::SocketConfig(_) => "invalid_config",
             Self::InvalidRequest => "invalid_request",
             Self::UnsupportedVersion => "unsupported_version",
             Self::RequestTooLarge => "request_too_large",
@@ -174,7 +178,9 @@ impl AccountdError {
             Self::StateUnavailable | Self::Persistence(_) | Self::CorruptState => {
                 "account metadata state is unavailable"
             }
-            Self::InvalidConfig(_) | Self::SocketConfig(_) => "accountd configuration is invalid",
+            Self::InvalidConfig(_) | Self::Home(_) | Self::SocketConfig(_) => {
+                "accountd configuration is invalid"
+            }
             Self::InvalidRequest => "request is invalid",
             Self::UnsupportedVersion => "protocol version is unsupported",
             Self::RequestTooLarge => "request exceeds the size limit",
@@ -195,6 +201,12 @@ impl From<sqlx::Error> for AccountdError {
 impl From<DomainError> for AccountdError {
     fn from(error: DomainError) -> Self {
         Self::Quota(error)
+    }
+}
+
+impl From<HomeError> for AccountdError {
+    fn from(error: HomeError) -> Self {
+        Self::Home(error)
     }
 }
 
@@ -1802,21 +1814,18 @@ pub fn sd_notify(_message: &str) -> Result<bool, AccountdError> {
     Ok(false)
 }
 
-/// Resolve `$CODEX_HOME/marathon/quota.sqlite`, falling back to
-/// `$HOME/.codex/marathon/quota.sqlite` when no explicit home is supplied.
+/// Resolve `$CODEX_HOME/marathon/quota.sqlite` using the shared CodexMarathon
+/// home contract. An explicit path (for example, `--codex-home`) remains
+/// authoritative and does not consult ambient configuration.
 pub fn default_quota_db_path(
     explicit_codex_home: Option<PathBuf>,
 ) -> Result<PathBuf, AccountdError> {
-    let codex_home = explicit_codex_home
-        .or_else(|| std::env::var_os("CODEX_HOME").map(PathBuf::from))
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))
-        .ok_or(AccountdError::InvalidConfig(
-            "CODEX_HOME or HOME is required",
-        ))?;
-    if codex_home.as_os_str().is_empty() {
-        return Err(AccountdError::InvalidConfig("CODEX_HOME is empty"));
+    let resolved = match explicit_codex_home {
+        Some(path) => codexmarathon_home::resolve_explicit(path),
+        None => codexmarathon_home::resolve(),
     }
-    codexmarathon_runtime::MarathonConfig::new(codex_home)
+    .map_err(AccountdError::Home)?;
+    codexmarathon_runtime::MarathonConfig::new(resolved.codex_home().to_path_buf())
         .map(|config| config.quota_db_path().to_path_buf())
         .map_err(AccountdError::Quota)
 }
@@ -2016,5 +2025,16 @@ mod tests {
                 Err(AccountdError::RequestTooLarge)
             ));
         });
+    }
+
+    #[test]
+    fn explicit_codex_home_remains_authoritative_for_default_quota_path() {
+        let directory = tempdir().expect("temporary directory");
+        let explicit_home = directory.path().join("explicit-codex-home");
+        let quota_path = default_quota_db_path(Some(explicit_home.clone())).expect("quota path");
+        assert_eq!(
+            quota_path,
+            explicit_home.join("marathon").join("quota.sqlite")
+        );
     }
 }

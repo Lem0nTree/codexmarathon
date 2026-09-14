@@ -1152,6 +1152,12 @@ client_request_definitions! {
         serialization: global("marathon"),
         response: v2::MarathonImportResponse,
     },
+    /// Save a current native snapshot without changing selection or aliases.
+    MarathonCheckpoint => "marathon/checkpoint" {
+        params: v2::MarathonCheckpointParams,
+        serialization: global("marathon"),
+        response: v2::MarathonCheckpointResponse,
+    },
     #[experimental("remoteControl/pairing/start")]
     RemoteControlPairingStart => "remoteControl/pairing/start" {
         params: v2::RemoteControlPairingStartParams,

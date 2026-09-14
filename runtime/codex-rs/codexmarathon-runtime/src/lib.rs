@@ -35,6 +35,7 @@ pub mod legacy;
 mod persistence;
 pub mod policy;
 pub mod quota_store;
+pub mod state_lock;
 pub mod telemetry;
 pub mod transitions;
 pub mod vault;

@@ -119,11 +119,11 @@ mod fs_watch;
 mod fuzzy_file_search;
 mod image_url;
 pub mod in_process;
+mod marathon_service;
 mod mcp_refresh;
 mod message_processor;
 mod models;
 mod models_refresh_worker;
-mod marathon_service;
 mod notification_media;
 mod otel_reloader;
 mod outgoing_message;
@@ -795,8 +795,8 @@ pub async fn run_main_with_transport_options(
     // process.  Treat it as a local transport for startup validation even
     // though it is spawned alongside the processor below rather than through
     // the JSON-RPC transport acceptor list.
-    let marathon_listener_requested = std::env::var_os("CODEXMARATHON_LISTEN")
-        .is_some_and(|value| !value.is_empty());
+    let marathon_listener_requested =
+        std::env::var_os("CODEXMARATHON_LISTEN").is_some_and(|value| !value.is_empty());
     let no_local_transport = transport_accept_handles.is_empty() && !marathon_listener_requested;
     if no_local_transport
         && remote_control_startup_mode != RemoteControlStartupMode::ResolvePersisted

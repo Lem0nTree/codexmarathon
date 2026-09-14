@@ -1,0 +1,22 @@
+[package]
+name = "codexmarathon-transfer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "Internal encrypted saved-account transfer for CodexMarathon"
+
+[lints]
+workspace = true
+
+[dependencies]
+age = { workspace = true }
+base64 = { workspace = true }
+chrono = { workspace = true }
+codexmarathon-runtime = { workspace = true }
+libc = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+thiserror = { workspace = true }
+zeroize = { workspace = true }

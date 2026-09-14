@@ -1,0 +1,23 @@
+[package]
+name = "codexmarathon-home"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Shared CodexMarathon home resolution and persistence"
+
+[lib]
+name = "codexmarathon_home"
+path = "src/lib.rs"
+doctest = false
+
+[lints]
+workspace = true
+
+[dependencies]
+libc = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

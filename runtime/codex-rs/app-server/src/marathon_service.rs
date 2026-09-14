@@ -6,16 +6,17 @@
 //! switches, and coordinates quota-triggered switches at an idle boundary.
 
 use codex_app_server_protocol::{
-    MarathonAccount, MarathonAutoResetSetResponse, MarathonEnabledSetResponse,
-    MarathonImportResponse, MarathonStatusResponse, MarathonSwitchOutcome, MarathonSwitchResponse,
+    MarathonAccount, MarathonAutoResetSetResponse, MarathonCheckpointResponse,
+    MarathonEnabledSetResponse, MarathonImportResponse, MarathonStatusResponse,
+    MarathonSwitchOutcome, MarathonSwitchResponse,
 };
 use codex_core::ThreadManager;
 use codex_login::{AuthDotJson, AuthManager, AuthReloadStatus, AuthTransitionSnapshot};
 use codex_protocol::protocol::RateLimitSnapshot;
 use codexmarathon_runtime::{
-    AccountStore, AccountTelemetry, AutoResetStore, CredentialHealth, DomainError,
-    FileAccountRegistry, FileSnapshotVault, Freshness, LimitTelemetry, MarathonConfig,
-    QuotaResetCapability, QuotaSnapshotStore, SnapshotVault, UsageWindow, WindowKind,
+    AccountTelemetry, AutoResetStore, CredentialHealth, DomainError, FileAccountRegistry,
+    FileSnapshotVault, Freshness, LimitTelemetry, MarathonConfig, QuotaResetCapability,
+    QuotaSnapshotStore, SnapshotVault, UsageWindow, WindowKind,
 };
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -334,9 +335,13 @@ impl MarathonService {
         alias: &str,
     ) -> Result<MarathonImportResponse, MarathonServiceError> {
         let _transition_guard = self.transition_mutex.lock().await;
-        let state = self
+        let state_lock = self
             .registry
-            .state()
+            .lock_exclusive()
+            .map_err(|_| MarathonServiceError::Persistence)?;
+        let mut state = self
+            .registry
+            .state_locked(&state_lock)
             .map_err(|_| MarathonServiceError::StateUnavailable)?;
         let current_account_id = self
             .auth_manager
@@ -360,7 +365,6 @@ impl MarathonService {
             return Err(MarathonServiceError::AliasConflict);
         }
         account.alias = validated.alias;
-        account.credential_ref = current_account_id.clone();
         account.credential_health = CredentialHealth::Healthy;
 
         let source_snapshot = self
@@ -370,43 +374,33 @@ impl MarathonService {
             .map_err(|_| MarathonServiceError::NativeTransition)?;
         let source_json = serde_json::to_vec(source_snapshot.as_auth_dot_json())
             .map_err(|_| MarathonServiceError::NativeTransition)?;
-        let source_snapshot =
-            codexmarathon_runtime::AuthSnapshot::for_account(&current_account_id, source_json)
-                .map_err(|_| MarathonServiceError::NativeTransition)?;
-        let previous_snapshot = self.vault.load(&current_account_id).ok();
+        let source_snapshot = codexmarathon_runtime::AuthSnapshot::from_owned_bytes(
+            Some(&current_account_id),
+            source_json,
+        )
+        .map_err(|_| MarathonServiceError::NativeTransition)?;
         self.vault
-            .save(&current_account_id, &source_snapshot)
+            .collect_orphans_locked(&state_lock, &state)
             .map_err(|_| MarathonServiceError::Persistence)?;
-
-        let previous_record = state.accounts.get(&current_account_id).cloned();
-        if let Err(error) = self.registry.upsert(account.clone()) {
-            rollback_import(
-                &self.registry,
-                &self.vault,
-                &current_account_id,
-                previous_record.as_ref(),
-                previous_snapshot.as_ref(),
-            );
-            let _ = error;
-            return Err(MarathonServiceError::Persistence);
-        }
-        if let Err(error) = self.registry.set_active(&current_account_id) {
-            rollback_import(
-                &self.registry,
-                &self.vault,
-                &current_account_id,
-                previous_record.as_ref(),
-                previous_snapshot.as_ref(),
-            );
-            let _ = error;
-            return Err(MarathonServiceError::Persistence);
-        }
+        let replaced = state.accounts.contains_key(&current_account_id);
+        account.credential_ref = self
+            .vault
+            .save_fresh_locked(&state_lock, &source_snapshot)
+            .map_err(|_| MarathonServiceError::Persistence)?;
+        account.updated_at = chrono::Utc::now();
+        state
+            .accounts
+            .insert(current_account_id.clone(), account.clone());
+        state.active_account_id = current_account_id.clone();
+        self.registry
+            .replace_locked(&state_lock, state)
+            .map_err(|_| MarathonServiceError::Persistence)?;
 
         Ok(MarathonImportResponse {
             account_id: current_account_id,
             alias: account.alias,
             active: true,
-            replaced: previous_snapshot.is_some(),
+            replaced,
         })
     }
 
@@ -415,9 +409,13 @@ impl MarathonService {
         target: &str,
     ) -> Result<MarathonSwitchResponse, MarathonServiceError> {
         let _transition_guard = self.transition_mutex.lock().await;
+        let state_lock = self
+            .registry
+            .lock_exclusive()
+            .map_err(|_| MarathonServiceError::Persistence)?;
         let state = self
             .registry
-            .state()
+            .state_locked(&state_lock)
             .map_err(|_| MarathonServiceError::StateUnavailable)?;
         let active_turn_count = (*self.running_turns.borrow()).min(u32::MAX as usize) as u32;
         let auth_generation = self.auth_generation.load(Ordering::Acquire);
@@ -439,7 +437,7 @@ impl MarathonService {
             .ok_or(MarathonServiceError::AuthenticationRequired)?;
         if current_account_id == target_account.id {
             self.registry
-                .set_active(&target_account.id)
+                .set_active_locked(&state_lock, &target_account.id)
                 .map_err(|_| MarathonServiceError::Persistence)?;
             return Ok(MarathonSwitchResponse {
                 account_id: Some(target_account.id),
@@ -459,9 +457,11 @@ impl MarathonService {
             .map_err(|_| MarathonServiceError::NativeTransition)?;
         let source_json = serde_json::to_vec(source_snapshot.as_auth_dot_json())
             .map_err(|_| MarathonServiceError::NativeTransition)?;
-        let source_snapshot =
-            codexmarathon_runtime::AuthSnapshot::for_account(&current_account_id, source_json)
-                .map_err(|_| MarathonServiceError::NativeTransition)?;
+        let source_snapshot = codexmarathon_runtime::AuthSnapshot::from_owned_bytes(
+            Some(&current_account_id),
+            source_json,
+        )
+        .map_err(|_| MarathonServiceError::NativeTransition)?;
         let source_credential_ref = state
             .accounts
             .get(&current_account_id)
@@ -474,7 +474,7 @@ impl MarathonService {
             })
             .unwrap_or_else(|| current_account_id.clone());
         self.vault
-            .save(&source_credential_ref, &source_snapshot)
+            .save_locked(&state_lock, &source_credential_ref, &source_snapshot)
             .map_err(|_| MarathonServiceError::Persistence)?;
 
         let target_credential_ref = if target_account.credential_ref.is_empty() {
@@ -482,13 +482,13 @@ impl MarathonService {
         } else {
             target_account.credential_ref.as_str()
         };
-        let target_snapshot =
-            self.vault
-                .load(target_credential_ref)
-                .map_err(|error| match error {
-                    DomainError::SnapshotNotFound => MarathonServiceError::CredentialsUnavailable,
-                    _ => MarathonServiceError::Persistence,
-                })?;
+        let target_snapshot = self
+            .vault
+            .load_locked(&state_lock, target_credential_ref)
+            .map_err(|error| match error {
+                DomainError::SnapshotNotFound => MarathonServiceError::CredentialsUnavailable,
+                _ => MarathonServiceError::Persistence,
+            })?;
         let target_auth: AuthDotJson = serde_json::from_slice(target_snapshot.bytes())
             .map_err(|_| MarathonServiceError::NativeTransition)?;
         let target_auth = AuthTransitionSnapshot::from_auth_dot_json(target_auth)
@@ -519,7 +519,7 @@ impl MarathonService {
             .invalidate_model_transport_caches()
             .await;
         self.registry
-            .set_active(&target_account.id)
+            .set_active_locked(&state_lock, &target_account.id)
             .map_err(|_| MarathonServiceError::Persistence)?;
         let auth_generation = if changed {
             self.auth_generation.fetch_add(1, Ordering::AcqRel) + 1
@@ -532,6 +532,65 @@ impl MarathonService {
             auth_generation,
             active_turn_count,
             reason: None,
+        })
+    }
+
+    pub(crate) async fn checkpoint_current(
+        &self,
+        expected_account_id: &str,
+        expected_auth_generation: u64,
+    ) -> Result<MarathonCheckpointResponse, MarathonServiceError> {
+        let _transition_guard = self.transition_mutex.lock().await;
+        let generation = self.auth_generation.load(Ordering::Acquire);
+        let current = self
+            .auth_manager
+            .auth_cached()
+            .and_then(|auth| auth.get_account_id());
+        if generation != expected_auth_generation || current.as_deref() != Some(expected_account_id)
+        {
+            return Err(MarathonServiceError::NativeTransition);
+        }
+        let lock = self
+            .registry
+            .lock_exclusive()
+            .map_err(|_| MarathonServiceError::Persistence)?;
+        let mut state = self
+            .registry
+            .state_locked(&lock)
+            .map_err(|_| MarathonServiceError::Persistence)?;
+        if !state.accounts.contains_key(expected_account_id) {
+            return Err(MarathonServiceError::AccountNotFound);
+        }
+        self.vault
+            .collect_orphans_locked(&lock, &state)
+            .map_err(|_| MarathonServiceError::Persistence)?;
+        let account = state
+            .accounts
+            .get_mut(expected_account_id)
+            .expect("account presence was checked before collecting orphaned snapshots");
+        let native = self
+            .auth_manager
+            .snapshot_for_transition(expected_account_id)
+            .await
+            .map_err(|_| MarathonServiceError::NativeTransition)?;
+        let bytes = serde_json::to_vec(native.as_auth_dot_json())
+            .map_err(|_| MarathonServiceError::NativeTransition)?;
+        let snapshot =
+            codexmarathon_runtime::AuthSnapshot::from_owned_bytes(Some(expected_account_id), bytes)
+                .map_err(|_| MarathonServiceError::NativeTransition)?;
+        if snapshot.embedded_account_id() != Some(expected_account_id) {
+            return Err(MarathonServiceError::NativeTransition);
+        }
+        account.credential_ref = self
+            .vault
+            .save_fresh_locked(&lock, &snapshot)
+            .map_err(|_| MarathonServiceError::Persistence)?;
+        self.registry
+            .replace_locked(&lock, state)
+            .map_err(|_| MarathonServiceError::Persistence)?;
+        Ok(MarathonCheckpointResponse {
+            account_id: expected_account_id.to_owned(),
+            auth_generation: generation,
         })
     }
 }
@@ -690,25 +749,6 @@ fn auto_reset_phase_label(phase: codexmarathon_runtime::AutoResetPhase) -> &'sta
         codexmarathon_runtime::AutoResetPhase::Attempting => "attempting",
         codexmarathon_runtime::AutoResetPhase::Succeeded => "succeeded",
         codexmarathon_runtime::AutoResetPhase::Blocked => "blocked",
-    }
-}
-
-fn rollback_import(
-    registry: &FileAccountRegistry,
-    vault: &FileSnapshotVault,
-    account_id: &str,
-    previous_record: Option<&codexmarathon_runtime::AccountRecord>,
-    previous_snapshot: Option<&codexmarathon_runtime::AuthSnapshot>,
-) {
-    if let Some(previous_record) = previous_record {
-        let _ = registry.upsert(previous_record.clone());
-    } else {
-        let _ = registry.remove(account_id, true);
-    }
-    if let Some(previous_snapshot) = previous_snapshot {
-        let _ = vault.save(account_id, previous_snapshot);
-    } else {
-        let _ = vault.delete(account_id);
     }
 }
 

@@ -1,0 +1,14 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "Enable or disable automatic use of a provider reset action when every eligible managed account has zero weekly quota.",
+  "properties": {
+    "enabled": {
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "enabled"
+  ],
+  "title": "MarathonAutoResetSetParams",
+  "type": "object"
+}

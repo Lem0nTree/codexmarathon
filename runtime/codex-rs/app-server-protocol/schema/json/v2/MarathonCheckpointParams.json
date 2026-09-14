@@ -1,0 +1,20 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "Checkpoint an already-saved current account through native AuthManager. Optimistic identity/generation binding prevents saving a different account after a status/selection race. No snapshot or passphrase crosses this API.",
+  "properties": {
+    "expectedAccountId": {
+      "type": "string"
+    },
+    "expectedAuthGeneration": {
+      "format": "uint64",
+      "minimum": 0.0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "expectedAccountId",
+    "expectedAuthGeneration"
+  ],
+  "title": "MarathonCheckpointParams",
+  "type": "object"
+}

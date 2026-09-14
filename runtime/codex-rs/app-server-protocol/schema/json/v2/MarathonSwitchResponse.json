@@ -1,0 +1,48 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "MarathonSwitchOutcome": {
+      "enum": [
+        "committed",
+        "rejected",
+        "deferred"
+      ],
+      "type": "string"
+    }
+  },
+  "description": "Secret-free result of a manual account switch.",
+  "properties": {
+    "accountId": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "activeTurnCount": {
+      "format": "uint32",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "authGeneration": {
+      "format": "uint64",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "outcome": {
+      "$ref": "#/definitions/MarathonSwitchOutcome"
+    },
+    "reason": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "activeTurnCount",
+    "authGeneration",
+    "outcome"
+  ],
+  "title": "MarathonSwitchResponse",
+  "type": "object"
+}

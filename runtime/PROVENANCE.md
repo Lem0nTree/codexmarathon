@@ -1,10 +1,9 @@
 # Optional runtime provenance
 
-CodexMarathon retains this Rust Codex runtime source for the compatible local
-control implementation, protocol development, and an explicitly opt-in
-self-contained diagnostic package. The normal companion release uses the
-user's separately installed Codex executable. The imported source is a pinned
-snapshot of the public
+CodexMarathon builds its modified CLI, native Marathon controls, and bundled
+account metadata daemon from this tracked Rust workspace. The release does not
+depend on a separately installed Codex executable. The imported source is a
+pinned snapshot of the public
 `openai/codex` repository:
 
 - Repository: <https://github.com/openai/codex>
@@ -45,6 +44,11 @@ The runtime-baseline integration additions are:
    refresh authority in isolated temporary auth homes. Its
    `account/authSnapshot/read` handler returns the same shared AuthManager
    snapshot so the controller can synchronize Account A before deployment.
+5. `codexmarathon-accountd` and `codexmarathon-accountd-client`, the private
+   credential-free local account/quota service and typed protocol client.
+6. `codexmarathon-home` and `codexmarathon-transfer`, which share the persisted
+   state-root contract and provide encrypted, transactional saved-account
+   transfer inside the modified CLI.
 
 The bridge does not independently parse or print credentials, create a second
 turn counter, or start a second Codex process. Opaque snapshot reads are made

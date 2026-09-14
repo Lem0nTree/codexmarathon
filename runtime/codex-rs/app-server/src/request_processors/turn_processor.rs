@@ -149,9 +149,7 @@ impl TurnRequestProcessor {
         thread_list_state_permit: Arc<Semaphore>,
         skills_watcher: Arc<SkillsWatcher>,
         turn_cost_worker: Option<crate::turn_cost_worker::TurnCostWorkerHandle>,
-        marathon_service: Arc<
-            std::sync::OnceLock<Arc<crate::marathon_service::MarathonService>>,
-        >,
+        marathon_service: Arc<std::sync::OnceLock<Arc<crate::marathon_service::MarathonService>>>,
     ) -> Self {
         let agent_runner = AgentRunner::new(Arc::downgrade(&thread_manager));
         Self {

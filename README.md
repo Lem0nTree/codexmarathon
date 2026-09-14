@@ -6,9 +6,10 @@ of the Codex CLI. Its release installer also installs and starts the private
 a controller command or configure a Marathon socket environment variable.
 
 It stores managed account profiles, lets you sign in to more than one ChatGPT
-account, and switches only at a safe boundary between turns. Credential
-snapshots are opaque, protected by Codex's configured credential storage, and
-never appear in status output, logs, or transition records.
+account, switches only at a safe boundary between turns, and can move selected
+profiles between CodexMarathon installations in a password-encrypted backup.
+Credential snapshots are treated as opaque, kept in owner-only local state,
+and never appear in status output, logs, or transition records.
 
 ## Install
 
@@ -31,8 +32,14 @@ curl -fsSL https://raw.githubusercontent.com/Lem0nTree/codexmarathon/main/script
   | CODEXMARATHON_CODEX_HOME=/srv/codex-state sh
 ```
 
-The default remains `$HOME/.codex`. The local API socket always stays under
-`$XDG_RUNTIME_DIR` and does not move with `CODEX_HOME`.
+The installer records that selection in the owner-private
+`$XDG_CONFIG_HOME/codexmarathon/config.json` (or
+`$HOME/.config/codexmarathon/config.json`). The modified CLI and accountd use
+it automatically on later invocations, so shell startup changes are not
+required. An explicit `CODEXMARATHON_CODEX_HOME` or `CODEX_HOME` still takes
+precedence; setting both to different paths is rejected. The default remains
+`$HOME/.codex`. The local API socket always stays under `$XDG_RUNTIME_DIR` and
+does not move with the state directory.
 
 ## Native workflow
 
@@ -101,6 +108,8 @@ codex marathon off
 codex marathon import <alias>
 codex marathon login <alias> [--browser | --device-code]
 codex marathon switch <alias-or-id>
+codex marathon backup export --output <file> [--account <id> ... | --all] [--overwrite]
+codex marathon backup import <file> [--conflict skip|replace|rename] [--dry-run | --yes]
 ```
 
 `import` saves the identity that is already active in Codex. `login` uses the
@@ -123,6 +132,33 @@ The matching interactive commands are:
 Configure the status line with the `marathon` and `marathon-accounts` items.
 They display whether native Marathon is enabled and the number of managed
 accounts.
+
+## Encrypted account backup
+
+Backups operate on saved Marathon profiles, not merely the currently installed
+`auth.json`. In an interactive terminal, omit the account flags to get a
+checkbox picker:
+
+```bash
+codex marathon backup export --output accounts.cmbackup
+codex marathon backup import accounts.cmbackup --dry-run
+codex marathon backup import accounts.cmbackup
+```
+
+Export asks for the passphrase twice and import asks once; terminal echo stays
+disabled while it is entered. For unattended use, pass an owner-only file with
+`--passphrase-file` and select accounts explicitly with repeatable `--account`
+or `--all`. Passphrases are never accepted in command arguments or environment
+variables.
+
+The archive is authenticated age encryption with a bounded scrypt work factor.
+Import validates and decrypts the complete archive before changing state,
+stages credentials under fresh vault references, and commits the registry as
+one atomic update. Imported accounts remain inactive, and import never replaces
+the destination's active `auth.json`. Conflicts default to `skip`; `replace`
+cannot replace the active identity, while `rename` changes only a colliding
+alias. See [Encrypted account backup and restore](docs/account-backup.md) for
+the full workflow and security contract.
 
 ## Local account API
 
@@ -181,6 +217,10 @@ requests.
   reconciliation; Marathon never guesses that a credential change succeeded.
 - API keys, external bearer authentication, workload identity, and other
   unsupported provider modes are rejected for Marathon switching.
+- Account backups are encrypted before publication and contain no quota,
+  scheduler, event, active-account, source-path, or machine metadata.
+- `codexmarathon-accountd` remains credential-free; backup and restore run
+  inside the CLI against the native Marathon vault.
 
 ## Quota reset actions
 
@@ -222,6 +262,7 @@ cargo check -p codex-cli
 ## Documentation
 
 - [Features and usage](docs/features-and-usage.md)
+- [Encrypted account backup and restore](docs/account-backup.md)
 - [Architecture](docs/architecture.md)
 - [Build and verification](docs/build-test.md)
 - [Runtime provenance](runtime/PROVENANCE.md)

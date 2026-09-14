@@ -1,0 +1,14 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "Capture the currently authenticated Codex identity in the Marathon vault.\n\nThe auth document is read only through Codex's native AuthManager. Clients never send token material to this request.",
+  "properties": {
+    "alias": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "alias"
+  ],
+  "title": "MarathonImportParams",
+  "type": "object"
+}

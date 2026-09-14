@@ -1936,6 +1936,72 @@
       ],
       "type": "string"
     },
+    "MarathonAutoResetSetParams": {
+      "description": "Enable or disable automatic use of a provider reset action when every eligible managed account has zero weekly quota.",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "enabled"
+      ],
+      "type": "object"
+    },
+    "MarathonCheckpointParams": {
+      "description": "Checkpoint an already-saved current account through native AuthManager. Optimistic identity/generation binding prevents saving a different account after a status/selection race. No snapshot or passphrase crosses this API.",
+      "properties": {
+        "expectedAccountId": {
+          "type": "string"
+        },
+        "expectedAuthGeneration": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "expectedAccountId",
+        "expectedAuthGeneration"
+      ],
+      "type": "object"
+    },
+    "MarathonEnabledSetParams": {
+      "description": "Enable or disable the native Marathon service.",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "enabled"
+      ],
+      "type": "object"
+    },
+    "MarathonImportParams": {
+      "description": "Capture the currently authenticated Codex identity in the Marathon vault.\n\nThe auth document is read only through Codex's native AuthManager. Clients never send token material to this request.",
+      "properties": {
+        "alias": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "alias"
+      ],
+      "type": "object"
+    },
+    "MarathonSwitchParams": {
+      "description": "Request a manual switch to an account id or registered alias.",
+      "properties": {
+        "target": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "target"
+      ],
+      "type": "object"
+    },
     "MarketplaceAddParams": {
       "properties": {
         "refName": {
@@ -7426,6 +7492,155 @@
         "params"
       ],
       "title": "ExperimentalFeature/enablement/setRequest",
+      "type": "object"
+    },
+    {
+      "description": "Read secret-free state from the native Marathon service.",
+      "properties": {
+        "id": {
+          "$ref": "#/definitions/RequestId"
+        },
+        "method": {
+          "enum": [
+            "marathon/status"
+          ],
+          "title": "Marathon/statusRequestMethod",
+          "type": "string"
+        },
+        "params": {
+          "type": "null"
+        }
+      },
+      "required": [
+        "id",
+        "method"
+      ],
+      "title": "Marathon/statusRequest",
+      "type": "object"
+    },
+    {
+      "description": "Enable or disable the native Marathon service.",
+      "properties": {
+        "id": {
+          "$ref": "#/definitions/RequestId"
+        },
+        "method": {
+          "enum": [
+            "marathon/enabled/set"
+          ],
+          "title": "Marathon/enabled/setRequestMethod",
+          "type": "string"
+        },
+        "params": {
+          "$ref": "#/definitions/MarathonEnabledSetParams"
+        }
+      },
+      "required": [
+        "id",
+        "method",
+        "params"
+      ],
+      "title": "Marathon/enabled/setRequest",
+      "type": "object"
+    },
+    {
+      "description": "Enable or disable automatic use of a provider-supported quota reset action after every eligible managed account reaches zero weekly quota.",
+      "properties": {
+        "id": {
+          "$ref": "#/definitions/RequestId"
+        },
+        "method": {
+          "enum": [
+            "marathon/autoReset/set"
+          ],
+          "title": "Marathon/autoReset/setRequestMethod",
+          "type": "string"
+        },
+        "params": {
+          "$ref": "#/definitions/MarathonAutoResetSetParams"
+        }
+      },
+      "required": [
+        "id",
+        "method",
+        "params"
+      ],
+      "title": "Marathon/autoReset/setRequest",
+      "type": "object"
+    },
+    {
+      "description": "Manually switch the native Codex auth identity at an idle boundary.",
+      "properties": {
+        "id": {
+          "$ref": "#/definitions/RequestId"
+        },
+        "method": {
+          "enum": [
+            "marathon/switch"
+          ],
+          "title": "Marathon/switchRequestMethod",
+          "type": "string"
+        },
+        "params": {
+          "$ref": "#/definitions/MarathonSwitchParams"
+        }
+      },
+      "required": [
+        "id",
+        "method",
+        "params"
+      ],
+      "title": "Marathon/switchRequest",
+      "type": "object"
+    },
+    {
+      "description": "Store the currently authenticated native Codex account under a Marathon alias.",
+      "properties": {
+        "id": {
+          "$ref": "#/definitions/RequestId"
+        },
+        "method": {
+          "enum": [
+            "marathon/import"
+          ],
+          "title": "Marathon/importRequestMethod",
+          "type": "string"
+        },
+        "params": {
+          "$ref": "#/definitions/MarathonImportParams"
+        }
+      },
+      "required": [
+        "id",
+        "method",
+        "params"
+      ],
+      "title": "Marathon/importRequest",
+      "type": "object"
+    },
+    {
+      "description": "Save a current native snapshot without changing selection or aliases.",
+      "properties": {
+        "id": {
+          "$ref": "#/definitions/RequestId"
+        },
+        "method": {
+          "enum": [
+            "marathon/checkpoint"
+          ],
+          "title": "Marathon/checkpointRequestMethod",
+          "type": "string"
+        },
+        "params": {
+          "$ref": "#/definitions/MarathonCheckpointParams"
+        }
+      },
+      "required": [
+        "id",
+        "method",
+        "params"
+      ],
+      "title": "Marathon/checkpointRequest",
       "type": "object"
     },
     {

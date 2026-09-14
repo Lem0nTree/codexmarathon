@@ -1,0 +1,26 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "Secret-free result of importing the current native Codex identity.",
+  "properties": {
+    "accountId": {
+      "type": "string"
+    },
+    "active": {
+      "type": "boolean"
+    },
+    "alias": {
+      "type": "string"
+    },
+    "replaced": {
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "accountId",
+    "active",
+    "alias",
+    "replaced"
+  ],
+  "title": "MarathonImportResponse",
+  "type": "object"
+}

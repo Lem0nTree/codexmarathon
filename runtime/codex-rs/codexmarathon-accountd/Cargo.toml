@@ -22,6 +22,7 @@ chrono = { workspace = true, features = ["serde"] }
 clap = { workspace = true, features = ["derive"] }
 codexmarathon-runtime = { workspace = true }
 codexmarathon-accountd-client = { workspace = true }
+codexmarathon-home = { workspace = true }
 libc = { workspace = true }
 log = { workspace = true }
 serde = { workspace = true, features = ["derive"] }

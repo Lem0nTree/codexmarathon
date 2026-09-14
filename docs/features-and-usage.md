@@ -1,8 +1,8 @@
 # CodexMarathon features and usage
 
-CodexMarathon is built into the custom Codex Rust CLI. The installed result is
-one `codex` executable; there is no companion process, control socket, or
-second command to supervise.
+CodexMarathon is built into the custom Codex Rust CLI. The release also ships
+the private, automatically managed `codexmarathon-accountd` metadata service;
+users do not install a plugin, SDK, or separate backup utility.
 
 ## Native commands
 
@@ -15,11 +15,13 @@ codex marathon login personal --device-code
 codex marathon login work --device-code
 codex marathon on
 codex marathon switch work
+codex marathon backup export --output accounts.cmbackup
 ```
 
-`status` and `accounts` show only aliases, IDs, quota summaries, enabled state,
-and transition state. Credential snapshots are never printed. `import` stores
-the identity that is already active in Codex:
+Native `status` and `accounts` show aliases, IDs, enabled state, and transition
+state. `accounts --daemon` adds the credential-health and quota summaries from
+accountd. Credential snapshots are never printed. `import` stores the identity
+that is already active in Codex:
 
 ```bash
 codex marathon import personal
@@ -29,6 +31,35 @@ Use `codex marathon off` to leave the profiles stored while disabling
 automatic Marathon account management. A switch is accepted only at a safe
 turn boundary and updates Codex's native in-memory authentication after the
 durable transition is committed.
+
+## Encrypted backup and restore
+
+Export selected saved profiles with the interactive checkbox picker:
+
+```bash
+codex marathon backup export --output accounts.cmbackup
+```
+
+For a non-interactive job, account selection and an owner-only passphrase file
+must be explicit:
+
+```bash
+codex marathon backup export --output accounts.cmbackup --all \
+  --passphrase-file /secure/codexmarathon-passphrase
+codex marathon backup import accounts.cmbackup --dry-run \
+  --passphrase-file /secure/codexmarathon-passphrase
+codex marathon backup import accounts.cmbackup --yes \
+  --passphrase-file /secure/codexmarathon-passphrase
+```
+
+The import conflict policy is `skip` by default. Choose `--conflict replace`
+to update only matching stable account IDs, or `--conflict rename` to retain an
+unrelated destination account and rename the imported alias. The active
+identity cannot be replaced. Imported accounts stay inactive until an explicit
+`codex marathon switch`.
+
+See [Encrypted account backup and restore](account-backup.md) for archive
+limits, password-file rules, atomicity, custom-home behavior, and recovery.
 
 The automatic reset control is explicit and disabled by default:
 

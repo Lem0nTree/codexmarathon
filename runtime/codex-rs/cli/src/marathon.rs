@@ -5,6 +5,7 @@
 //! its Unix socket environment variable; all state changes go through the
 //! typed app-server Marathon requests.
 
+use age::secrecy::ExposeSecret;
 use clap::{Parser, ValueEnum};
 use codex_app_server_client::DEFAULT_IN_PROCESS_CHANNEL_CAPACITY;
 use codex_app_server_client::InProcessAppServerClient;
@@ -15,6 +16,8 @@ use codex_app_server_protocol::LoginAccountResponse;
 use codex_app_server_protocol::MarathonAccount;
 use codex_app_server_protocol::MarathonAutoResetSetParams;
 use codex_app_server_protocol::MarathonAutoResetSetResponse;
+use codex_app_server_protocol::MarathonCheckpointParams;
+use codex_app_server_protocol::MarathonCheckpointResponse;
 use codex_app_server_protocol::MarathonEnabledSetParams;
 use codex_app_server_protocol::MarathonEnabledSetResponse;
 use codex_app_server_protocol::MarathonImportParams;
@@ -27,7 +30,9 @@ use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ServerNotification;
 use codex_arg0::Arg0DispatchPaths;
 use codex_cloud_config::cloud_config_bundle_loader_for_storage;
+use codex_config::CloudConfigBundleLoader;
 use codex_config::LoaderOverrides;
+use codex_core::config::Config;
 use codex_core::config::ConfigBuilder;
 use codex_exec_server::EnvironmentManager;
 use codex_feedback::CodexFeedback;
@@ -36,11 +41,22 @@ use codexmarathon_accountd_client::{
     AccountTelemetry as DaemonTelemetry, AccountdClient, AccountsResult, Freshness, UsageWindow,
     WindowKind, default_socket_path,
 };
+use codexmarathon_runtime::MarathonConfig;
+use codexmarathon_transfer as transfer;
+use codexmarathon_transfer::ConflictPolicy;
+use codexmarathon_transfer::SecretString;
+use crossterm::cursor;
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::execute;
+use crossterm::terminal::{self, ClearType};
 use serde::de::DeserializeOwned;
+use std::io;
 use std::io::IsTerminal;
 use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
+use zeroize::Zeroizing;
 
 #[derive(Debug, Parser)]
 pub(crate) struct MarathonCommand {
@@ -103,6 +119,87 @@ pub(crate) enum MarathonAction {
         /// Registered account alias or account id.
         target: String,
     },
+
+    /// Encrypt or restore native Marathon account backups.
+    Backup {
+        #[command(subcommand)]
+        action: BackupAction,
+    },
+}
+
+#[derive(Debug, clap::Subcommand)]
+pub(crate) enum BackupAction {
+    /// Encrypt selected native Marathon accounts into an age backup file.
+    Export(BackupExportArgs),
+
+    /// Restore native Marathon accounts from an encrypted age backup file.
+    Import(BackupImportArgs),
+}
+
+#[derive(Debug, clap::Args)]
+pub(crate) struct BackupExportArgs {
+    /// Destination path for the encrypted backup.
+    #[arg(long, value_name = "PATH")]
+    output: PathBuf,
+
+    /// Account id to include. Repeat for multiple accounts.
+    #[arg(long = "account", value_name = "ID", conflicts_with = "all")]
+    account: Vec<String>,
+
+    /// Include every registered account.
+    #[arg(long, conflicts_with = "account")]
+    all: bool,
+
+    /// Replace an existing destination file.
+    #[arg(long)]
+    overwrite: bool,
+
+    /// Read the passphrase from an owner-only file instead of prompting.
+    #[arg(long, value_name = "PATH")]
+    passphrase_file: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub(crate) enum BackupConflict {
+    /// Leave a conflicting account unchanged.
+    Skip,
+    /// Replace an existing account with the imported snapshot.
+    Replace,
+    /// Rename an imported account when its alias conflicts.
+    Rename,
+}
+
+impl BackupConflict {
+    fn into_policy(self) -> ConflictPolicy {
+        match self {
+            Self::Skip => ConflictPolicy::Skip,
+            Self::Replace => ConflictPolicy::Replace,
+            Self::Rename => ConflictPolicy::Rename,
+        }
+    }
+}
+
+#[derive(Debug, clap::Args)]
+pub(crate) struct BackupImportArgs {
+    /// Source path for the encrypted backup.
+    #[arg(value_name = "PATH")]
+    input: PathBuf,
+
+    /// Resolve account conflicts using this policy.
+    #[arg(long, value_enum, default_value_t = BackupConflict::Skip)]
+    conflict: BackupConflict,
+
+    /// Validate and preview the backup without writing account state.
+    #[arg(long)]
+    dry_run: bool,
+
+    /// Apply the import without an interactive confirmation.
+    #[arg(long, conflicts_with = "dry_run")]
+    yes: bool,
+
+    /// Read the passphrase from an owner-only file instead of prompting.
+    #[arg(long, value_name = "PATH")]
+    passphrase_file: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -130,6 +227,16 @@ pub(crate) async fn run(
     loader_overrides: LoaderOverrides,
 ) -> anyhow::Result<()> {
     let action = command.action.unwrap_or(MarathonAction::Status);
+    if matches!(&action, MarathonAction::Backup { .. }) {
+        return run_backup(
+            action,
+            root_config_overrides,
+            strict_config,
+            arg0_paths,
+            loader_overrides,
+        )
+        .await;
+    }
     if let MarathonAction::Accounts {
         daemon: true,
         format,
@@ -158,30 +265,21 @@ async fn start_client(
     arg0_paths: Arg0DispatchPaths,
     loader_overrides: LoaderOverrides,
 ) -> anyhow::Result<InProcessAppServerClient> {
-    let cli_overrides = root_config_overrides
-        .parse_overrides()
-        .map_err(anyhow::Error::msg)?;
+    let prepared = prepare_config(root_config_overrides, strict_config, &loader_overrides).await?;
+    start_client_with_prepared(prepared, strict_config, arg0_paths, loader_overrides).await
+}
 
-    // Build once without managed cloud config so the native auth configuration
-    // can choose the same cloud loader as the interactive TUI.
-    let bootstrap_config = ConfigBuilder::default()
-        .cli_overrides(cli_overrides.clone())
-        .loader_overrides(loader_overrides.clone())
-        .strict_config(strict_config)
-        .build()
-        .await?;
-    let cloud_config_bundle = cloud_config_bundle_loader_for_storage(
-        bootstrap_config.auth_config(),
-        /*enable_codex_api_key_env*/ false,
-    )
-    .await?;
-    let config = ConfigBuilder::default()
-        .cli_overrides(cli_overrides.clone())
-        .loader_overrides(loader_overrides.clone())
-        .strict_config(strict_config)
-        .cloud_config_bundle(cloud_config_bundle.clone())
-        .build()
-        .await?;
+async fn start_client_with_prepared(
+    prepared: PreparedConfig,
+    strict_config: bool,
+    arg0_paths: Arg0DispatchPaths,
+    loader_overrides: LoaderOverrides,
+) -> anyhow::Result<InProcessAppServerClient> {
+    let PreparedConfig {
+        config,
+        cli_overrides,
+        cloud_config_bundle,
+    } = prepared;
 
     let config_warnings = config
         .startup_warnings
@@ -221,6 +319,559 @@ async fn start_client(
         channel_capacity: DEFAULT_IN_PROCESS_CHANNEL_CAPACITY,
     })
     .await?)
+}
+
+struct PreparedConfig {
+    config: Config,
+    cli_overrides: Vec<(String, toml::Value)>,
+    cloud_config_bundle: CloudConfigBundleLoader,
+}
+
+async fn prepare_config(
+    root_config_overrides: &CliConfigOverrides,
+    strict_config: bool,
+    loader_overrides: &LoaderOverrides,
+) -> anyhow::Result<PreparedConfig> {
+    let cli_overrides = root_config_overrides
+        .parse_overrides()
+        .map_err(anyhow::Error::msg)?;
+
+    // Build once without managed cloud config so the native auth configuration
+    // can choose the same cloud loader as the interactive TUI.
+    let bootstrap_config = ConfigBuilder::default()
+        .cli_overrides(cli_overrides.clone())
+        .loader_overrides(loader_overrides.clone())
+        .strict_config(strict_config)
+        .build()
+        .await?;
+    let cloud_config_bundle = cloud_config_bundle_loader_for_storage(
+        bootstrap_config.auth_config(),
+        /*enable_codex_api_key_env*/ false,
+    )
+    .await?;
+    let config = ConfigBuilder::default()
+        .cli_overrides(cli_overrides.clone())
+        .loader_overrides(loader_overrides.clone())
+        .strict_config(strict_config)
+        .cloud_config_bundle(cloud_config_bundle.clone())
+        .build()
+        .await?;
+
+    Ok(PreparedConfig {
+        config,
+        cli_overrides,
+        cloud_config_bundle,
+    })
+}
+
+async fn run_backup(
+    action: MarathonAction,
+    root_config_overrides: &CliConfigOverrides,
+    strict_config: bool,
+    arg0_paths: Arg0DispatchPaths,
+    loader_overrides: LoaderOverrides,
+) -> anyhow::Result<()> {
+    let MarathonAction::Backup { action } = action else {
+        unreachable!("run_backup is only called for a backup action");
+    };
+    let prepared = prepare_config(root_config_overrides, strict_config, &loader_overrides).await?;
+    let config = MarathonConfig::new(prepared.config.codex_home.to_path_buf())?;
+    run_backup_action(
+        &config,
+        action,
+        prepared,
+        strict_config,
+        arg0_paths,
+        loader_overrides,
+    )
+    .await
+}
+
+async fn run_backup_action(
+    config: &MarathonConfig,
+    action: BackupAction,
+    prepared: PreparedConfig,
+    strict_config: bool,
+    arg0_paths: Arg0DispatchPaths,
+    loader_overrides: LoaderOverrides,
+) -> anyhow::Result<()> {
+    match action {
+        BackupAction::Export(args) => {
+            run_backup_export(
+                config,
+                args,
+                prepared,
+                strict_config,
+                arg0_paths,
+                loader_overrides,
+            )
+            .await
+        }
+        BackupAction::Import(args) => {
+            run_backup_import(
+                config,
+                args,
+                prepared,
+                strict_config,
+                arg0_paths,
+                loader_overrides,
+            )
+            .await
+        }
+    }
+}
+
+async fn run_backup_export(
+    config: &MarathonConfig,
+    args: BackupExportArgs,
+    prepared: PreparedConfig,
+    strict_config: bool,
+    arg0_paths: Arg0DispatchPaths,
+    loader_overrides: LoaderOverrides,
+) -> anyhow::Result<()> {
+    let interactive = interactive_terminal();
+    let accounts = transfer::list_accounts(config).map_err(transfer_error)?;
+    let selected_ids = if args.all {
+        account_ids(&accounts)
+    } else if !args.account.is_empty() {
+        args.account
+    } else {
+        if !interactive {
+            anyhow::bail!("backup export requires --account or --all when no terminal is attached");
+        }
+        choose_accounts(&accounts)?
+    };
+    if selected_ids.is_empty() {
+        anyhow::bail!("no accounts are available to export");
+    }
+
+    let passphrase = export_passphrase(args.passphrase_file.as_deref(), interactive)?;
+    checkpoint_before_export(
+        &selected_ids,
+        prepared,
+        strict_config,
+        arg0_paths,
+        loader_overrides,
+    )
+    .await?;
+    let report = transfer::export_accounts(
+        config,
+        &selected_ids,
+        &args.output,
+        passphrase,
+        args.overwrite,
+    )
+    .map_err(transfer_error)?;
+
+    println!(
+        "Encrypted {} account{} to {}.",
+        report.accounts.len(),
+        plural_suffix(report.accounts.len()),
+        args.output.display()
+    );
+    print_account_summaries("  ", &report.accounts);
+    Ok(())
+}
+
+async fn run_backup_import(
+    config: &MarathonConfig,
+    args: BackupImportArgs,
+    prepared: PreparedConfig,
+    strict_config: bool,
+    arg0_paths: Arg0DispatchPaths,
+    loader_overrides: LoaderOverrides,
+) -> anyhow::Result<()> {
+    let interactive = interactive_terminal();
+    if !args.dry_run && !args.yes && !interactive {
+        anyhow::bail!("backup import requires --yes when no terminal is attached");
+    }
+    let passphrase = import_passphrase(args.passphrase_file.as_deref(), interactive)?;
+    let conflict = args.conflict.into_policy();
+
+    // Always preview first so a replace operation can be checked against the
+    // account currently held by the native AuthManager before confirmation or
+    // any write transaction begins.
+    let preview =
+        transfer::import_accounts(config, &args.input, passphrase.clone(), conflict, true)
+            .map_err(transfer_error)?;
+    if !args.dry_run && matches!(conflict, ConflictPolicy::Replace) && !preview.replaced.is_empty()
+    {
+        reject_live_account_replacement(
+            &preview.replaced,
+            prepared,
+            strict_config,
+            arg0_paths,
+            loader_overrides,
+        )
+        .await?;
+    }
+
+    if args.dry_run {
+        print_import_report(&preview, true);
+        return Ok(());
+    }
+
+    if args.yes {
+        let report = transfer::import_accounts(config, &args.input, passphrase, conflict, false)
+            .map_err(transfer_error)?;
+        print_import_report(&report, false);
+        return Ok(());
+    }
+
+    // Planning with dry_run gives the operator a secret-free preview before
+    // the one write transaction. The passphrase is cloned inside SecretString
+    // and is never converted to a normal command-line or environment value.
+    print_import_report(&preview, true);
+    if preview.imported.is_empty() && preview.replaced.is_empty() {
+        return Ok(());
+    }
+    if !confirm_import()? {
+        println!("Backup import canceled.");
+        return Ok(());
+    }
+
+    let report = transfer::import_accounts(config, &args.input, passphrase, conflict, false)
+        .map_err(transfer_error)?;
+    print_import_report(&report, false);
+    Ok(())
+}
+
+async fn checkpoint_before_export(
+    selected_ids: &[String],
+    prepared: PreparedConfig,
+    strict_config: bool,
+    arg0_paths: Arg0DispatchPaths,
+    loader_overrides: LoaderOverrides,
+) -> anyhow::Result<()> {
+    // Always ask the embedded service for the live identity. The persisted
+    // registry marker can lag native AuthManager after a login or switch.
+    let mut client =
+        start_client_with_prepared(prepared, strict_config, arg0_paths, loader_overrides).await?;
+    let checkpoint_result = checkpoint_selected_active(&mut client, selected_ids).await;
+    let shutdown_result = client.shutdown().await;
+    checkpoint_result?;
+    shutdown_result.map_err(anyhow::Error::from)
+}
+
+async fn checkpoint_selected_active(
+    client: &mut InProcessAppServerClient,
+    selected_ids: &[String],
+) -> anyhow::Result<()> {
+    let status: MarathonStatusResponse = request(
+        client,
+        ClientRequest::MarathonStatus {
+            request_id: request_id("marathon-backup-status"),
+            params: None,
+        },
+    )
+    .await?;
+    let Some(active_account_id) = status.current_account_id else {
+        return Ok(());
+    };
+    if !selected_ids
+        .iter()
+        .any(|account_id| account_id == &active_account_id)
+    {
+        return Ok(());
+    }
+
+    let response: MarathonCheckpointResponse = request(
+        client,
+        ClientRequest::MarathonCheckpoint {
+            request_id: request_id("marathon-backup-checkpoint"),
+            params: MarathonCheckpointParams {
+                expected_account_id: active_account_id.clone(),
+                expected_auth_generation: status.auth_generation,
+            },
+        },
+    )
+    .await?;
+    if response.account_id != active_account_id {
+        anyhow::bail!("backup checkpoint returned an unexpected account");
+    }
+    Ok(())
+}
+
+async fn reject_live_account_replacement(
+    replaced: &[transfer::AccountSummary],
+    prepared: PreparedConfig,
+    strict_config: bool,
+    arg0_paths: Arg0DispatchPaths,
+    loader_overrides: LoaderOverrides,
+) -> anyhow::Result<()> {
+    let client =
+        start_client_with_prepared(prepared, strict_config, arg0_paths, loader_overrides).await?;
+    let current_result: anyhow::Result<Option<String>> = request(
+        &client,
+        ClientRequest::MarathonStatus {
+            request_id: request_id("marathon-backup-import-status"),
+            params: None,
+        },
+    )
+    .await
+    .map(|status: MarathonStatusResponse| status.current_account_id);
+    let shutdown_result = client.shutdown().await;
+    let current_account_id = current_result?;
+    shutdown_result.map_err(anyhow::Error::from)?;
+
+    if let Some(current_account_id) = current_account_id {
+        if replacement_includes_account(replaced, &current_account_id) {
+            anyhow::bail!(
+                "backup import cannot replace the currently authenticated account; switch accounts first"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn replacement_includes_account(
+    replaced: &[transfer::AccountSummary],
+    current_account_id: &str,
+) -> bool {
+    replaced
+        .iter()
+        .any(|account| account.id == current_account_id)
+}
+
+fn account_ids(accounts: &[transfer::AccountSummary]) -> Vec<String> {
+    accounts.iter().map(|account| account.id.clone()).collect()
+}
+
+fn export_passphrase(path: Option<&Path>, interactive: bool) -> anyhow::Result<SecretString> {
+    if let Some(path) = path {
+        return transfer::read_passphrase_file(path).map_err(transfer_error);
+    }
+    if !interactive {
+        anyhow::bail!("backup export requires --passphrase-file when no terminal is attached");
+    }
+
+    let first = read_hidden_passphrase("Passphrase: ")?;
+    let second = read_hidden_passphrase("Repeat passphrase: ")?;
+    if first.expose_secret() != second.expose_secret() {
+        anyhow::bail!("passphrases do not match");
+    }
+    Ok(first)
+}
+
+fn import_passphrase(path: Option<&Path>, interactive: bool) -> anyhow::Result<SecretString> {
+    if let Some(path) = path {
+        return transfer::read_passphrase_file(path).map_err(transfer_error);
+    }
+    if !interactive {
+        anyhow::bail!("backup import requires --passphrase-file when no terminal is attached");
+    }
+    read_hidden_passphrase("Passphrase: ")
+}
+
+fn transfer_error(error: transfer::TransferError) -> anyhow::Error {
+    anyhow::anyhow!(error.to_string())
+}
+
+fn plural_suffix(count: usize) -> &'static str {
+    if count == 1 { "" } else { "s" }
+}
+
+fn print_account_summaries(indent: &str, accounts: &[transfer::AccountSummary]) {
+    for account in accounts {
+        let alias = if account.alias.is_empty() {
+            "(no alias)"
+        } else {
+            account.alias.as_str()
+        };
+        println!("{indent}{alias} ({})", account.id);
+    }
+}
+
+fn print_import_report(report: &transfer::ImportReport, preview: bool) {
+    println!(
+        "Backup import {}.",
+        if preview {
+            "preview (no changes written)"
+        } else {
+            "completed"
+        }
+    );
+    print_import_group("  Imported", &report.imported);
+    print_import_group("  Replaced", &report.replaced);
+    print_import_group("  Skipped", &report.skipped);
+}
+
+fn print_import_group(label: &str, accounts: &[transfer::AccountSummary]) {
+    println!("{label}: {}", accounts.len());
+    print_account_summaries("    ", accounts);
+}
+
+fn confirm_import() -> anyhow::Result<bool> {
+    let mut stderr = io::stderr();
+    write!(stderr, "Apply this backup import? [y/N] ")?;
+    stderr.flush()?;
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    writeln!(stderr)?;
+    Ok(matches!(
+        answer.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
+}
+
+fn interactive_terminal() -> bool {
+    io::stdin().is_terminal() && io::stderr().is_terminal()
+}
+
+struct RawModeGuard;
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        let _ = terminal::disable_raw_mode();
+    }
+}
+
+fn read_hidden_passphrase(prompt: &str) -> anyhow::Result<SecretString> {
+    let mut line = read_hidden_line(prompt)?;
+    Ok(SecretString::from(std::mem::take(&mut *line)))
+}
+
+fn read_hidden_line(prompt: &str) -> anyhow::Result<Zeroizing<String>> {
+    let mut stderr = io::stderr();
+    write!(stderr, "{prompt}")?;
+    stderr.flush()?;
+    terminal::enable_raw_mode()?;
+    let guard = RawModeGuard;
+    let mut line = Zeroizing::new(String::new());
+    let result = loop {
+        let Event::Key(key) = event::read()? else {
+            continue;
+        };
+        if key.kind != KeyEventKind::Press {
+            continue;
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
+        {
+            break Err(anyhow::anyhow!("passphrase entry canceled"));
+        }
+        match key.code {
+            KeyCode::Enter => break Ok(Zeroizing::new(std::mem::take(&mut *line))),
+            KeyCode::Esc => break Err(anyhow::anyhow!("passphrase entry canceled")),
+            KeyCode::Backspace => {
+                line.pop();
+            }
+            KeyCode::Char(character) => line.push(character),
+            _ => {}
+        }
+    };
+    drop(guard);
+    writeln!(stderr)?;
+    result
+}
+
+fn choose_accounts(accounts: &[transfer::AccountSummary]) -> anyhow::Result<Vec<String>> {
+    if accounts.is_empty() {
+        anyhow::bail!("no accounts are available to export");
+    }
+    terminal::enable_raw_mode()?;
+    let guard = RawModeGuard;
+    let result = account_picker_loop(accounts);
+    drop(guard);
+    writeln!(io::stderr())?;
+    result
+}
+
+fn account_picker_loop(accounts: &[transfer::AccountSummary]) -> anyhow::Result<Vec<String>> {
+    let mut selected = vec![false; accounts.len()];
+    let mut cursor = 0usize;
+    let mut rendered_lines = 0usize;
+    let mut message = None;
+    let mut stderr = io::stderr();
+
+    loop {
+        rendered_lines = render_account_picker(
+            &mut stderr,
+            accounts,
+            &selected,
+            cursor,
+            rendered_lines,
+            message,
+        )?;
+        message = None;
+        let Event::Key(key) = event::read()? else {
+            continue;
+        };
+        if key.kind != KeyEventKind::Press {
+            continue;
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
+        {
+            anyhow::bail!("account selection canceled");
+        }
+        match key.code {
+            KeyCode::Up => {
+                cursor = if cursor == 0 {
+                    accounts.len() - 1
+                } else {
+                    cursor - 1
+                };
+            }
+            KeyCode::Down => {
+                cursor = (cursor + 1) % accounts.len();
+            }
+            KeyCode::Char(' ') => selected[cursor] = !selected[cursor],
+            KeyCode::Char('a') | KeyCode::Char('A') => selected.fill(true),
+            KeyCode::Enter => {
+                if selected.iter().any(|selected| *selected) {
+                    return Ok(accounts
+                        .iter()
+                        .zip(selected)
+                        .filter_map(|(account, selected)| selected.then_some(account.id.clone()))
+                        .collect());
+                }
+                message = Some("select at least one account before confirming");
+            }
+            KeyCode::Esc => anyhow::bail!("account selection canceled"),
+            _ => {}
+        }
+    }
+}
+
+fn render_account_picker(
+    stderr: &mut io::Stderr,
+    accounts: &[transfer::AccountSummary],
+    selected: &[bool],
+    cursor: usize,
+    rendered_lines: usize,
+    message: Option<&str>,
+) -> anyhow::Result<usize> {
+    if rendered_lines > 0 {
+        execute!(
+            stderr,
+            cursor::MoveToColumn(0),
+            cursor::MoveUp(rendered_lines as u16),
+            terminal::Clear(ClearType::FromCursorDown)
+        )?;
+    }
+    writeln!(
+        stderr,
+        "Select accounts to export (Space toggle, a all, Enter confirm, Esc cancel):"
+    )?;
+    let mut lines = 1usize;
+    for (index, account) in accounts.iter().enumerate() {
+        let pointer = if index == cursor { ">" } else { " " };
+        let marker = if selected[index] { "x" } else { " " };
+        let alias = if account.alias.is_empty() {
+            "(no alias)"
+        } else {
+            account.alias.as_str()
+        };
+        writeln!(stderr, "{pointer} [{marker}] {alias} ({})", account.id)?;
+        lines += 1;
+    }
+    if let Some(message) = message {
+        writeln!(stderr, "{message}")?;
+        lines += 1;
+    }
+    stderr.flush()?;
+    Ok(lines)
 }
 
 async fn run_action(
@@ -348,6 +999,9 @@ async fn run_action(
                 choose_login_mode()?
             };
             login_and_import(client, alias, mode).await?
+        }
+        MarathonAction::Backup { .. } => {
+            unreachable!("backup actions are handled before app-server startup")
         }
     }
     Ok(())
@@ -709,5 +1363,104 @@ mod tests {
                 action: AutoResetAction::On
             })
         ));
+    }
+
+    #[test]
+    fn parses_encrypted_backup_actions() {
+        let command = MarathonCommand::try_parse_from([
+            "marathon",
+            "backup",
+            "export",
+            "--output",
+            "accounts.age",
+            "--account",
+            "account-a",
+            "--account",
+            "account-b",
+            "--overwrite",
+        ])
+        .expect("valid backup export");
+        let Some(MarathonAction::Backup {
+            action: BackupAction::Export(args),
+        }) = command.action
+        else {
+            panic!("expected backup export");
+        };
+        assert_eq!(args.output, PathBuf::from("accounts.age"));
+        assert_eq!(
+            args.account,
+            vec!["account-a".to_string(), "account-b".to_string()]
+        );
+        assert!(args.overwrite);
+
+        let command = MarathonCommand::try_parse_from([
+            "marathon",
+            "backup",
+            "import",
+            "accounts.age",
+            "--conflict",
+            "rename",
+            "--dry-run",
+        ])
+        .expect("valid backup import");
+        assert!(matches!(
+            command.action,
+            Some(MarathonAction::Backup {
+                action: BackupAction::Import(BackupImportArgs {
+                    conflict: BackupConflict::Rename,
+                    dry_run: true,
+                    ..
+                })
+            })
+        ));
+
+        assert!(
+            MarathonCommand::try_parse_from([
+                "marathon",
+                "backup",
+                "import",
+                "accounts.age",
+                "--dry-run",
+                "--yes",
+            ])
+            .is_err()
+        );
+
+        assert!(
+            MarathonCommand::try_parse_from([
+                "marathon",
+                "backup",
+                "export",
+                "--output",
+                "accounts.age",
+                "--all",
+                "--account",
+                "account-a",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn backup_selection_helpers_are_secret_free() {
+        let accounts = vec![
+            transfer::AccountSummary {
+                id: "account-b".to_string(),
+                alias: "work".to_string(),
+            },
+            transfer::AccountSummary {
+                id: "account-a".to_string(),
+                alias: "personal".to_string(),
+            },
+        ];
+        assert_eq!(
+            account_ids(&accounts),
+            vec!["account-b".to_string(), "account-a".to_string()]
+        );
+        assert_eq!(plural_suffix(1), "");
+        assert_eq!(plural_suffix(2), "s");
+
+        assert!(replacement_includes_account(&accounts, "account-a"));
+        assert!(!replacement_includes_account(&accounts, "account-c"));
     }
 }

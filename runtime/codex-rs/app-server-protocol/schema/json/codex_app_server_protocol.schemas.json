@@ -1904,6 +1904,155 @@
           "type": "object"
         },
         {
+          "description": "Read secret-free state from the native Marathon service.",
+          "properties": {
+            "id": {
+              "$ref": "#/definitions/v2/RequestId"
+            },
+            "method": {
+              "enum": [
+                "marathon/status"
+              ],
+              "title": "Marathon/statusRequestMethod",
+              "type": "string"
+            },
+            "params": {
+              "type": "null"
+            }
+          },
+          "required": [
+            "id",
+            "method"
+          ],
+          "title": "Marathon/statusRequest",
+          "type": "object"
+        },
+        {
+          "description": "Enable or disable the native Marathon service.",
+          "properties": {
+            "id": {
+              "$ref": "#/definitions/v2/RequestId"
+            },
+            "method": {
+              "enum": [
+                "marathon/enabled/set"
+              ],
+              "title": "Marathon/enabled/setRequestMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/v2/MarathonEnabledSetParams"
+            }
+          },
+          "required": [
+            "id",
+            "method",
+            "params"
+          ],
+          "title": "Marathon/enabled/setRequest",
+          "type": "object"
+        },
+        {
+          "description": "Enable or disable automatic use of a provider-supported quota reset action after every eligible managed account reaches zero weekly quota.",
+          "properties": {
+            "id": {
+              "$ref": "#/definitions/v2/RequestId"
+            },
+            "method": {
+              "enum": [
+                "marathon/autoReset/set"
+              ],
+              "title": "Marathon/autoReset/setRequestMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/v2/MarathonAutoResetSetParams"
+            }
+          },
+          "required": [
+            "id",
+            "method",
+            "params"
+          ],
+          "title": "Marathon/autoReset/setRequest",
+          "type": "object"
+        },
+        {
+          "description": "Manually switch the native Codex auth identity at an idle boundary.",
+          "properties": {
+            "id": {
+              "$ref": "#/definitions/v2/RequestId"
+            },
+            "method": {
+              "enum": [
+                "marathon/switch"
+              ],
+              "title": "Marathon/switchRequestMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/v2/MarathonSwitchParams"
+            }
+          },
+          "required": [
+            "id",
+            "method",
+            "params"
+          ],
+          "title": "Marathon/switchRequest",
+          "type": "object"
+        },
+        {
+          "description": "Store the currently authenticated native Codex account under a Marathon alias.",
+          "properties": {
+            "id": {
+              "$ref": "#/definitions/v2/RequestId"
+            },
+            "method": {
+              "enum": [
+                "marathon/import"
+              ],
+              "title": "Marathon/importRequestMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/v2/MarathonImportParams"
+            }
+          },
+          "required": [
+            "id",
+            "method",
+            "params"
+          ],
+          "title": "Marathon/importRequest",
+          "type": "object"
+        },
+        {
+          "description": "Save a current native snapshot without changing selection or aliases.",
+          "properties": {
+            "id": {
+              "$ref": "#/definitions/v2/RequestId"
+            },
+            "method": {
+              "enum": [
+                "marathon/checkpoint"
+              ],
+              "title": "Marathon/checkpointRequestMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/v2/MarathonCheckpointParams"
+            }
+          },
+          "required": [
+            "id",
+            "method",
+            "params"
+          ],
+          "title": "Marathon/checkpointRequest",
+          "type": "object"
+        },
+        {
           "properties": {
             "id": {
               "$ref": "#/definitions/v2/RequestId"
@@ -14288,6 +14437,306 @@
           "SubagentStop",
           "UserPromptSubmit"
         ],
+        "type": "object"
+      },
+      "MarathonAccount": {
+        "description": "Secret-free view of one account managed by the native Marathon service.",
+        "properties": {
+          "accountId": {
+            "type": "string"
+          },
+          "active": {
+            "type": "boolean"
+          },
+          "alias": {
+            "type": "string"
+          },
+          "credentialHealth": {
+            "type": "string"
+          },
+          "credentialPresent": {
+            "type": "boolean"
+          },
+          "resetActionAvailable": {
+            "default": false,
+            "description": "Whether the provider reported an immediate quota-reset action for this account. This is capability metadata, never an inferred timestamp.",
+            "type": "boolean"
+          },
+          "weeklyQuotaRemainingPercent": {
+            "default": null,
+            "description": "Last native provider observation for the weekly/long quota window. `null` means the provider has not supplied a weekly window yet.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "accountId",
+          "active",
+          "alias",
+          "credentialHealth",
+          "credentialPresent"
+        ],
+        "type": "object"
+      },
+      "MarathonAutoResetSetParams": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "description": "Enable or disable automatic use of a provider reset action when every eligible managed account has zero weekly quota.",
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "enabled"
+        ],
+        "title": "MarathonAutoResetSetParams",
+        "type": "object"
+      },
+      "MarathonAutoResetSetResponse": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "phase": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "enabled",
+          "phase"
+        ],
+        "title": "MarathonAutoResetSetResponse",
+        "type": "object"
+      },
+      "MarathonCheckpointParams": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "description": "Checkpoint an already-saved current account through native AuthManager. Optimistic identity/generation binding prevents saving a different account after a status/selection race. No snapshot or passphrase crosses this API.",
+        "properties": {
+          "expectedAccountId": {
+            "type": "string"
+          },
+          "expectedAuthGeneration": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "expectedAccountId",
+          "expectedAuthGeneration"
+        ],
+        "title": "MarathonCheckpointParams",
+        "type": "object"
+      },
+      "MarathonCheckpointResponse": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "accountId": {
+            "type": "string"
+          },
+          "authGeneration": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "accountId",
+          "authGeneration"
+        ],
+        "title": "MarathonCheckpointResponse",
+        "type": "object"
+      },
+      "MarathonEnabledSetParams": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "description": "Enable or disable the native Marathon service.",
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "enabled"
+        ],
+        "title": "MarathonEnabledSetParams",
+        "type": "object"
+      },
+      "MarathonEnabledSetResponse": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "description": "Result of changing the native Marathon enabled state.",
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "enabled"
+        ],
+        "title": "MarathonEnabledSetResponse",
+        "type": "object"
+      },
+      "MarathonImportParams": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "description": "Capture the currently authenticated Codex identity in the Marathon vault.\n\nThe auth document is read only through Codex's native AuthManager. Clients never send token material to this request.",
+        "properties": {
+          "alias": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "alias"
+        ],
+        "title": "MarathonImportParams",
+        "type": "object"
+      },
+      "MarathonImportResponse": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "description": "Secret-free result of importing the current native Codex identity.",
+        "properties": {
+          "accountId": {
+            "type": "string"
+          },
+          "active": {
+            "type": "boolean"
+          },
+          "alias": {
+            "type": "string"
+          },
+          "replaced": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "accountId",
+          "active",
+          "alias",
+          "replaced"
+        ],
+        "title": "MarathonImportResponse",
+        "type": "object"
+      },
+      "MarathonStatusResponse": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "description": "Status of the in-process Marathon account manager.\n\nThis type intentionally contains identity and lifecycle metadata only. It must never grow fields containing auth snapshots or token material.",
+        "properties": {
+          "accounts": {
+            "items": {
+              "$ref": "#/definitions/v2/MarathonAccount"
+            },
+            "type": "array"
+          },
+          "activeAccountId": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "activeTurnCount": {
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "authGeneration": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "autoResetEnabled": {
+            "default": false,
+            "type": "boolean"
+          },
+          "autoResetLastError": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "autoResetPhase": {
+            "default": "",
+            "type": "string"
+          },
+          "currentAccountId": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "enabled": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "accounts",
+          "activeTurnCount",
+          "authGeneration",
+          "enabled"
+        ],
+        "title": "MarathonStatusResponse",
+        "type": "object"
+      },
+      "MarathonSwitchOutcome": {
+        "enum": [
+          "committed",
+          "rejected",
+          "deferred"
+        ],
+        "type": "string"
+      },
+      "MarathonSwitchParams": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "description": "Request a manual switch to an account id or registered alias.",
+        "properties": {
+          "target": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "target"
+        ],
+        "title": "MarathonSwitchParams",
+        "type": "object"
+      },
+      "MarathonSwitchResponse": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "description": "Secret-free result of a manual account switch.",
+        "properties": {
+          "accountId": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "activeTurnCount": {
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "authGeneration": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "outcome": {
+            "$ref": "#/definitions/v2/MarathonSwitchOutcome"
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "activeTurnCount",
+          "authGeneration",
+          "outcome"
+        ],
+        "title": "MarathonSwitchResponse",
         "type": "object"
       },
       "MarketplaceAddParams": {

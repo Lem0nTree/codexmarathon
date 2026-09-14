@@ -51,7 +51,10 @@ pub(crate) async fn collect_git_status_summary(cwd: &Path) -> Option<GitStatusSu
 fn parse_porcelain_counts(output: &[u8]) -> (usize, usize) {
     let mut changed = 0;
     let mut untracked = 0;
-    for entry in output.split(|byte| *byte == 0).filter(|entry| !entry.is_empty()) {
+    for entry in output
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty())
+    {
         match entry[0] {
             b'?' => untracked += 1,
             b'1' | b'2' | b'u' => changed += 1,
@@ -72,7 +75,9 @@ fn string_output(output: Option<std::process::Output>) -> Option<String> {
 }
 
 async fn commit_count(cwd: &Path, range: &str) -> Option<usize> {
-    string_output(run_git_command(&["rev-list", "--count", range], cwd).await)?.parse().ok()
+    string_output(run_git_command(&["rev-list", "--count", range], cwd).await)?
+        .parse()
+        .ok()
 }
 
 async fn run_git_command(args: &[&str], cwd: &Path) -> Option<std::process::Output> {
@@ -82,5 +87,8 @@ async fn run_git_command(args: &[&str], cwd: &Path) -> Option<std::process::Outp
         .args(args)
         .current_dir(cwd)
         .kill_on_drop(true);
-    timeout(GIT_STATUS_TIMEOUT, command.output()).await.ok()?.ok()
+    timeout(GIT_STATUS_TIMEOUT, command.output())
+        .await
+        .ok()?
+        .ok()
 }

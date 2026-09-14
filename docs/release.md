@@ -24,15 +24,24 @@ daemon installation succeeded.
 
 The release installer uses `$HOME/.codex` by default. For a different state
 root, `CODEXMARATHON_CODEX_HOME` takes precedence over an existing
-`CODEX_HOME`; when neither is set, the default is used. The selected value
+`CODEX_HOME`; when neither is set, the default is used. If both environment
+variables are present, their normalized values must match. The selected value
 must be an absolute printable path (not `/`, with no `%`, `.` or `..` path
 components). Spaces, quotes, and backslashes are escaped in the generated
 `codexmarathon-accountd.service.d/10-codex-home.conf` drop-in. The drop-in
 sets the daemon environment and replaces both filesystem allowlists, while
 the socket remains under `%t/codexmarathon-accountd/accountd.sock`. Unsetting
 both variables on a later upgrade removes the drop-in and restores the
-packaged default. The installer does not alter shell startup files; callers
-using a custom root must set `CODEX_HOME` for their CLI processes as well.
+packaged default. The installer also atomically records the choice in the
+owner-private `$XDG_CONFIG_HOME/codexmarathon/config.json` (falling back to
+`$HOME/.config`), which the modified CLI and daemon resolve automatically.
+It does not alter shell startup files.
+
+Registry mutations in v0.155.0 and later upgrade the Marathon registry from
+schema v1 to v2 for fresh credential references and batch commits. New builds
+read v1, while older builds reject v2. Stop old CodexMarathon CLI processes
+before installing this release, and do not downgrade after mutating account
+state unless restoring a complete compatible state backup.
 
 ## Publishing releases
 
@@ -61,6 +70,7 @@ python3 scripts/verify_provenance.py --root .
 cd runtime/codex-rs
 cargo fmt --all -- --check
 cargo test --locked -p codexmarathon-runtime
+cargo test --locked -p codexmarathon-home -p codexmarathon-transfer
 cd ../..
 scripts/build-release.sh
 ```
@@ -84,6 +94,8 @@ acceptance environment. Record the executable version and exercise:
 4. `/marathon` help and status inside an interactive session.
 5. Status-line Marathon state and managed-account count.
 6. Recovery at a safe turn boundary with no duplicate continuation.
+7. Encrypted export, wrong-passphrase/tamper rejection, dry-run import, and an
+   exact synthetic round trip between isolated Codex homes.
 
 Do not invoke a real quota reset while testing automatic reset. The product
 uses mocked reset capabilities and executors until a provider integration is
