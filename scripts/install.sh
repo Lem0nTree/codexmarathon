@@ -23,6 +23,12 @@ for asset in json.load(sys.stdin).get('assets', []):
 ")"
 
 [ -n "$asset_url" ] || { echo "No latest release asset matches $suffix." >&2; exit 1; }
-mkdir -p "$target_dir"
-curl -fsSL "$asset_url" | tar -xz -C "$target_dir"
-printf 'Installed latest CodexMarathon to %s/codex\n' "$target_dir"
+package_dir="$(mktemp -d "${TMPDIR:-/tmp}/codexmarathon-install.XXXXXX")"
+trap 'rm -rf -- "$package_dir"' EXIT HUP INT TERM
+curl -fsSL "$asset_url" | tar -xz -C "$package_dir"
+[ -x "$package_dir/install-codexmarathon" ] || {
+    echo 'Release does not contain the CodexMarathon package installer.' >&2
+    exit 1
+}
+CODEXMARATHON_INSTALL_DIR="$target_dir" \
+    "$package_dir/install-codexmarathon" "$package_dir"

@@ -13,9 +13,11 @@ use codex_core::ThreadManager;
 use codex_login::{AuthDotJson, AuthManager, AuthReloadStatus, AuthTransitionSnapshot};
 use codex_protocol::protocol::RateLimitSnapshot;
 use codexmarathon_runtime::{
-    AccountStore, AutoResetStore, CredentialHealth, DomainError, FileAccountRegistry,
-    FileSnapshotVault, MarathonConfig, SnapshotVault,
+    AccountStore, AccountTelemetry, AutoResetStore, CredentialHealth, DomainError,
+    FileAccountRegistry, FileSnapshotVault, Freshness, LimitTelemetry, MarathonConfig,
+    QuotaResetCapability, QuotaSnapshotStore, SnapshotVault, UsageWindow, WindowKind,
 };
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -67,6 +69,7 @@ pub(crate) struct MarathonService {
     registry: Arc<FileAccountRegistry>,
     vault: Arc<FileSnapshotVault>,
     auto_reset: Arc<AutoResetStore>,
+    quota_store: Arc<QuotaSnapshotStore>,
     auth_generation: AtomicU64,
     quota_by_account: StdMutex<std::collections::BTreeMap<String, CachedQuota>>,
     auto_failover_in_flight: AtomicBool,
@@ -91,6 +94,7 @@ impl MarathonService {
             registry: Arc::new(FileAccountRegistry::new(config.registry_path())),
             vault: Arc::new(FileSnapshotVault::new(config.vault_dir())),
             auto_reset: Arc::new(AutoResetStore::new(config.auto_reset_state_path())),
+            quota_store: Arc::new(QuotaSnapshotStore::new(config.quota_db_path())),
             auth_generation: AtomicU64::new(1),
             quota_by_account: StdMutex::new(std::collections::BTreeMap::new()),
             auto_failover_in_flight: AtomicBool::new(false),
@@ -120,6 +124,13 @@ impl MarathonService {
                     .unwrap_or_else(|| std::path::Path::new("."))
                     .join("auto-reset.json"),
             )),
+            quota_store: Arc::new(QuotaSnapshotStore::new(
+                registry
+                    .path()
+                    .parent()
+                    .unwrap_or_else(|| std::path::Path::new("."))
+                    .join("quota.sqlite"),
+            )),
             auth_generation: AtomicU64::new(1),
             quota_by_account: StdMutex::new(std::collections::BTreeMap::new()),
             auto_failover_in_flight: AtomicBool::new(false),
@@ -140,6 +151,20 @@ impl MarathonService {
             return;
         };
         let now = chrono::Utc::now();
+        if let Some(telemetry) = quota_telemetry(&account_id, snapshot, now) {
+            let store = Arc::clone(&self.quota_store);
+            tokio::spawn(async move {
+                // Quota persistence is deliberately off the turn event path.
+                // A transient local storage failure must not delay or fail a turn.
+                if let Err(error) = store.upsert(&telemetry).await {
+                    tracing::warn!(
+                        account_id = %telemetry.account_id,
+                        error = %error,
+                        "failed to persist CodexMarathon quota telemetry"
+                    );
+                }
+            });
+        }
         let Ok(mut quotas) = self.quota_by_account.lock() else {
             return;
         };
@@ -161,7 +186,9 @@ impl MarathonService {
         let service = Arc::clone(self);
         tokio::spawn(async move {
             service.run_auto_failover(account_id).await;
-            service.auto_failover_in_flight.store(false, Ordering::Release);
+            service
+                .auto_failover_in_flight
+                .store(false, Ordering::Release);
         });
     }
 
@@ -528,6 +555,66 @@ fn quota_used_percent(snapshot: &RateLimitSnapshot) -> Option<f64> {
     used.is_finite().then_some(used.clamp(0.0, 100.0))
 }
 
+fn quota_telemetry(
+    account_id: &str,
+    snapshot: &RateLimitSnapshot,
+    observed_at: chrono::DateTime<chrono::Utc>,
+) -> Option<AccountTelemetry> {
+    let mut windows = Vec::new();
+    for (kind, window) in [
+        (WindowKind::Primary, snapshot.primary.as_ref()),
+        (WindowKind::Secondary, snapshot.secondary.as_ref()),
+    ] {
+        let Some(window) = window else {
+            continue;
+        };
+        if !window.used_percent.is_finite() {
+            continue;
+        }
+        windows.push(UsageWindow {
+            kind,
+            used_percent: window.used_percent.clamp(0.0, 100.0),
+            window_duration_mins: window
+                .window_minutes
+                .and_then(|value| value.try_into().ok()),
+            resets_at: window
+                .resets_at
+                .and_then(|seconds| chrono::DateTime::from_timestamp(seconds, 0)),
+            observed_at,
+            freshness: Freshness::Fresh,
+        });
+    }
+    if windows.is_empty() {
+        return None;
+    }
+
+    let limit_id = snapshot.limit_id.as_deref().unwrap_or("codex").to_owned();
+    let limit_name = snapshot.limit_name.clone().unwrap_or_default();
+    let plan_type = snapshot
+        .plan_type
+        .and_then(|plan| serde_json::to_value(plan).ok())
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .unwrap_or_default();
+    let mut limits = BTreeMap::new();
+    limits.insert(
+        limit_id.clone(),
+        LimitTelemetry {
+            limit_id,
+            limit_name,
+            plan_type,
+            windows,
+        },
+    );
+    Some(AccountTelemetry {
+        account_id: account_id.to_owned(),
+        limits,
+        observed_at,
+        usable: true,
+        reset_capability: QuotaResetCapability::Unavailable,
+        source: "app-server/token-count".to_owned(),
+    })
+}
+
 fn select_auto_target(
     state: &codexmarathon_runtime::RegistryState,
     quotas: &std::collections::BTreeMap<String, CachedQuota>,
@@ -656,6 +743,7 @@ mod tests {
         RateLimitSnapshot {
             limit_id: Some("codex".to_string()),
             limit_name: None,
+            normal_model_slug: None,
             primary: Some(window(primary)),
             secondary: secondary.map(window),
             credits: None,
@@ -676,12 +764,26 @@ mod tests {
             quota_used_percent(&rate_limits(1.0, Some(90.0))),
             Some(90.0)
         );
-        assert_eq!(
-            quota_used_percent(&rate_limits(90.0, None)),
-            Some(90.0)
-        );
+        assert_eq!(quota_used_percent(&rate_limits(90.0, None)), Some(90.0));
         assert!(!quota_requires_failover(90.0));
         assert!(quota_requires_failover(90.1));
+    }
+
+    #[test]
+    fn provider_snapshot_preserves_short_and_weekly_windows() {
+        let observed_at = Utc::now();
+        let telemetry = quota_telemetry("account-a", &rate_limits(12.5, Some(34.5)), observed_at)
+            .expect("telemetry");
+        let limit = telemetry.limits.get("codex").expect("codex limit");
+
+        assert_eq!(telemetry.account_id, "account-a");
+        assert_eq!(telemetry.observed_at, observed_at);
+        assert_eq!(limit.windows.len(), 2);
+        assert_eq!(limit.windows[0].kind, WindowKind::Primary);
+        assert_eq!(limit.windows[0].used_percent, 12.5);
+        assert_eq!(limit.windows[1].kind, WindowKind::Secondary);
+        assert_eq!(limit.windows[1].used_percent, 34.5);
+        assert_eq!(limit.windows[1].window_duration_mins, Some(10_080));
     }
 
     #[test]
@@ -706,8 +808,8 @@ mod tests {
             let mut account = codexmarathon_runtime::AccountRecord::new(id, "").expect("account");
             account.credential_health = health;
             state.accounts.insert(id.to_string(), account);
-            let snapshot = codexmarathon_runtime::AuthSnapshot::for_account(id, b"{}")
-                .expect("snapshot");
+            let snapshot =
+                codexmarathon_runtime::AuthSnapshot::for_account(id, b"{}").expect("snapshot");
             vault.save(id, &snapshot).expect("vault save");
         }
         let mut no_credentials =

@@ -1,0 +1,16 @@
+[Unit]
+Description=CodexMarathon account metadata API socket
+PartOf=codexmarathon-accountd.service
+
+[Socket]
+# %t is the per-user runtime directory.  No TCP listener is defined.
+# Keep the matching service enabled: this socket must not make scheduling
+# demand-driven.
+ListenStream=%t/codexmarathon-accountd/accountd.sock
+SocketMode=0600
+DirectoryMode=0700
+Service=codexmarathon-accountd.service
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target

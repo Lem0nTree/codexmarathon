@@ -83,6 +83,22 @@ pub enum DomainError {
     #[error("invalid automatic reset state")]
     InvalidAutoResetState,
 
+    /// A typed quota snapshot failed metadata or value validation.
+    #[error("invalid quota snapshot: {0}")]
+    InvalidQuotaSnapshot(&'static str),
+
+    /// The quota database schema is missing or newer than this runtime.
+    #[error("incompatible quota store schema")]
+    IncompatibleQuotaSchema,
+
+    /// The quota database contains an invalid row or relationship.
+    #[error("corrupt quota store")]
+    CorruptQuotaStore,
+
+    /// A SQLite quota-store operation failed without exposing row contents.
+    #[error("quota SQLite persistence failed")]
+    QuotaStore(#[from] sqlx::Error),
+
     /// A completion attempted to update a different reset attempt.
     #[error("automatic reset attempt mismatch")]
     AutoResetAttemptMismatch,
@@ -126,6 +142,10 @@ impl DomainError {
             Self::InvalidTransitionState(_) => "invalid_transition_state",
             Self::InvalidConfig(_) => "invalid_config",
             Self::InvalidAutoResetState => "invalid_auto_reset_state",
+            Self::InvalidQuotaSnapshot(_) => "invalid_quota_snapshot",
+            Self::IncompatibleQuotaSchema => "incompatible_quota_schema",
+            Self::CorruptQuotaStore => "corrupt_quota_store",
+            Self::QuotaStore(_) => "quota_store_error",
             Self::AutoResetAttemptMismatch => "auto_reset_attempt_mismatch",
             Self::TransitionNotFound => "transition_not_found",
             Self::InsufficientTelemetry => "insufficient_telemetry",

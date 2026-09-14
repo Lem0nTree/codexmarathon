@@ -5,6 +5,7 @@
 
 use crate::errors::{DomainError, DomainResult};
 use crate::policy::PolicyConfig;
+use crate::quota_store::QUOTA_DB_FILENAME;
 use std::path::{Path, PathBuf};
 
 /// Native Marathon storage configuration.
@@ -16,6 +17,7 @@ pub struct MarathonConfig {
     vault_dir: PathBuf,
     journal_path: PathBuf,
     auto_reset_state_path: PathBuf,
+    quota_db_path: PathBuf,
     legacy_auth_path: Option<PathBuf>,
     policy: PolicyConfig,
 }
@@ -34,6 +36,7 @@ impl MarathonConfig {
             vault_dir: state_dir.join("vault"),
             journal_path: state_dir.join("transitions.jsonl"),
             auto_reset_state_path: state_dir.join("auto-reset.json"),
+            quota_db_path: state_dir.join(QUOTA_DB_FILENAME),
             state_dir,
             legacy_auth_path: None,
             policy: PolicyConfig::default(),
@@ -50,6 +53,7 @@ impl MarathonConfig {
         self.vault_dir = state_dir.join("vault");
         self.journal_path = state_dir.join("transitions.jsonl");
         self.auto_reset_state_path = state_dir.join("auto-reset.json");
+        self.quota_db_path = state_dir.join(QUOTA_DB_FILENAME);
         self.state_dir = state_dir;
         Ok(self)
     }
@@ -79,12 +83,18 @@ impl MarathonConfig {
             &self.vault_dir,
             &self.journal_path,
             &self.auto_reset_state_path,
+            &self.quota_db_path,
         ] {
             if path.as_os_str().is_empty() {
                 return Err(DomainError::InvalidConfig("configuration path is empty"));
             }
         }
-        if self.registry_path == self.journal_path || self.registry_path == self.vault_dir {
+        if self.registry_path == self.journal_path
+            || self.registry_path == self.vault_dir
+            || self.registry_path == self.quota_db_path
+            || self.journal_path == self.quota_db_path
+            || self.auto_reset_state_path == self.quota_db_path
+        {
             return Err(DomainError::InvalidConfig("state paths overlap"));
         }
         if self.policy.freshness_ttl <= chrono::Duration::zero()
@@ -126,6 +136,11 @@ impl MarathonConfig {
     /// idempotency, cooldown, and outcome metadata.
     pub fn auto_reset_state_path(&self) -> &Path {
         &self.auto_reset_state_path
+    }
+
+    /// Metadata-only quota snapshot database path.
+    pub fn quota_db_path(&self) -> &Path {
+        &self.quota_db_path
     }
 
     /// Optional stock Codex auth file used only by explicit import scaffolding.

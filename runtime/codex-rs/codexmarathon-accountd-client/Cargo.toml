@@ -1,0 +1,25 @@
+[package]
+name = "codexmarathon-accountd-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Typed private client and wire protocol for codexmarathon-accountd"
+
+[lib]
+name = "codexmarathon_accountd_client"
+path = "src/lib.rs"
+doctest = false
+
+[lints]
+workspace = true
+
+[dependencies]
+chrono = { workspace = true, features = ["serde"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["io-util", "net", "time"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }
+tempfile = { workspace = true }

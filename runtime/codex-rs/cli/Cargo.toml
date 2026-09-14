@@ -73,6 +73,7 @@ codex-stdio-to-uds = { workspace = true }
 codex-terminal-detection = { workspace = true }
 codex-thread-store = { workspace = true }
 codex-tui = { workspace = true }
+codexmarathon-accountd-client = { workspace = true }
 codexmarathon-runtime = { workspace = true }
 codex-utils-absolute-path = { workspace = true }
 codex-utils-path = { workspace = true }

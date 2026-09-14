@@ -1,48 +1,62 @@
 # Release validation
 
 CodexMarathon releases are custom Codex CLI builds with native Marathon
-controls compiled into the `codex` executable. There is no separate Marathon
-controller or Go binary. Release archives do include every sibling executable
-the Codex CLI package expects:
+controls compiled into the `codex` executable. Release archives include the
+account daemon, its automatic installer and user systemd units, plus every
+sibling executable the Codex CLI package expects:
 
-- Linux: `codex`, `codex-code-mode-host`, `codex-responses-api-proxy`, and
-  `bwrap`.
+- Linux: `codex`, `codexmarathon-accountd`, `codex-code-mode-host`,
+  `codex-responses-api-proxy`, and `bwrap`. Linux ARM64 omits the unavailable
+  code-mode host and responses proxy.
 - Windows: `codex.exe`, `codex-code-mode-host.exe`,
   `codex-responses-api-proxy.exe`, `codex-command-runner.exe`, and
   `codex-windows-sandbox-setup.exe`.
 
-Do not publish a CLI-only archive. Code mode and platform sandboxing depend on
-those resources.
+Do not publish a CLI-only archive. The quota display depends on accountd, and
+code mode and platform sandboxing depend on their sibling resources. The
+release installer installs and enables both accountd user units, starts the
+daemon, and verifies it is active; installation fails instead of silently
+leaving manual activation work. It also enables user lingering so the service
+continues running after a headless SSH session exits when local policy permits
+the user or passwordless sudo to do so. If neither path is authorized, the
+installer fails before copying files instead of claiming a non-persistent
+daemon installation succeeded.
 
-## Automated upstream releases
+The release installer uses `$HOME/.codex` by default. For a different state
+root, `CODEXMARATHON_CODEX_HOME` takes precedence over an existing
+`CODEX_HOME`; when neither is set, the default is used. The selected value
+must be an absolute printable path (not `/`, with no `%`, `.` or `..` path
+components). Spaces, quotes, and backslashes are escaped in the generated
+`codexmarathon-accountd.service.d/10-codex-home.conf` drop-in. The drop-in
+sets the daemon environment and replaces both filesystem allowlists, while
+the socket remains under `%t/codexmarathon-accountd/accountd.sock`. Unsetting
+both variables on a later upgrade removes the drop-in and restores the
+packaged default. The installer does not alter shell startup files; callers
+using a custom root must set `CODEX_HOME` for their CLI processes as well.
 
-`.github/workflows/upstream-release.yml` polls the latest published stable
-release from `openai/codex` every six hours. It maps a tag such as
-`rust-v0.154.0` to `codexmarathon-v0.154.0` and exits successfully when that
-repository release already exists. A concurrency group and a second lookup
-immediately before publication protect against duplicate releases.
+## Publishing releases
 
-For a new release, the workflow reconstructs the maintained customization
-delta from the exact baseline in `.github/upstream-base.txt`, applies it to the
-upstream tag, and stops before building if Git reports a conflict. A clean port
-is archived once and used for native Linux x64 and Windows x64 builds.
-Publication requires both packages and the Marathon command smoke test. Only
-the final publish job has `contents: write`.
+Releases are currently built and published manually from a clean checkout of
+the exact commit being tagged. Set `CODEXMARATHON_VERSION` to the intended tag,
+run the required checks below on the target architecture, and run
+`scripts/build-release.sh`. Do not tag or publish a build produced from a dirty
+or different source tree.
 
-Each release carries the platform packages, the exact prepared source archive,
-the generated full-index customization patch, a JSON provenance manifest, and
-SHA-256 checksums for every asset. The manifest records the upstream and
-customization commits plus the patch, source-tree, and source-archive digests.
-
-Run the workflow manually with `port_only` enabled to check a particular
-published stable tag without building or publishing. A failed port uploads a
-14-day diagnostic artifact and never guesses at conflict resolution.
+For Linux ARM64, publish the generated
+`codexmarathon-<version>-linux-aarch64.tar.gz` archive and its `.sha256` file.
+The public `scripts/install.sh` bootstrap selects that suffix for ARM64 hosts.
+Before publication, install the archive on an acceptance host and verify the
+CLI version, enabled accountd socket/service, API health, account quota data,
+and restart persistence. The Git tag and GitHub release must point to the same
+commit used for the tested archive.
 
 ## Required checks
 
 From the repository root:
 
 ```bash
+sh -n scripts/install.sh scripts/install-release.sh scripts/test-install-release.sh
+scripts/test-install-release.sh
 python3 scripts/verify_provenance.py --root .
 cd runtime/codex-rs
 cargo fmt --all -- --check

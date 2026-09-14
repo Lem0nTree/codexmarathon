@@ -5,7 +5,7 @@
 //! its Unix socket environment variable; all state changes go through the
 //! typed app-server Marathon requests.
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use codex_app_server_client::DEFAULT_IN_PROCESS_CHANNEL_CAPACITY;
 use codex_app_server_client::InProcessAppServerClient;
 use codex_app_server_client::InProcessClientStartArgs;
@@ -32,6 +32,10 @@ use codex_core::config::ConfigBuilder;
 use codex_exec_server::EnvironmentManager;
 use codex_feedback::CodexFeedback;
 use codex_utils_cli::CliConfigOverrides;
+use codexmarathon_accountd_client::{
+    AccountTelemetry as DaemonTelemetry, AccountdClient, AccountsResult, Freshness, UsageWindow,
+    WindowKind, default_socket_path,
+};
 use serde::de::DeserializeOwned;
 use std::io::IsTerminal;
 use std::io::Write;
@@ -51,7 +55,17 @@ pub(crate) enum MarathonAction {
     Status,
 
     /// Alias for `status` that emphasizes the account list.
-    Accounts,
+    Accounts {
+        /// Read durable quota metadata from codexmarathon-accountd.
+        #[arg(long)]
+        daemon: bool,
+        /// Output format used with --daemon.
+        #[arg(long, value_enum, default_value_t = DaemonAccountsFormat::Table)]
+        format: DaemonAccountsFormat,
+        /// Override the accountd Unix socket.
+        #[arg(long, requires = "daemon")]
+        socket: Option<std::path::PathBuf>,
+    },
 
     /// Enable automatic native Marathon account management.
     On,
@@ -91,6 +105,13 @@ pub(crate) enum MarathonAction {
     },
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub(crate) enum DaemonAccountsFormat {
+    Table,
+    Motd,
+    Json,
+}
+
 #[derive(Debug, clap::Subcommand)]
 pub(crate) enum AutoResetAction {
     /// Show automatic reset-action state.
@@ -109,6 +130,14 @@ pub(crate) async fn run(
     loader_overrides: LoaderOverrides,
 ) -> anyhow::Result<()> {
     let action = command.action.unwrap_or(MarathonAction::Status);
+    if let MarathonAction::Accounts {
+        daemon: true,
+        format,
+        socket,
+    } = &action
+    {
+        return print_daemon_accounts(*format, socket.clone()).await;
+    }
     let mut client = start_client(
         root_config_overrides,
         strict_config,
@@ -199,7 +228,7 @@ async fn run_action(
     action: MarathonAction,
 ) -> anyhow::Result<()> {
     match action {
-        MarathonAction::Status | MarathonAction::Accounts => {
+        MarathonAction::Status | MarathonAction::Accounts { .. } => {
             let status = request(
                 client,
                 ClientRequest::MarathonStatus {
@@ -322,6 +351,99 @@ async fn run_action(
         }
     }
     Ok(())
+}
+
+async fn print_daemon_accounts(
+    format: DaemonAccountsFormat,
+    socket: Option<std::path::PathBuf>,
+) -> anyhow::Result<()> {
+    let socket = socket.or_else(default_socket_path).ok_or_else(|| {
+        anyhow::anyhow!("XDG_RUNTIME_DIR is unavailable; pass --socket explicitly")
+    })?;
+    let accounts: AccountsResult = AccountdClient::new(socket).accounts().await?;
+
+    if matches!(format, DaemonAccountsFormat::Json) {
+        println!("{}", serde_json::to_string(&accounts)?);
+        return Ok(());
+    }
+    if matches!(format, DaemonAccountsFormat::Motd) {
+        println!("ACCOUNT\tACTIVE\tHEALTH\t5H LEFT\tWEEKLY LEFT\t5H RESET");
+    } else {
+        println!(
+            "{:<20} {:<7} {:<10} {:>9} {:>12} {:>12}",
+            "ACCOUNT", "ACTIVE", "HEALTH", "5H LEFT", "WEEKLY LEFT", "5H RESET"
+        );
+    }
+    for account in accounts.accounts {
+        let (primary, secondary) = account
+            .quota
+            .as_ref()
+            .map(quota_columns)
+            .unwrap_or_else(|| (None, None));
+        let short_left = quota_left(primary.as_ref());
+        let weekly_left = quota_left(secondary.as_ref());
+        let reset = quota_reset(primary.as_ref());
+        if matches!(format, DaemonAccountsFormat::Motd) {
+            println!(
+                "{}\t{}\t{:?}\t{}\t{}\t{}",
+                account.alias,
+                if account.active { "yes" } else { "no" },
+                account.credential_health,
+                short_left,
+                weekly_left,
+                reset
+            );
+        } else {
+            println!(
+                "{:<20} {:<7} {:<10} {:>9} {:>12} {:>12}",
+                account.alias,
+                if account.active { "yes" } else { "no" },
+                format!("{:?}", account.credential_health).to_lowercase(),
+                short_left,
+                weekly_left,
+                reset
+            );
+        }
+    }
+    Ok(())
+}
+
+fn quota_columns(telemetry: &DaemonTelemetry) -> (Option<UsageWindow>, Option<UsageWindow>) {
+    let mut primary = None;
+    let mut secondary = None;
+    for window in telemetry.windows() {
+        match window.kind {
+            WindowKind::Primary => primary = Some(window.clone()),
+            WindowKind::Secondary => secondary = Some(window.clone()),
+        }
+    }
+    (primary, secondary)
+}
+
+fn quota_left(window: Option<&UsageWindow>) -> String {
+    window.map_or_else(
+        || "unknown".to_string(),
+        |window| {
+            if window.freshness == Freshness::Stale {
+                "stale".to_string()
+            } else {
+                format!("{:.1}%", 100.0 - window.used_percent)
+            }
+        },
+    )
+}
+
+fn quota_reset(window: Option<&UsageWindow>) -> String {
+    let Some(reset) = window.and_then(|window| window.resets_at) else {
+        return "—".to_string();
+    };
+    let seconds = (reset - chrono::Utc::now()).num_seconds();
+    if seconds <= 0 {
+        return "ready".to_string();
+    }
+    let hours = seconds / 3600;
+    let minutes = (seconds % 3600) / 60;
+    format!("{hours}h {minutes}m")
 }
 
 async fn login_and_import(

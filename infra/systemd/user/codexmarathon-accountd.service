@@ -1,0 +1,39 @@
+[Unit]
+Description=CodexMarathon per-user account metadata scheduler
+Requires=codexmarathon-accountd.socket
+After=codexmarathon-accountd.socket
+StartLimitIntervalSec=60s
+StartLimitBurst=5
+
+[Service]
+Type=exec
+ExecStart=%h/.local/bin/codexmarathon-accountd
+# The socket may trigger this unit, but the target wants it kept alive for
+# scheduling; socket activation is transport setup, not scheduler lifetime.
+Restart=on-failure
+RestartSec=5s
+
+# The daemon is a per-user service; never create files readable by other users.
+UMask=0077
+NoNewPrivileges=yes
+StateDirectory=codexmarathon-accountd
+StateDirectoryMode=0700
+
+# Accountd owns metadata and scheduling only.  It has no reason to inspect
+# the rest of the home directory, access devices, or open a network socket.
+ProtectSystem=strict
+# The app server and daemon intentionally share the quota database below the
+# Marathon state directory. Hide the credential file and vault explicitly.
+ProtectHome=read-only
+ReadWritePaths=%h/.codex/marathon
+InaccessiblePaths=%h/.codex/auth.json %h/.codex/marathon/vault
+PrivateTmp=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_UNIX
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=default.target

@@ -34,6 +34,7 @@ pub mod journal;
 pub mod legacy;
 mod persistence;
 pub mod policy;
+pub mod quota_store;
 pub mod telemetry;
 pub mod transitions;
 pub mod vault;
@@ -59,6 +60,7 @@ pub use legacy::{LegacyImportResult, import_legacy_auth, read_legacy_auth};
 pub use policy::{
     PolicyConfig, PolicyDecision, PolicyDecisionType, PolicyInput, PolicyTrigger, evaluate,
 };
+pub use quota_store::{QUOTA_DB_FILENAME, QUOTA_SCHEMA_VERSION, QuotaSnapshotStore};
 pub use telemetry::{
     AccountTelemetry, CandidateRank, Freshness, LimitTelemetry, Thresholds, UsageWindow, WindowKind,
 };

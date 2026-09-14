@@ -1,0 +1,43 @@
+[package]
+name = "codexmarathon-accountd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Per-user CodexMarathon account metadata daemon"
+
+[lib]
+name = "codexmarathon_accountd"
+path = "src/lib.rs"
+doctest = false
+
+[[bin]]
+name = "codexmarathon-accountd"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+chrono = { workspace = true, features = ["serde"] }
+clap = { workspace = true, features = ["derive"] }
+codexmarathon-runtime = { workspace = true }
+codexmarathon-accountd-client = { workspace = true }
+libc = { workspace = true }
+log = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+sqlx = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = [
+    "fs",
+    "io-util",
+    "macros",
+    "net",
+    "rt-multi-thread",
+    "signal",
+    "sync",
+    "time",
+] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
