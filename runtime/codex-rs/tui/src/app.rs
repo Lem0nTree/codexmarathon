@@ -1064,6 +1064,13 @@ impl App {
                     self.handle_key_event(tui, app_server, key_event).await;
                 }
                 TuiEvent::Paste(pasted) => {
+                    if self.chat_widget.secret_input_active() {
+                        // A password paste is moved directly into the secret
+                        // view. Normalization would create an additional,
+                        // non-zeroizing plaintext allocation.
+                        self.chat_widget.handle_paste(pasted);
+                        return Ok(AppRunControl::Continue);
+                    }
                     // Pasted text may contain CRLF pairs or bare CRs (e.g., from iTerm2),
                     // but tui-textarea expects LF. Normalize CRLF pairs before bare CRs so
                     // each pasted line break becomes one LF and existing LFs stay unchanged.

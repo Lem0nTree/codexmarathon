@@ -73,6 +73,7 @@ mod multi_select_picker;
 mod question_tests;
 mod questions;
 mod request_user_input;
+mod secret_prompt_view;
 mod status_line_setup;
 mod status_line_style;
 mod status_surface_preview;
@@ -97,7 +98,10 @@ pub(crate) use async_questions::QuestionState;
 pub(crate) use async_questions::QuestionSubmission;
 pub(crate) use mcp_server_elicitation::McpServerElicitationFormRequest;
 pub(crate) use mcp_server_elicitation::McpServerElicitationOverlay;
+pub(crate) use multi_select_picker::MultiSelectItem;
+pub(crate) use multi_select_picker::MultiSelectPicker;
 pub(crate) use request_user_input::RequestUserInputOverlay;
+pub(crate) use secret_prompt_view::SecretPromptView;
 pub(crate) use status_line_style::status_line_from_segments;
 mod bottom_pane_view;
 mod effort_ignition;
@@ -1626,6 +1630,11 @@ impl BottomPane {
     /// running and some are not.
     pub(crate) fn no_modal_or_popup_active(&self) -> bool {
         self.can_launch_external_editor()
+    }
+
+    pub(crate) fn secret_input_active(&self) -> bool {
+        self.active_view()
+            .is_some_and(|view| view.is_secret_input())
     }
 
     pub(crate) fn show_view(&mut self, view: Box<dyn BottomPaneView>) {

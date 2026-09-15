@@ -1509,6 +1509,131 @@ impl App {
                     app_event_tx.send(AppEvent::MarathonLoginResult { alias, result });
                 });
             }
+            AppEvent::MarathonExportStart { flow_id } => {
+                let request_id = app_server.next_request_id();
+                let request_handle = app_server.request_handle();
+                let app_event_tx = self.app_event_tx.clone();
+                tokio::spawn(async move {
+                    let result = request_handle
+                        .request_typed::<codex_app_server_protocol::MarathonStatusResponse>(
+                            ClientRequest::MarathonStatus {
+                                request_id,
+                                params: None,
+                            },
+                        )
+                        .await
+                        .map_err(|error| error.to_string());
+                    app_event_tx
+                        .send(AppEvent::MarathonExportAccountsLoaded { flow_id, result });
+                });
+            }
+            AppEvent::MarathonExportAccountsLoaded { flow_id, result } => {
+                self.chat_widget
+                    .on_marathon_export_accounts_loaded(flow_id, result);
+            }
+            AppEvent::MarathonExportAccountsSelected {
+                flow_id,
+                account_ids,
+            } => self
+                .chat_widget
+                .on_marathon_export_accounts_selected(flow_id, account_ids),
+            AppEvent::MarathonExportOutputSubmitted { flow_id, output } => self
+                .chat_widget
+                .on_marathon_export_output_submitted(flow_id, output),
+            AppEvent::MarathonExportSecretStageReady { flow_id, stage } => {
+                let Some(export) = self
+                    .chat_widget
+                    .on_marathon_export_secret_ready(flow_id, stage)
+                else {
+                    return Ok(AppRunControl::Continue);
+                };
+                let config = match codexmarathon_runtime::MarathonConfig::new(
+                    self.config.codex_home.to_path_buf(),
+                ) {
+                    Ok(config) => config,
+                    Err(error) => {
+                        self.chat_widget.on_marathon_export_finished(
+                            flow_id,
+                            export.output,
+                            Err(error.to_string()),
+                        );
+                        return Ok(AppRunControl::Continue);
+                    }
+                };
+                let status_request_id = app_server.next_request_id();
+                let checkpoint_request_id = app_server.next_request_id();
+                let request_handle = app_server.request_handle();
+                let app_event_tx = self.app_event_tx.clone();
+                let event_output = export.output.clone();
+                tokio::spawn(async move {
+                    let result = async {
+                        let status = request_handle
+                            .request_typed::<codex_app_server_protocol::MarathonStatusResponse>(
+                                ClientRequest::MarathonStatus {
+                                    request_id: status_request_id,
+                                    params: None,
+                                },
+                            )
+                            .await
+                            .map_err(|error| error.to_string())?;
+
+                        if let Some(current_account_id) = status.current_account_id
+                            && export.selected_ids.contains(&current_account_id)
+                        {
+                            let checkpoint = request_handle
+                                .request_typed::<
+                                    codex_app_server_protocol::MarathonCheckpointResponse,
+                                >(ClientRequest::MarathonCheckpoint {
+                                    request_id: checkpoint_request_id,
+                                    params:
+                                        codex_app_server_protocol::MarathonCheckpointParams {
+                                            expected_account_id: current_account_id.clone(),
+                                            expected_auth_generation: status.auth_generation,
+                                        },
+                                })
+                                .await
+                                .map_err(|error| error.to_string())?;
+                            if checkpoint.account_id != current_account_id
+                                || checkpoint.auth_generation != status.auth_generation
+                            {
+                                return Err(
+                                    "active account changed while preparing the export; retry"
+                                        .to_string(),
+                                );
+                            }
+                        }
+
+                        tokio::task::spawn_blocking(move || {
+                            codexmarathon_transfer::export_accounts(
+                                &config,
+                                &export.selected_ids,
+                                &export.output,
+                                export.passphrase,
+                                /*overwrite*/ false,
+                            )
+                            .map_err(|error| error.to_string())
+                        })
+                        .await
+                        .map_err(|error| format!("export task failed: {error}"))?
+                    }
+                    .await;
+                    app_event_tx.send(AppEvent::MarathonExportFinished {
+                        flow_id,
+                        output: event_output,
+                        result,
+                    });
+                });
+            }
+            AppEvent::MarathonExportCancelled { flow_id } => {
+                self.chat_widget.on_marathon_export_cancelled(flow_id);
+            }
+            AppEvent::MarathonExportFinished {
+                flow_id,
+                output,
+                result,
+            } => self
+                .chat_widget
+                .on_marathon_export_finished(flow_id, output, result),
             AppEvent::MarathonStatusResult { result } => {
                 self.chat_widget.on_marathon_status_result(result);
             }

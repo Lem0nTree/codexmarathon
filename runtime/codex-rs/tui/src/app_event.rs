@@ -261,6 +261,13 @@ pub(crate) enum MarathonLoginMode {
     DeviceCode,
 }
 
+/// Secret-free marker for the two local password prompts in an export flow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MarathonExportSecretStage {
+    Passphrase,
+    Confirmation,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum KeymapEditIntent {
     ReplaceAll,
@@ -663,6 +670,36 @@ pub(crate) enum AppEvent {
     MarathonLoginRequest {
         alias: String,
         mode: MarathonLoginMode,
+    },
+
+    /// Begin a native encrypted Marathon export. All events in this flow carry
+    /// metadata only; prompt callbacks transfer secrets through TUI-local state.
+    MarathonExportStart {
+        flow_id: Uuid,
+    },
+    MarathonExportAccountsLoaded {
+        flow_id: Uuid,
+        result: Result<MarathonStatusResponse, String>,
+    },
+    MarathonExportAccountsSelected {
+        flow_id: Uuid,
+        account_ids: Vec<String>,
+    },
+    MarathonExportOutputSubmitted {
+        flow_id: Uuid,
+        output: PathBuf,
+    },
+    MarathonExportSecretStageReady {
+        flow_id: Uuid,
+        stage: MarathonExportSecretStage,
+    },
+    MarathonExportCancelled {
+        flow_id: Uuid,
+    },
+    MarathonExportFinished {
+        flow_id: Uuid,
+        output: PathBuf,
+        result: Result<codexmarathon_transfer::ExportReport, String>,
     },
 
     /// Result of reading native Marathon status.

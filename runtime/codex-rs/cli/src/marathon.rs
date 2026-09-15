@@ -1062,16 +1062,87 @@ async fn print_daemon_accounts(
     Ok(())
 }
 
+const FIVE_HOUR_WINDOW_MINUTES: u64 = 5 * 60;
+const WEEKLY_WINDOW_MINUTES: u64 = 7 * 24 * 60;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum QuotaWindowClass {
+    FiveHour,
+    Weekly,
+}
+
+fn quota_window_class(window: &UsageWindow) -> Option<QuotaWindowClass> {
+    match window.window_duration_mins {
+        Some(FIVE_HOUR_WINDOW_MINUTES) => Some(QuotaWindowClass::FiveHour),
+        Some(WEEKLY_WINDOW_MINUTES) => Some(QuotaWindowClass::Weekly),
+        Some(_) | None => None,
+    }
+}
+
+/// Classify daemon quota windows by duration. A duration-less window uses its
+/// conventional primary/secondary role only when a complete pair makes that
+/// fallback unambiguous; a known weekly primary is never short-window data.
 fn quota_columns(telemetry: &DaemonTelemetry) -> (Option<UsageWindow>, Option<UsageWindow>) {
+    let windows = telemetry.windows();
+    let mut five_hour = None;
+    let mut weekly = None;
     let mut primary = None;
     let mut secondary = None;
-    for window in telemetry.windows() {
+    let mut primary_count = 0;
+    let mut secondary_count = 0;
+    let mut has_unknown_duration = false;
+
+    for window in windows {
         match window.kind {
-            WindowKind::Primary => primary = Some(window.clone()),
-            WindowKind::Secondary => secondary = Some(window.clone()),
+            WindowKind::Primary => {
+                primary = Some(window);
+                primary_count += 1;
+            }
+            WindowKind::Secondary => {
+                secondary = Some(window);
+                secondary_count += 1;
+            }
+        }
+        match quota_window_class(window) {
+            Some(QuotaWindowClass::FiveHour) => five_hour = Some(window.clone()),
+            Some(QuotaWindowClass::Weekly) => weekly = Some(window.clone()),
+            None if window.window_duration_mins.is_some() => has_unknown_duration = true,
+            None => {}
         }
     }
-    (primary, secondary)
+
+    // Do not infer from an incomplete/ambiguous set of duration-less windows.
+    // The explicit duration pass above always wins, including for a primary
+    // window that is actually weekly on Pro accounts.
+    if !has_unknown_duration && primary_count == 1 && secondary_count == 1 {
+        let primary = primary.expect("primary count was checked");
+        let secondary = secondary.expect("secondary count was checked");
+        let primary_class = quota_window_class(primary);
+        let secondary_class = quota_window_class(secondary);
+        match (primary.window_duration_mins, secondary.window_duration_mins) {
+            (None, None) => {
+                if five_hour.is_none() {
+                    five_hour = Some(primary.clone());
+                }
+                if weekly.is_none() {
+                    weekly = Some(secondary.clone());
+                }
+            }
+            (None, Some(_))
+                if secondary_class == Some(QuotaWindowClass::Weekly) && five_hour.is_none() =>
+            {
+                five_hour = Some(primary.clone());
+            }
+            (Some(_), None)
+                if primary_class == Some(QuotaWindowClass::FiveHour) && weekly.is_none() =>
+            {
+                weekly = Some(secondary.clone());
+            }
+            _ => {}
+        }
+    }
+
+    (five_hour, weekly)
 }
 
 fn quota_left(window: Option<&UsageWindow>) -> String {
@@ -1332,6 +1403,75 @@ fn print_switch(response: &MarathonSwitchResponse) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn daemon_window(
+        kind: WindowKind,
+        used_percent: f64,
+        window_duration_mins: Option<u64>,
+    ) -> UsageWindow {
+        UsageWindow {
+            kind,
+            used_percent,
+            window_duration_mins,
+            resets_at: None,
+            observed_at: chrono::Utc::now(),
+            freshness: Freshness::Fresh,
+        }
+    }
+
+    fn daemon_telemetry(windows: Vec<UsageWindow>) -> DaemonTelemetry {
+        let observed_at = chrono::Utc::now();
+        DaemonTelemetry {
+            account_id: "account-a".to_string(),
+            limits: std::collections::BTreeMap::from([(
+                "codex".to_string(),
+                codexmarathon_accountd_client::LimitTelemetry {
+                    limit_id: "codex".to_string(),
+                    limit_name: String::new(),
+                    plan_type: String::new(),
+                    windows,
+                },
+            )]),
+            observed_at,
+            usable: true,
+            reset_capability: codexmarathon_accountd_client::QuotaResetCapability::Unavailable,
+            source: "test".to_string(),
+        }
+    }
+
+    #[test]
+    fn daemon_quota_columns_classify_weekly_only_primary_by_duration() {
+        let telemetry = daemon_telemetry(vec![daemon_window(
+            WindowKind::Primary,
+            84.0,
+            Some(WEEKLY_WINDOW_MINUTES),
+        )]);
+
+        let (five_hour, weekly) = quota_columns(&telemetry);
+        assert!(five_hour.is_none());
+        assert_eq!(weekly.map(|window| window.used_percent), Some(84.0));
+    }
+
+    #[test]
+    fn daemon_quota_columns_classify_dual_windows_by_duration() {
+        let telemetry = daemon_telemetry(vec![
+            daemon_window(WindowKind::Primary, 12.5, Some(FIVE_HOUR_WINDOW_MINUTES)),
+            daemon_window(WindowKind::Secondary, 34.5, Some(WEEKLY_WINDOW_MINUTES)),
+        ]);
+
+        let (five_hour, weekly) = quota_columns(&telemetry);
+        assert_eq!(five_hour.map(|window| window.used_percent), Some(12.5));
+        assert_eq!(weekly.map(|window| window.used_percent), Some(34.5));
+    }
+
+    #[test]
+    fn durationless_single_primary_is_not_assumed_to_be_five_hour() {
+        let telemetry = daemon_telemetry(vec![daemon_window(WindowKind::Primary, 84.0, None)]);
+
+        let (five_hour, weekly) = quota_columns(&telemetry);
+        assert!(five_hour.is_none());
+        assert!(weekly.is_none());
+    }
 
     #[test]
     fn bare_command_defaults_to_status() {

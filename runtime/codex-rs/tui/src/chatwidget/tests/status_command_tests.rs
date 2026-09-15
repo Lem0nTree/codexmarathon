@@ -40,6 +40,15 @@ async fn marathon_status_displays_current_account_state() {
 }
 
 #[tokio::test]
+async fn marathon_export_starts_native_secret_safe_wizard() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+
+    chat.dispatch_command_with_args(SlashCommand::Marathon, "export".to_string(), Vec::new());
+
+    assert_matches!(rx.try_recv(), Ok(AppEvent::MarathonExportStart { .. }));
+}
+
+#[tokio::test]
 async fn marathon_account_commands_use_native_app_server_events() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
 
@@ -147,6 +156,8 @@ async fn marathon_controller_status_updates_configured_status_line_items() {
                 active: true,
                 credential_present: true,
                 credential_health: "healthy".to_string(),
+                weekly_quota_remaining_percent: Some(75.0),
+                reset_action_available: false,
             },
             codex_app_server_protocol::MarathonAccount {
                 account_id: "acct-b".to_string(),
@@ -154,15 +165,28 @@ async fn marathon_controller_status_updates_configured_status_line_items() {
                 active: false,
                 credential_present: true,
                 credential_health: "healthy".to_string(),
+                weekly_quota_remaining_percent: None,
+                reset_action_available: false,
             },
         ],
+        auto_reset_enabled: false,
+        auto_reset_phase: "idle".to_string(),
+        auto_reset_last_error: None,
     }));
 
     assert_eq!(
         chat.status_line_text(),
         Some("Marathon enabled · Accounts 2".to_string())
     );
-    assert!(matches!(rx.try_recv(), Ok(AppEvent::InsertHistoryCell(_))));
+    let rendered = match rx.try_recv() {
+        Ok(AppEvent::InsertHistoryCell(cell)) => {
+            lines_to_single_string(&cell.display_lines(/*width*/ 120))
+        }
+        other => panic!("expected styled Marathon status output, got {other:?}"),
+    };
+    assert!(rendered.contains("ACCOUNT"));
+    assert!(rendered.contains("WEEKLY LEFT"));
+    assert!(rendered.contains("75%"));
 }
 
 #[tokio::test]

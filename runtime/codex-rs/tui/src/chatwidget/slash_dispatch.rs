@@ -772,6 +772,8 @@ impl ChatWidget {
                         self.request_marathon_status();
                     }
                     "status" if rest.trim().is_empty() => self.request_marathon_status(),
+                    "export" if rest.trim().is_empty() => self.request_marathon_export(),
+                    "export" => self.add_error_message("Usage: /marathon export".to_string()),
                     "on" | "enable" if rest.trim().is_empty() => {
                         self.request_marathon_enabled_set(true)
                     }
@@ -1257,12 +1259,53 @@ impl ChatWidget {
             }
             None => "Current: checking native Marathon status…".to_string(),
         };
-        self.add_info_message(
-            format!(
-                "Native Marathon is built into Codex.\n{current}\n\nCommands:\n  /marathon on (enable account switching)\n  /marathon off (disable account switching)\n  /marathon status (show accounts and active account)\n  /marathon auto-reset on | off | status (configure automatic quota reset)\n  /marathon login <alias> (choose browser link or device code)\n  /marathon import <alias> (save the current account under an alias)\n  /marathon switch <alias> (switch to a saved account)\n\nStart by importing your current account with /marathon import <alias>. For a headless server, choose device code and finish sign-in from another machine. No separate codexmarathon command is required."
+        let commands = [
+            (
+                "/marathon status",
+                "Show accounts, credentials, and weekly quota",
             ),
-            Some("Use ↑ to recall this help".to_string()),
-        );
+            ("/marathon on | off", "Enable or disable account switching"),
+            ("/marathon switch <alias>", "Switch to a saved account"),
+            ("/marathon import <alias>", "Save the current account"),
+            (
+                "/marathon login <alias>",
+                "Add an account with browser or device code",
+            ),
+            ("/marathon export", "Create an encrypted account backup"),
+            (
+                "/marathon auto-reset on|off|status",
+                "Configure provider quota reset",
+            ),
+        ];
+        let command_width = commands
+            .iter()
+            .map(|(command, _)| command.len())
+            .max()
+            .unwrap_or(0);
+        let mut lines = vec![
+            Line::from("CodexMarathon".bold().cyan()),
+            Line::from("Native account continuity, built into Codex.".dim()),
+            Line::from(vec!["Status  ".bold(), current.into()]),
+            Line::from(""),
+            Line::from("Commands".bold()),
+        ];
+        lines.extend(commands.into_iter().map(|(command, description)| {
+            Line::from(vec![
+                format!("  {command:<command_width$}  ").cyan(),
+                description.dim(),
+            ])
+        }));
+        lines.extend([
+            Line::from(""),
+            Line::from(vec![
+                "Tip  ".bold(),
+                "Start with ".into(),
+                "/marathon import <alias>".cyan(),
+                ". device code works on headless servers.".into(),
+            ]),
+            Line::from("No separate codexmarathon command is required.".dim()),
+        ]);
+        self.add_plain_history_lines(lines);
     }
 
     fn request_marathon_enabled_set(&mut self, enabled: bool) {
@@ -1599,53 +1642,115 @@ impl ChatWidget {
             .unwrap_or("none")
             .to_string();
         let mut lines = vec![
-            Line::from(format!("• CodexMarathon: {service_state}")),
-            Line::from(format!("  Active account: {active}")),
-            Line::from(format!(
-                "  Automatic provider quota reset: {} (phase: {})",
-                if status.auto_reset_enabled {
-                    "enabled"
+            Line::from("CodexMarathon status".bold().cyan()),
+            Line::from(vec![
+                "Service  ".bold(),
+                if status.enabled {
+                    service_state.green()
                 } else {
-                    "disabled"
+                    service_state.yellow()
                 },
-                status.auto_reset_phase
-            )),
+                "    Active  ".bold(),
+                active.clone().cyan(),
+                "    Turns  ".bold(),
+                status.active_turn_count.to_string().into(),
+            ]),
+            Line::from(vec![
+                "Auto reset  ".bold(),
+                if status.auto_reset_enabled {
+                    "enabled".green()
+                } else {
+                    "disabled".yellow()
+                },
+                format!(" ({})", status.auto_reset_phase).dim(),
+                "    Auth generation  ".bold(),
+                status.auth_generation.to_string().into(),
+            ]),
         ];
         if let Some(error) = status.auto_reset_last_error.as_deref() {
-            lines.push(Line::from(format!("  Last reset result: {error}")));
+            lines.push(Line::from(vec![
+                "Last reset  ".bold(),
+                error.to_string().red(),
+            ]));
         }
         if status.accounts.is_empty() {
-            lines.push(Line::from("  Accounts: none configured"));
+            lines.push(Line::from("No accounts configured.".yellow()));
         } else {
-            lines.push(Line::from("  Accounts:"));
+            let account_width = status
+                .accounts
+                .iter()
+                .map(|account| {
+                    if account.alias.is_empty() {
+                        account.account_id.len()
+                    } else {
+                        account.alias.len()
+                    }
+                })
+                .max()
+                .unwrap_or(7)
+                .max("ACCOUNT".len());
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![
+                format!("  {:<account_width$}  ", "ACCOUNT").bold(),
+                format!(
+                    "{:<8}  {:<10}  {:<12}  {}",
+                    "ACTIVE", "CREDENTIAL", "HEALTH", "WEEKLY LEFT"
+                )
+                .bold(),
+            ]));
+            lines.push(Line::from(
+                format!(
+                    "  {}  --------  ----------  ------------  -----------",
+                    "-".repeat(account_width)
+                )
+                .dim(),
+            ));
             for account in status.accounts {
                 let name = if account.alias.is_empty() {
                     account.account_id.clone()
-                } else if account.account_id.is_empty() {
-                    account.alias.clone()
                 } else {
-                    format!("{} ({})", account.alias, account.account_id)
+                    account.alias.clone()
                 };
-                let state = if account.active { "active" } else { "inactive" };
+                let is_active =
+                    status.current_account_id.as_deref() == Some(account.account_id.as_str());
+                let active_text = if is_active { "yes" } else { "no" };
+                let credential = if account.credential_present {
+                    "present"
+                } else {
+                    "missing"
+                };
                 let health = if account.credential_health.is_empty() {
-                    "health unknown"
+                    "unknown"
                 } else {
                     account.credential_health.as_str()
                 };
-                lines.push(Line::from(format!(
-                    "    - {name}: {state}, {health}{}",
-                    if account.credential_present {
-                        ""
+                let weekly = account
+                    .weekly_quota_remaining_percent
+                    .map(|remaining| format!("{remaining:.0}%"))
+                    .unwrap_or_else(|| "—".to_string());
+                lines.push(Line::from(vec![
+                    format!("  {name:<account_width$}  ").cyan(),
+                    if is_active {
+                        format!("{active_text:<8}  ").green().bold()
                     } else {
-                        ", credential missing"
-                    }
-                )));
+                        format!("{active_text:<8}  ").yellow()
+                    },
+                    if account.credential_present {
+                        format!("{credential:<10}  ").green()
+                    } else {
+                        format!("{credential:<10}  ").red()
+                    },
+                    if health.eq_ignore_ascii_case("healthy") {
+                        format!("{health:<12}  ").green()
+                    } else if health.eq_ignore_ascii_case("unknown") {
+                        format!("{health:<12}  ").yellow()
+                    } else {
+                        format!("{health:<12}  ").red()
+                    },
+                    weekly.into(),
+                ]));
             }
         }
-        lines.push(Line::from(format!(
-            "  Active turns: {}, auth generation {}",
-            status.active_turn_count, status.auth_generation
-        )));
         self.add_plain_history_lines(lines);
     }
 

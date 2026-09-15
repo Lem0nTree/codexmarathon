@@ -4711,6 +4711,8 @@ dependencies = [
  "codex-utils-string",
  "codex-windows-sandbox",
  "codex-worktree",
+ "codexmarathon-runtime",
+ "codexmarathon-transfer",
  "color-eyre",
  "core_test_support",
  "crossterm",
@@ -4765,6 +4767,7 @@ dependencies = [
  "windows-sys 0.52.0",
  "winsplit",
  "wiremock",
+ "zeroize",
 ]
 
 [[package]]

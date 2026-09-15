@@ -127,6 +127,7 @@ The matching interactive commands are:
 /marathon import <alias>
 /marathon login <alias> [browser|device-code]
 /marathon switch <alias-or-id>
+/marathon export
 ```
 
 Configure the status line with the `marathon` and `marathon-accounts` items.
@@ -144,6 +145,12 @@ codex marathon backup export --output accounts.cmbackup
 codex marathon backup import accounts.cmbackup --dry-run
 codex marathon backup import accounts.cmbackup
 ```
+
+Inside the Codex TUI, `/marathon export` opens the same native workflow: select
+accounts with checkboxes, choose the destination filename, and enter and
+confirm a masked backup password. The password stays in zeroizing local TUI
+state; it is never sent to accountd, app-server RPCs, session history, or debug
+events.
 
 Export asks for the passphrase twice and import asks once; terminal echo stays
 disabled while it is entered. For unattended use, pass an owner-only file with
