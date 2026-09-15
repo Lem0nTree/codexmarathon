@@ -1,8 +1,11 @@
 # SEO keyword research: CodexMarathon
 
-**Research date:** 2026-09-10  
-**Source:** Ubersuggest MCP, authenticated free account  
-**Market:** Global metrics where available; live SERP analysis in United States / English.
+**Research dates:** 2026-09-10 and 2026-09-15
+
+**Source:** Ubersuggest MCP, authenticated free account
+
+**Market:** Global metrics where available; localized metrics and live SERP
+analysis in United States / English.
 
 ## Executive recommendation
 
@@ -27,19 +30,51 @@ capabilities.
 | `codex multi account` | 140 | $0.00 | 1 | 0.00 | Unavailable | 2 — secondary |
 | `codex multi account manager` | 10 | $0.00 | 1 | 0.00 | Unavailable | 3 — supporting |
 
+### Usage-limit demand in US English
+
+A follow-up report on 2026-09-15 measured the language used by people dealing
+with Codex usage limits. These figures are localized to United States / English
+(`en`, location ID `2840`) and therefore should not be compared directly with
+the global volumes above.
+
+| Keyword | US monthly volume | CPC (USD) | Paid difficulty | Paid competition | SEO difficulty | Recommended role |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| `codex usage limit` | 210 | $6.90 | 10 | 0.10 | 38 | Primary problem-cluster term |
+| `how to check codex usage limit` | 110 | $9.81 | 7 | 0.07 | 26 | High-priority how-to article |
+| `codex rate limit` | 90 | $16.33 | 20 | 0.20 | 27 | Supporting explainer term |
+| `codex rate limit reset` | 90 | $139.86 | 14 | 0.14 | 44 | Reset-time article; treat the unusually high CPC as directional |
+| `codex 5 hour limit` | 50 | $46.08 | 5 | 0.05 | 36 | Five-hour-window explainer |
+| `codex account switcher` | 40 | $60.55 | 12 | 0.12 | 25 | Product/category landing page |
+| `codex usage limit reached` | 10 | $58.70 | 17 | 0.17 | 11 | Recovery/troubleshooting article |
+
+Google-autocomplete expansion also returned recurring variants around checking
+remaining usage, dashboards and status, reset timing, reduced limits, the
+five-hour versus weekly window, monitoring, and limits being reached. This is
+evidence of the vocabulary people use, but autocomplete presence is not a
+monthly-volume measurement.
+
+The exact proposed names `codex supercharged`, `codex extended`, and
+`codex accounts manager` had no measurable US-English metrics in the report.
+`codex extended usage` appeared as a related phrase with zero reported monthly
+volume. Keep **CodexMarathon** as the brand and use the measured problem and
+category phrases in page titles, headings, descriptions, and explanatory copy.
+
 ### Data limits and interpretation
 
 * Ubersuggest global mode does not apply an English-language filter; these
   metrics are global and not language-specific.
-* The free account reached its daily three-report cap after the three terms
-  above. Ubersuggest returned no SEO-difficulty score for them.
+* The original global report reached the free account's daily three-report cap
+  after the three global terms above. Ubersuggest returned no SEO-difficulty
+  score for them.
+* The 2026-09-15 US-English report supplied localized volume and difficulty for
+  the usage-limit cluster. Volumes are rounded estimates, not traffic forecasts,
+  and CPC can be volatile at this scale.
 * The high CPC for `codex account switcher` is a strong commercial-intent
   signal. It should be the main landing-page target.
-* The remaining terms should be measured with US English (`en`, location ID
-  `2840`) once the daily report limit resets:
-  `codex CLI multiple accounts`, `switch Codex accounts`, `Codex account
-  switching`, `Codex usage limit account switch`, and `switch Codex account
-  without losing conversation`.
+* The next US-English research pass should measure `codex CLI multiple
+  accounts`, `switch Codex accounts`, `Codex account switching`, `Codex usage
+  limit account switch`, and `switch Codex account without losing
+  conversation`.
 
 ## SERP competitors
 
