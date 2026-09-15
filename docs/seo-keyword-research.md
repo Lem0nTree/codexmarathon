@@ -14,13 +14,14 @@ repository to `codex-multi-account`: that exact category is already crowded,
 and the product's differentiator is safer than generic account management.
 
 Use **Codex account switcher** as the primary discovery phrase. Position the
-product around a specific outcome:
+product around the automatic outcome that separates it from manual switchers:
 
-> Safely switch Codex accounts without losing the active conversation.
+> Automatically switch Codex accounts after a usage limit and continue the
+> same CLI conversation.
 
-This wording combines the highest-value validated head term with the product's
-safe-boundary switching, identity verification, and conversation-recovery
-capabilities.
+This combines the highest-value validated head term with the larger
+usage-limit problem cluster and the product's safe-boundary switching, identity
+verification, and exactly-once conversation recovery.
 
 ## Validated keyword metrics
 
@@ -135,15 +136,14 @@ Use clear qualifiers such as **OpenAI Codex CLI**, **ChatGPT accounts**, and
 **Suggested title**
 
 ```text
-CodexMarathon — Safe Codex Account Switcher for the Codex CLI
+Codex Account Switcher for the CLI | CodexMarathon
 ```
 
 **Suggested description**
 
 ```text
-Safely switch between ChatGPT accounts in the OpenAI Codex CLI at turn
-boundaries. Preserve conversations, recover after usage limits, and avoid
-duplicate turns.
+Automatically switch to an eligible Codex account after a usage limit. Preserve
+the same CLI conversation with safe boundaries and verified identity changes.
 ```
 
 **Primary keyword:** `codex account switcher`  
