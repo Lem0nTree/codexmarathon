@@ -49,6 +49,8 @@ pub enum TransferError {
     Limit,
     #[error("passphrase must contain at least 12 characters and at most 1024 bytes")]
     Passphrase,
+    #[error("passphrases do not match")]
+    PassphraseMismatch,
     #[error("backup decryption or authentication failed")]
     Decryption,
     #[error("backup encryption failed")]
@@ -148,6 +150,19 @@ pub fn validate_export_passphrase(passphrase: &SecretString) -> Result<()> {
         return Err(TransferError::Passphrase);
     }
     Ok(())
+}
+
+/// Validate an export passphrase and compare its confirmation without exposing
+/// either value to callers as ordinary text.
+pub fn confirm_export_passphrase(
+    passphrase: SecretString,
+    confirmation: SecretString,
+) -> Result<SecretString> {
+    validate_export_passphrase(&passphrase)?;
+    if passphrase.expose_secret().as_bytes() != confirmation.expose_secret().as_bytes() {
+        return Err(TransferError::PassphraseMismatch);
+    }
+    Ok(passphrase)
 }
 
 pub fn list_accounts(config: &MarathonConfig) -> Result<Vec<AccountSummary>> {

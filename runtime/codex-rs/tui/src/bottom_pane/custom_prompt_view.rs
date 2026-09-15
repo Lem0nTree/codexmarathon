@@ -35,6 +35,7 @@ use super::textarea::TextAreaState;
 
 /// Callback invoked when the user submits a custom prompt.
 pub(crate) type PromptSubmitted = Box<dyn Fn(String) + Send + Sync>;
+pub(crate) type PromptCancelled = Box<dyn Fn() + Send + Sync>;
 
 /// Correlates a pending generated prefill with its eventual display label.
 struct PendingTextSuggestion {
@@ -48,6 +49,7 @@ pub(crate) struct CustomPromptView {
     placeholder: String,
     context_label: Option<String>,
     on_submit: PromptSubmitted,
+    on_cancel: Option<PromptCancelled>,
 
     // UI state
     textarea: TextArea,
@@ -77,6 +79,7 @@ impl CustomPromptView {
             placeholder,
             context_label,
             on_submit,
+            on_cancel: None,
             textarea,
             textarea_state: RefCell::new(TextAreaState::default()),
             paste_burst: PasteBurst::default(),
@@ -84,6 +87,11 @@ impl CustomPromptView {
             pending_suggestion: None,
             user_edited: false,
         }
+    }
+
+    pub(crate) fn with_cancel_callback(mut self, on_cancel: PromptCancelled) -> Self {
+        self.on_cancel = Some(on_cancel);
+        self
     }
 
     /// Apply the same editor and Vim bindings used by the main composer.
@@ -201,7 +209,12 @@ impl BottomPaneView for CustomPromptView {
     }
 
     fn on_ctrl_c(&mut self) -> CancellationEvent {
-        self.completion = Some(ViewCompletion::Cancelled);
+        if self.completion.is_none() {
+            if let Some(on_cancel) = &self.on_cancel {
+                on_cancel();
+            }
+            self.completion = Some(ViewCompletion::Cancelled);
+        }
         CancellationEvent::Handled
     }
 

@@ -316,6 +316,20 @@ fn background_prefill_preserves_replace_backspace_recovery() {
     );
 }
 
+#[test]
+fn cancellation_callback_runs_once() {
+    let (cancelled, cancelled_rx) = std::sync::mpsc::channel();
+    let (view, _submitted_rx) = custom_prompt_view();
+    let mut view = view.with_cancel_callback(Box::new(move || {
+        cancelled.send(()).expect("send cancellation");
+    }));
+
+    assert_eq!(view.on_ctrl_c(), CancellationEvent::Handled);
+    assert_eq!(view.on_ctrl_c(), CancellationEvent::Handled);
+    assert_eq!(cancelled_rx.try_recv(), Ok(()));
+    assert!(cancelled_rx.try_recv().is_err());
+}
+
 fn custom_prompt_view() -> (CustomPromptView, Receiver<String>) {
     let (submitted, submitted_rx) = std::sync::mpsc::channel();
     let view = CustomPromptView::new(

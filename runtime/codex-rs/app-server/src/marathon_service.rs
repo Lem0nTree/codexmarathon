@@ -12,7 +12,7 @@ use codex_app_server_protocol::{
 };
 use codex_core::ThreadManager;
 use codex_login::{AuthDotJson, AuthManager, AuthReloadStatus, AuthTransitionSnapshot};
-use codex_protocol::protocol::RateLimitSnapshot;
+use codex_protocol::protocol::{RateLimitSnapshot, RateLimitWindow};
 use codexmarathon_runtime::{
     AccountTelemetry, AutoResetStore, CredentialHealth, DomainError, FileAccountRegistry,
     FileSnapshotVault, Freshness, LimitTelemetry, MarathonConfig, QuotaResetCapability,
@@ -27,6 +27,8 @@ use tokio::sync::{Mutex, watch};
 
 const AUTO_FAILOVER_USED_PERCENT: f64 = 90.0;
 const AUTO_FAILOVER_TELEMETRY_TTL: chrono::Duration = chrono::Duration::minutes(5);
+const FIVE_HOUR_WINDOW_MINUTES: i64 = 5 * 60;
+const WEEKLY_WINDOW_MINUTES: i64 = 7 * 24 * 60;
 
 #[derive(Clone, Copy, Debug)]
 struct CachedQuota {
@@ -148,7 +150,7 @@ impl MarathonService {
         else {
             return;
         };
-        let Some(used_percent) = quota_used_percent(snapshot) else {
+        let Some((used_percent, is_weekly)) = quota_observation(snapshot) else {
             return;
         };
         let now = chrono::Utc::now();
@@ -174,12 +176,13 @@ impl MarathonService {
             CachedQuota {
                 used_percent,
                 observed_at: now,
-                is_weekly: snapshot.secondary.is_some(),
+                is_weekly,
             },
         );
         drop(quotas);
 
-        if !quota_requires_failover(used_percent)
+        if !is_weekly
+            || !quota_requires_failover(used_percent)
             || !try_begin_auto_failover(&self.auto_failover_in_flight)
         {
             return;
@@ -603,15 +606,109 @@ fn quota_requires_failover(used_percent: f64) -> bool {
     used_percent > AUTO_FAILOVER_USED_PERCENT
 }
 
-fn quota_used_percent(snapshot: &RateLimitSnapshot) -> Option<f64> {
-    // Secondary is the longer (normally weekly) provider window. Values are
-    // percentage consumed, so <10 remaining is the strict >90 boundary.
-    let used = snapshot
-        .secondary
-        .as_ref()
-        .or(snapshot.primary.as_ref())?
-        .used_percent;
-    used.is_finite().then_some(used.clamp(0.0, 100.0))
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum QuotaWindowClass {
+    FiveHour,
+    Weekly,
+}
+
+fn quota_window_class(window: &RateLimitWindow) -> Option<QuotaWindowClass> {
+    match window.window_minutes {
+        Some(FIVE_HOUR_WINDOW_MINUTES) => Some(QuotaWindowClass::FiveHour),
+        Some(WEEKLY_WINDOW_MINUTES) => Some(QuotaWindowClass::Weekly),
+        Some(_) | None => None,
+    }
+}
+
+/// Classify provider windows by their durations, retaining conventional slot
+/// fallback only when the pair makes that mapping unambiguous. In particular,
+/// a primary window carrying the weekly duration must never be treated as a
+/// five-hour window merely because it is primary.
+fn classify_snapshot_windows(
+    snapshot: &RateLimitSnapshot,
+) -> (Option<&RateLimitWindow>, Option<&RateLimitWindow>) {
+    let windows = [
+        (WindowKind::Primary, snapshot.primary.as_ref()),
+        (WindowKind::Secondary, snapshot.secondary.as_ref()),
+    ];
+    let has_unknown_duration = windows
+        .iter()
+        .filter_map(|(_, window)| *window)
+        .any(|window| {
+            window.window_minutes.is_some_and(|minutes| {
+                minutes != FIVE_HOUR_WINDOW_MINUTES && minutes != WEEKLY_WINDOW_MINUTES
+            })
+        });
+
+    let mut five_hour = None;
+    let mut weekly = None;
+    for (_, window) in windows.iter().copied() {
+        let Some(window) = window else {
+            continue;
+        };
+        match quota_window_class(window) {
+            Some(QuotaWindowClass::FiveHour) => five_hour = Some(window),
+            Some(QuotaWindowClass::Weekly) => weekly = Some(window),
+            None => {}
+        }
+    }
+
+    // A missing duration can use the conventional primary/secondary roles
+    // only when both slots are present and all explicit durations are known.
+    // A single duration-less primary remains ambiguous because it may be a
+    // weekly-only account.
+    if !has_unknown_duration {
+        let primary = snapshot.primary.as_ref();
+        let secondary = snapshot.secondary.as_ref();
+        let primary_class = primary.and_then(quota_window_class);
+        let secondary_class = secondary.and_then(quota_window_class);
+        match (primary, secondary) {
+            (Some(primary), Some(secondary))
+                if primary.window_minutes.is_none() && secondary.window_minutes.is_none() =>
+            {
+                if five_hour.is_none() {
+                    five_hour = Some(primary);
+                }
+                if weekly.is_none() {
+                    weekly = Some(secondary);
+                }
+            }
+            (Some(primary), Some(_))
+                if primary.window_minutes.is_none()
+                    && secondary_class == Some(QuotaWindowClass::Weekly)
+                    && five_hour.is_none() =>
+            {
+                five_hour = Some(primary);
+            }
+            (Some(_), Some(secondary))
+                if secondary.window_minutes.is_none()
+                    && primary_class == Some(QuotaWindowClass::FiveHour)
+                    && weekly.is_none() =>
+            {
+                weekly = Some(secondary);
+            }
+            _ => {}
+        }
+    }
+
+    (five_hour, weekly)
+}
+
+fn quota_observation(snapshot: &RateLimitSnapshot) -> Option<(f64, bool)> {
+    let (five_hour, weekly) = classify_snapshot_windows(snapshot);
+    weekly
+        .and_then(|window| normalized_quota_used_percent(window).map(|used| (used, true)))
+        .or_else(|| {
+            five_hour
+                .and_then(|window| normalized_quota_used_percent(window).map(|used| (used, false)))
+        })
+}
+
+fn normalized_quota_used_percent(window: &RateLimitWindow) -> Option<f64> {
+    window
+        .used_percent
+        .is_finite()
+        .then_some(window.used_percent.clamp(0.0, 100.0))
 }
 
 fn quota_telemetry(
@@ -697,6 +794,7 @@ fn select_auto_target(
             };
             vault.contains(credential_ref).unwrap_or(false)
         })
+        .filter(|account| quotas.get(&account.id).is_some_and(|quota| quota.is_weekly))
         .filter_map(|account| {
             let quota = quotas.get(&account.id)?;
             (quota.observed_at <= now
@@ -774,18 +872,36 @@ mod tests {
     use chrono::Utc;
     use tempfile::tempdir;
 
-    fn rate_limits(primary: f64, secondary: Option<f64>) -> RateLimitSnapshot {
-        let window = |used_percent| codex_protocol::protocol::RateLimitWindow {
+    fn rate_limit_window(used_percent: f64, window_minutes: i64) -> RateLimitWindow {
+        RateLimitWindow {
             used_percent,
-            window_minutes: Some(10_080),
+            window_minutes: Some(window_minutes),
             resets_at: None,
-        };
+        }
+    }
+
+    fn rate_limits(primary: f64, secondary: Option<f64>) -> RateLimitSnapshot {
         RateLimitSnapshot {
             limit_id: Some("codex".to_string()),
             limit_name: None,
             normal_model_slug: None,
-            primary: Some(window(primary)),
-            secondary: secondary.map(window),
+            primary: Some(rate_limit_window(primary, FIVE_HOUR_WINDOW_MINUTES)),
+            secondary: secondary.map(|used| rate_limit_window(used, WEEKLY_WINDOW_MINUTES)),
+            credits: None,
+            individual_limit: None,
+            spend_control_reached: None,
+            plan_type: None,
+            rate_limit_reached_type: None,
+        }
+    }
+
+    fn weekly_only_primary(used_percent: f64) -> RateLimitSnapshot {
+        RateLimitSnapshot {
+            limit_id: Some("codex".to_string()),
+            limit_name: None,
+            normal_model_slug: None,
+            primary: Some(rate_limit_window(used_percent, WEEKLY_WINDOW_MINUTES)),
+            secondary: None,
             credits: None,
             individual_limit: None,
             spend_control_reached: None,
@@ -821,9 +937,40 @@ mod tests {
         assert_eq!(limit.windows.len(), 2);
         assert_eq!(limit.windows[0].kind, WindowKind::Primary);
         assert_eq!(limit.windows[0].used_percent, 12.5);
+        assert_eq!(limit.windows[0].window_duration_mins, Some(300));
         assert_eq!(limit.windows[1].kind, WindowKind::Secondary);
         assert_eq!(limit.windows[1].used_percent, 34.5);
         assert_eq!(limit.windows[1].window_duration_mins, Some(10_080));
+    }
+
+    #[test]
+    fn weekly_only_primary_is_classified_as_weekly() {
+        let snapshot = weekly_only_primary(84.0);
+        let (five_hour, weekly) = classify_snapshot_windows(&snapshot);
+
+        assert!(five_hour.is_none());
+        assert_eq!(weekly.map(|window| window.used_percent), Some(84.0));
+        assert_eq!(quota_observation(&snapshot), Some((84.0, true)));
+    }
+
+    #[test]
+    fn dual_windows_are_classified_by_duration() {
+        let snapshot = rate_limits(12.5, Some(34.5));
+        let (five_hour, weekly) = classify_snapshot_windows(&snapshot);
+
+        assert_eq!(five_hour.map(|window| window.used_percent), Some(12.5));
+        assert_eq!(weekly.map(|window| window.used_percent), Some(34.5));
+        assert_eq!(quota_observation(&snapshot), Some((34.5, true)));
+    }
+
+    #[test]
+    fn known_weekly_primary_is_never_five_hour() {
+        let snapshot = weekly_only_primary(95.0);
+        let (five_hour, weekly) = classify_snapshot_windows(&snapshot);
+
+        assert!(five_hour.is_none());
+        assert!(weekly.is_some());
+        assert!(quota_observation(&snapshot).expect("weekly observation").1);
     }
 
     #[test]

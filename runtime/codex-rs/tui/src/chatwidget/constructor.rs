@@ -135,6 +135,7 @@ impl ChatWidget {
             status_account_display,
             marathon_controller_status: None,
             pending_marathon_login: None,
+            pending_marathon_export: None,
             remote_connection: None,
             local_worktree_operations: true,
             token_info: None,

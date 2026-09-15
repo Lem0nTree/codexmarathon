@@ -364,6 +364,7 @@ use self::session_header::SessionHeader;
 mod hook_lifecycle;
 mod hooks;
 mod interaction;
+mod marathon_export;
 mod skills;
 mod slash_dispatch;
 mod worktree_picker;
@@ -600,6 +601,7 @@ pub(crate) struct ChatWidget {
     /// Login started from `/marathon login`; importing waits for both native
     /// login completion and the following AuthManager reload notification.
     pending_marathon_login: Option<PendingMarathonLogin>,
+    pending_marathon_export: Option<marathon_export::PendingMarathonExport>,
     pub(crate) remote_connection: Option<RemoteConnectionStatus>,
     pub(crate) local_worktree_operations: bool,
     token_info: Option<TokenUsageInfo>,

@@ -17,6 +17,16 @@ Create a backup:
 codex marathon backup export --output accounts.cmbackup
 ```
 
+Or launch the integrated wizard from a running Codex session:
+
+```text
+/marathon export
+```
+
+The TUI wizard collects the account selection, output filename, password, and
+password confirmation locally. Secret input is masked and zeroized and never
+crosses the app-server or accountd protocols.
+
 The picker uses Up/Down to move, Space to toggle an account, `a` to select all,
 Enter to continue, and Escape to cancel. Export prompts for the passphrase
 twice with terminal echo disabled. A passphrase must contain at least 12

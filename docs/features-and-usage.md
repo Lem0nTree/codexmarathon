@@ -92,12 +92,23 @@ The same actions are available as slash commands:
 /marathon login work browser
 /marathon login work device-code
 /marathon switch work
+/marathon export
 ```
 
 The login panel asks whether to use a browser link or a device/auth code. On a
 headless server, choose device code, open the displayed verification URL on
 another machine, and enter the one-time code. After native login completes,
 the identity is saved under the requested alias.
+
+`/marathon export` opens a native encrypted-backup wizard. Use Space to toggle
+accounts in the checkbox list, then confirm the destination filename and enter
+the masked password twice. Existing destination files are not overwritten.
+The password remains inside the local TUI and is never included in an app event,
+RPC, transcript, or accountd request.
+
+The `/marathon` help and status views use the normal Codex terminal styling:
+colored service/health states, bold headings, and an aligned account table with
+credential and weekly-quota status.
 
 ## Status line
 

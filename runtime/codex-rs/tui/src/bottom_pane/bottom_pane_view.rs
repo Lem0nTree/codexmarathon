@@ -93,6 +93,12 @@ pub(crate) trait BottomPaneView: Renderable {
         false
     }
 
+    /// Whether pasted input must be moved directly into zeroizing storage
+    /// without normalization copies.
+    fn is_secret_input(&self) -> bool {
+        false
+    }
+
     /// Flush any pending paste-burst state. Return true if state changed.
     ///
     /// This lets a modal that reuses `ChatComposer` participate in the same

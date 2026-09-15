@@ -284,6 +284,10 @@ impl ChatWidget {
         self.bottom_pane.no_modal_or_popup_active()
     }
 
+    pub(crate) fn secret_input_active(&self) -> bool {
+        self.bottom_pane.secret_input_active()
+    }
+
     pub(crate) fn can_launch_external_editor(&self) -> bool {
         !self.external_writer_view && self.bottom_pane.can_launch_external_editor()
     }

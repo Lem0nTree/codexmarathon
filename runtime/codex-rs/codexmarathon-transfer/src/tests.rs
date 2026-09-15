@@ -3,6 +3,31 @@ use codexmarathon_runtime::{AccountStore, CredentialHealth, SnapshotVault};
 
 const SECRET: &str = "test passphrase with several words";
 
+#[test]
+fn export_passphrase_confirmation_enforces_policy_and_equality() {
+    let confirmed = confirm_export_passphrase(
+        SecretString::from("correct horse battery staple".to_string()),
+        SecretString::from("correct horse battery staple".to_string()),
+    )
+    .expect("matching valid passphrases");
+    validate_export_passphrase(&confirmed).expect("confirmed passphrase remains valid");
+
+    assert!(matches!(
+        confirm_export_passphrase(
+            SecretString::from("correct horse battery staple".to_string()),
+            SecretString::from("different horse battery staple".to_string()),
+        ),
+        Err(TransferError::PassphraseMismatch)
+    ));
+    assert!(matches!(
+        confirm_export_passphrase(
+            SecretString::from("too short".to_string()),
+            SecretString::from("too short".to_string()),
+        ),
+        Err(TransferError::Passphrase)
+    ));
+}
+
 fn snapshot(id: &str) -> AuthSnapshot {
     let bytes = format!(
         "{{ \"account_id\":\"{id}\", \"tokens\":{{\"access_token\":\"synthetic-{id}\"}} }}\n"
