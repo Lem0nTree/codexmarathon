@@ -119,7 +119,7 @@ async fn stdio_execution_timing_includes_javascript_but_excludes_delayed_reads()
     );
     let delegate = Arc::new(RecordingDelegate::default());
     let session = provider
-        .create_session(delegate.clone())
+        .create_session()
         .await
         .map_err(anyhow::Error::msg)?;
 
@@ -127,17 +127,21 @@ async fn stdio_execution_timing_includes_javascript_but_excludes_delayed_reads()
     for (index, suffix) in endings.into_iter().enumerate() {
         let observed = Instant::now();
         let started = session
-            .execute(ExecuteRequest {
-                tool_call_id: format!("call-{index}"),
-                source: format!(
-                    "const until = Date.now() + 150; while (Date.now() < until) {{}} \
+            .execute(
+                ExecuteRequest {
+                    tool_call_id: format!("call-{index}"),
+                    source: format!(
+                        "const until = Date.now() + 150; while (Date.now() < until) {{}} \
                      await new Promise(resolve => setTimeout(resolve, 150)); \
                      notify('finished'); {suffix}"
-                ),
-                enabled_tools: Vec::new(),
-                yield_time_ms: Some(/*value*/ 5_000),
-                max_output_tokens: Some(/*value*/ 1_000),
-            })
+                    ),
+                    enabled_tools: Vec::new(),
+                    yield_time_ms: Some(/*value*/ 5_000),
+                    max_output_tokens: Some(/*value*/ 1_000),
+                },
+                delegate.clone(),
+                /*preempt*/ None,
+            )
             .await
             .map_err(anyhow::Error::msg)?;
         timeout(TEST_TIMEOUT, delegate.notification_delivered.notified())
@@ -184,17 +188,21 @@ async fn observation_timing_excludes_previous_requests_and_background_time() -> 
     ];
     for provider in providers {
         let session = provider
-            .create_session(Arc::new(NoopCodeModeSessionDelegate))
+            .create_session()
             .await
             .map_err(anyhow::Error::msg)?;
         let started = session
-            .execute(ExecuteRequest {
-                tool_call_id: "call-1".to_string(),
-                source: "await new Promise(() => {});".to_string(),
-                enabled_tools: Vec::new(),
-                yield_time_ms: Some(/*value*/ 200),
-                max_output_tokens: Some(/*value*/ 1_000),
-            })
+            .execute(
+                ExecuteRequest {
+                    tool_call_id: "call-1".to_string(),
+                    source: "await new Promise(() => {});".to_string(),
+                    enabled_tools: Vec::new(),
+                    yield_time_ms: Some(/*value*/ 200),
+                    max_output_tokens: Some(/*value*/ 1_000),
+                },
+                Arc::new(NoopCodeModeSessionDelegate),
+                /*preempt*/ None,
+            )
             .await
             .map_err(anyhow::Error::msg)?;
         let cell_id = started.cell_id.clone();
@@ -217,10 +225,13 @@ async fn observation_timing_excludes_previous_requests_and_background_time() -> 
             sleep(Duration::from_millis(/*millis*/ 300)).await;
             let observed = Instant::now();
             let outcome = session
-                .wait(WaitRequest {
-                    cell_id: cell_id.clone(),
-                    yield_time_ms: 50,
-                })
+                .wait(
+                    WaitRequest {
+                        cell_id: cell_id.clone(),
+                        yield_time_ms: 50,
+                    },
+                    /*preempt*/ None,
+                )
                 .await
                 .map_err(anyhow::Error::msg)?;
             let duration = outcome
@@ -261,10 +272,13 @@ async fn observation_timing_excludes_previous_requests_and_background_time() -> 
 
         let observed = Instant::now();
         let missing = session
-            .wait(WaitRequest {
-                cell_id: cell_id.clone(),
-                yield_time_ms: 50,
-            })
+            .wait(
+                WaitRequest {
+                    cell_id: cell_id.clone(),
+                    yield_time_ms: 50,
+                },
+                /*preempt*/ None,
+            )
             .await
             .map_err(anyhow::Error::msg)?;
         let duration = missing

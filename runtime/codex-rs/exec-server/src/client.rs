@@ -45,6 +45,7 @@ use crate::environment::EnvironmentConnectionState;
 use crate::process::ExecProcessEvent;
 use crate::process::ExecProcessEventLog;
 use crate::process::ExecProcessEventReceiver;
+use crate::process_telemetry::trace_process_id;
 use crate::protocol::CAPABILITY_ROOTS_DISCOVER_METHOD;
 use crate::protocol::CapabilityRootsDiscoverParams;
 use crate::protocol::CapabilityRootsDiscoverResponse;
@@ -120,6 +121,16 @@ use crate::protocol::SignalParams;
 use crate::protocol::SignalResponse;
 use crate::protocol::TerminateParams;
 use crate::protocol::TerminateResponse;
+use crate::protocol::WireFsCanonicalizeParams;
+use crate::protocol::WireFsCopyParams;
+use crate::protocol::WireFsCreateDirectoryParams;
+use crate::protocol::WireFsGetMetadataParams;
+use crate::protocol::WireFsOpenParams;
+use crate::protocol::WireFsReadDirectoryParams;
+use crate::protocol::WireFsReadFileParams;
+use crate::protocol::WireFsRemoveParams;
+use crate::protocol::WireFsWalkParams;
+use crate::protocol::WireFsWriteFileParams;
 use crate::protocol::WriteParams;
 use crate::protocol::WriteResponse;
 use crate::rpc::RpcCallError;
@@ -138,9 +149,13 @@ mod provisioning_tests;
 mod recovery;
 #[path = "client_refresh.rs"]
 mod refresh;
-#[cfg(test)]
+pub(crate) use connection_failure::can_retry_connection_attempt;
 pub(crate) use recovery::is_environment_offline_error;
 pub(crate) use recovery::is_retryable_recovery_error;
+
+#[path = "client/connection_failure.rs"]
+mod connection_failure;
+use connection_failure::ConnectionFailure;
 pub(crate) use recovery::is_retryable_registry_error;
 pub(crate) use recovery::registry_recovery_retry_delay;
 use refresh::ConnectionAttempt;
@@ -281,6 +296,8 @@ struct Inner {
 
 struct ConnectionState {
     status: ConnectionStatus,
+    // Publish registration renewal together with the recovered transport.
+    executor_registration_id: Option<String>,
     active_process_starts: usize,
     environment_connection_state_tx: watch::Sender<EnvironmentConnectionState>,
 }
@@ -288,7 +305,7 @@ struct ConnectionState {
 enum ConnectionStatus {
     Connected(Arc<RpcClient>),
     Recovering,
-    Failed(String),
+    Failed(ConnectionFailure),
 }
 
 impl ConnectionState {
@@ -309,7 +326,8 @@ impl ConnectionState {
         let _ = self
             .environment_connection_state_tx
             .send_if_modified(|current| {
-                if *current == state {
+                // A terminal failure must wake callers waiting on recovery.
+                if *current == state && !matches!(self.status, ConnectionStatus::Failed(_)) {
                     false
                 } else {
                     *current = state;
@@ -337,6 +355,7 @@ pub struct ExecServerClient {
 /// `timeout_for_error` keeps diagnostics tied to the caller's configured
 /// budget after readiness has consumed part of that budget.
 pub(crate) struct NoiseInitializeContext {
+    pub(crate) executor_registration_id: String,
     pub(crate) span: tracing::Span,
     pub(crate) timeout_for_error: Duration,
 }
@@ -526,7 +545,7 @@ impl LazyRemoteExecServerClient {
                 || self.startup.result.get().is_some_and(|result| {
                     result
                         .as_ref()
-                        .is_err_and(|error| recovery::is_retryable_recovery_error(error))
+                        .is_err_and(|error| can_retry_connection_attempt(error))
                 })) {
             Box::pin(self.reconnect()).await
         } else {
@@ -586,6 +605,11 @@ impl LazyRemoteExecServerClient {
     fn connected_client(&self) -> Option<ExecServerClient> {
         self.cached_client()
             .filter(|client| !client.is_disconnected())
+    }
+
+    pub(crate) fn cached_executor_registration_id(&self) -> Option<String> {
+        self.cached_client()
+            .and_then(|client| client.executor_registration_id())
     }
 
     fn cached_client(&self) -> Option<ExecServerClient> {
@@ -648,6 +672,8 @@ pub enum ExecServerError {
     WebSocketConfiguration(String),
     #[error("timed out waiting for exec-server initialize handshake after {timeout:?}")]
     InitializeTimedOut { timeout: Duration },
+    #[error(transparent)]
+    ApplicationNetworkPolicy(#[from] codex_http_client::NetworkPolicyDenied),
     #[error("exec-server transport closed")]
     Closed,
     #[error("{0}")]
@@ -683,6 +709,15 @@ pub enum ExecServerError {
 }
 
 impl ExecServerClient {
+    fn executor_registration_id(&self) -> Option<String> {
+        self.inner
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .executor_registration_id
+            .clone()
+    }
+
     fn attach_environment_connection_state(
         &self,
         state_tx: watch::Sender<EnvironmentConnectionState>,
@@ -717,9 +752,7 @@ impl ExecServerClient {
             ConnectionStatus::Connected(_) | ConnectionStatus::Recovering => Err(
                 ExecServerError::Disconnected("exec-server environment is recovering".to_string()),
             ),
-            ConnectionStatus::Failed(message) => {
-                Err(ExecServerError::Disconnected(message.clone()))
-            }
+            ConnectionStatus::Failed(message) => Err(message.clone().into()),
         }
     }
 
@@ -900,11 +933,13 @@ impl ExecServerClient {
         &self,
         params: FsReadFileParams,
     ) -> Result<FsReadFileResponse, ExecServerError> {
-        self.call(FS_READ_FILE_METHOD, &params).await
+        self.call(FS_READ_FILE_METHOD, &WireFsReadFileParams::from(params))
+            .await
     }
 
     pub async fn fs_open(&self, params: FsOpenParams) -> Result<FsOpenResponse, ExecServerError> {
-        self.call(FS_OPEN_METHOD, &params).await
+        self.call(FS_OPEN_METHOD, &WireFsOpenParams::from(params))
+            .await
     }
 
     pub async fn fs_read_block(
@@ -925,52 +960,77 @@ impl ExecServerClient {
         &self,
         params: FsWriteFileParams,
     ) -> Result<FsWriteFileResponse, ExecServerError> {
-        self.call(FS_WRITE_FILE_METHOD, &params).await
+        self.call(FS_WRITE_FILE_METHOD, &WireFsWriteFileParams::from(params))
+            .await
     }
 
     pub async fn fs_create_directory(
         &self,
         params: FsCreateDirectoryParams,
     ) -> Result<FsCreateDirectoryResponse, ExecServerError> {
-        self.call(FS_CREATE_DIRECTORY_METHOD, &params).await
+        self.call(
+            FS_CREATE_DIRECTORY_METHOD,
+            &WireFsCreateDirectoryParams::from(params),
+        )
+        .await
     }
 
     pub async fn fs_get_metadata(
         &self,
         params: FsGetMetadataParams,
     ) -> Result<FsGetMetadataResponse, ExecServerError> {
-        self.call(FS_GET_METADATA_METHOD, &params).await
+        self.call(
+            FS_GET_METADATA_METHOD,
+            &WireFsGetMetadataParams::from(params),
+        )
+        .await
     }
 
     pub async fn fs_canonicalize(
         &self,
         params: FsCanonicalizeParams,
     ) -> Result<FsCanonicalizeResponse, ExecServerError> {
-        self.call(FS_CANONICALIZE_METHOD, &params).await
+        self.call(
+            FS_CANONICALIZE_METHOD,
+            &WireFsCanonicalizeParams::from(params),
+        )
+        .await
     }
 
     pub async fn fs_read_directory(
         &self,
         params: FsReadDirectoryParams,
     ) -> Result<FsReadDirectoryResponse, ExecServerError> {
-        self.call(FS_READ_DIRECTORY_METHOD, &params).await
+        self.call(
+            FS_READ_DIRECTORY_METHOD,
+            &WireFsReadDirectoryParams::from(params),
+        )
+        .await
     }
 
     pub async fn fs_walk(&self, params: FsWalkParams) -> Result<FsWalkResponse, ExecServerError> {
-        self.call(FS_WALK_METHOD, &params).await
+        self.call(FS_WALK_METHOD, &WireFsWalkParams::from(params))
+            .await
     }
 
     pub async fn fs_remove(
         &self,
         params: FsRemoveParams,
     ) -> Result<FsRemoveResponse, ExecServerError> {
-        self.call(FS_REMOVE_METHOD, &params).await
+        self.call(FS_REMOVE_METHOD, &WireFsRemoveParams::from(params))
+            .await
     }
 
     pub async fn fs_copy(&self, params: FsCopyParams) -> Result<FsCopyResponse, ExecServerError> {
-        self.call(FS_COPY_METHOD, &params).await
+        self.call(FS_COPY_METHOD, &WireFsCopyParams::from(params))
+            .await
     }
 
+    #[tracing::instrument(
+        name = "codex.exec_server.process_start",
+        skip_all,
+        fields(process.id = trace_process_id(params.process_id.as_str())),
+    )]
     pub(crate) async fn start_process(
         &self,
         params: ExecParams,
@@ -1129,9 +1189,7 @@ impl ExecServerClient {
                 Some(Ok(()))
             }
             ConnectionStatus::Connected(_) | ConnectionStatus::Recovering => None,
-            ConnectionStatus::Failed(message) => {
-                Some(Err(ExecServerError::Disconnected(message.clone())))
-            }
+            ConnectionStatus::Failed(message) => Some(Err(message.clone().into())),
         }
     }
 
@@ -1184,6 +1242,9 @@ impl ExecServerClient {
         let inner = Arc::new(Inner {
             connection: StdMutex::new(ConnectionState {
                 status: ConnectionStatus::Connected(Arc::clone(&rpc_client)),
+                executor_registration_id: noise_context
+                    .as_ref()
+                    .map(|context| context.executor_registration_id.clone()),
                 active_process_starts: 0,
                 environment_connection_state_tx: watch::channel(
                     EnvironmentConnectionState::Connected,
@@ -1628,8 +1689,8 @@ impl Inner {
         // Do not register a process session that can never receive environment
         // notifications. Without this check, remote MCP startup could create a
         // dead session and wait for process output that will never arrive.
-        if let Some(message) = self.failure_message() {
-            return Err(ExecServerError::Disconnected(message));
+        if let Some(message) = self.connection_failure() {
+            return Err(message.into());
         }
         let sessions = self.sessions.load();
         if sessions.contains_key(process_id) {

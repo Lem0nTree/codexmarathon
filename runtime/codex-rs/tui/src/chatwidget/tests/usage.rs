@@ -13,6 +13,15 @@ use uuid::Uuid;
 
 const TEST_OVERLAY_VIEW_ID: &str = "usage-test-overlay";
 
+#[tokio::test]
+async fn usage_menu_opens_analytics() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    set_chatgpt_auth(&mut chat);
+    chat.dispatch_command(SlashCommand::Usage);
+    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert_matches!(rx.try_recv(), Ok(AppEvent::OpenAnalytics { view: None }));
+}
+
 fn reset_credits(available_count: i64) -> RateLimitResetCreditsSummary {
     RateLimitResetCreditsSummary {
         available_count,
@@ -89,15 +98,15 @@ fn reset_credit_options_use_generic_copy_when_backend_copy_is_missing() {
     credit.reset_type = RateLimitResetType::Unknown;
 
     assert_eq!(
-        reset_credit_options(&detailed_reset_credits(
-            /*available_count*/ 1,
-            vec![credit],
-        )),
+        reset_credit_options(
+            &detailed_reset_credits(/*available_count*/ 1, vec![credit],),
+            crate::clock_format::ClockFormat::TwentyFourHour
+        ),
         vec![ResetCreditOption {
             credit_id: Some("future-credit".to_string()),
             name: "Full reset".to_string(),
-            detail: Some("Does not expire.".to_string()),
-            description: "Reset your current usage limits.".to_string(),
+            detail: Some("Does not expire".to_string()),
+            description: "Reset your current usage limits".to_string(),
         }]
     );
 }
@@ -119,8 +128,12 @@ async fn usage_command_opens_menu_when_reset_is_available_snapshot() {
         "usage_command_menu",
         render_bottom_popup(&chat, /*width*/ 80)
     );
+    assert_chatwidget_snapshot!(
+        "usage_command_menu_narrow",
+        render_bottom_popup(&chat, /*width*/ 40)
+    );
     chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-    assert_matches!(rx.try_recv(), Ok(AppEvent::OpenTokenActivity));
+    assert_matches!(rx.try_recv(), Ok(AppEvent::OpenAnalytics { view: None }));
 }
 
 #[tokio::test]
@@ -146,9 +159,8 @@ async fn usage_command_disables_reset_after_cached_zero_snapshot() {
             origin: RateLimitRefreshOrigin::UsageMenu { request_id: 1 }
         })
     );
-    chat.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
     chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-    assert_matches!(rx.try_recv(), Ok(AppEvent::OpenTokenActivity));
+    assert_matches!(rx.try_recv(), Ok(AppEvent::OpenAnalytics { view: None }));
 }
 
 #[tokio::test]
@@ -204,10 +216,9 @@ async fn usage_menu_refresh_failure_preserves_disabled_known_zero() {
         Err("backend unavailable".to_string()),
     );
 
-    assert!(render_bottom_popup(&chat, /*width*/ 80).contains("No usage limit resets available."));
-    chat.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    assert!(render_bottom_popup(&chat, /*width*/ 80).contains("None available"));
     chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-    assert_matches!(rx.try_recv(), Ok(AppEvent::OpenTokenActivity));
+    assert_matches!(rx.try_recv(), Ok(AppEvent::OpenAnalytics { view: None }));
 }
 
 #[tokio::test]
@@ -405,6 +416,7 @@ async fn rate_limit_reset_popup_states_snapshot() {
 #[tokio::test]
 async fn rate_limit_reset_picker_wraps_expiry_details_snapshot() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.clock_format = crate::clock_format::ClockFormat::TwelveHour;
     let request_id = chat.show_rate_limit_reset_loading_popup();
     let expiry = expiry_timestamp(/*day*/ 18, /*hour*/ 9, /*minute*/ 39);
     assert!(chat.finish_rate_limit_reset_credits_refresh(
@@ -466,7 +478,7 @@ async fn rate_limit_reset_confirmation_uses_backend_copy_snapshot() {
             request_id,
             Some("weekly-credit"),
             "Full reset (Weekly + 5 hr)",
-            Some("Expires 09:39 on 18 Jun 2026."),
+            Some("Expires 09:39 on 18 Jun 2026"),
             "Reset your weekly and 5-hour usage limits.",
         )
     );
@@ -542,7 +554,7 @@ async fn reset_picker_allows_only_one_pending_confirmation() {
     chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
     show_rate_limit_reset_confirmation_from_event(&mut chat, &mut rx);
 
-    assert!(render_bottom_popup(&chat, /*width*/ 80).contains("Second reset · Does not expire."));
+    assert!(render_bottom_popup(&chat, /*width*/ 80).contains("Second reset · Does not expire"));
 }
 
 #[tokio::test]
@@ -567,7 +579,7 @@ async fn rate_limit_reset_picker_starts_with_soonest_expiries_and_keeps_all_rows
 
     let rendered = render_bottom_popup(&chat, /*width*/ 80);
     assert!(
-        rendered.contains("Expires 09:39 on 18 Jun 2026."),
+        rendered.contains("Expires 09:39 on 18 Jun 2026"),
         "{rendered}"
     );
     assert!(!rendered.contains("Full reset ("), "{rendered}");
@@ -589,8 +601,8 @@ async fn rate_limit_reset_picker_starts_with_soonest_expiries_and_keeps_all_rows
         }) if picker_request_id == request_id
             && credit_id.as_deref() == Some("credit-8")
             && reset_title == "Full reset"
-            && reset_detail.as_deref() == Some("Expires 09:39 on 26 Jun 2026.")
-            && reset_description == "Reset your current usage limits."
+            && reset_detail.as_deref() == Some("Expires 09:39 on 26 Jun 2026")
+            && reset_description == "Reset your current usage limits"
     );
 }
 
@@ -700,10 +712,9 @@ async fn no_credit_outcome_disables_reset_entry_in_usage_menu() {
             origin: RateLimitRefreshOrigin::UsageMenu { request_id: 2 }
         })
     );
-    chat.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
     chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
-    assert_matches!(rx.try_recv(), Ok(AppEvent::OpenTokenActivity));
+    assert_matches!(rx.try_recv(), Ok(AppEvent::OpenAnalytics { view: None }));
 
     chat.available_rate_limit_reset_credits = Some(2);
     let consume_request_id = chat.show_rate_limit_reset_consuming_popup();
@@ -810,8 +821,8 @@ async fn failed_post_consume_refresh_does_not_keep_stale_reset_count() {
     chat.dispatch_command(SlashCommand::Usage);
 
     let rendered = render_bottom_popup(&chat, /*width*/ 80);
-    assert!(rendered.contains("Check reset availability."));
-    assert!(!rendered.contains("You have 2 usage limit resets available."));
+    assert!(rendered.contains("Check availability"));
+    assert!(!rendered.contains("2 available"));
 }
 
 #[tokio::test]

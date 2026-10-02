@@ -74,10 +74,12 @@ async fn responses_stream_includes_subagent_header_on_review() {
     let provider = ModelProviderInfo {
         name: "mock".into(),
         base_url: Some(format!("{}/v1", server.uri())),
+        model_catalog_url: None,
         env_key: None,
         env_key_instructions: None,
         experimental_bearer_token: None,
         auth: None,
+        gateway_oauth: None,
         aws: None,
         wire_api: WireApi::Responses,
         query_params: None,
@@ -90,6 +92,7 @@ async fn responses_stream_includes_subagent_header_on_review() {
         requires_openai_auth: false,
         supports_websockets: false,
         supports_standalone_web_search: false,
+        include_internal_metadata: false,
     };
 
     let codex_home = TempDir::new().expect("failed to create TempDir");
@@ -130,12 +133,15 @@ async fn responses_stream_includes_subagent_header_on_review() {
         "test_originator".to_string(),
         config.model_verbosity,
         config.features.enabled(Feature::ContentItemKinds),
+        config.features.enabled(Feature::ReasoningEffortOverride),
         /*enable_request_compression*/ false,
         /*include_timing_metrics*/ false,
         /*beta_features_header*/ None,
         /*concurrent_reasoning_summaries_enabled*/ false,
         /*attestation_provider*/ None,
         config.http_client_factory(),
+        config.workspace_routing_context(),
+        Vec::new(),
     );
     let responses_metadata = test_turn_responses_metadata(&client, thread_id, &session_source);
     let mut client_session = client.new_session();
@@ -211,10 +217,12 @@ async fn responses_stream_includes_subagent_header_on_other() {
     let provider = ModelProviderInfo {
         name: "mock".into(),
         base_url: Some(format!("{}/v1", server.uri())),
+        model_catalog_url: None,
         env_key: None,
         env_key_instructions: None,
         experimental_bearer_token: None,
         auth: None,
+        gateway_oauth: None,
         aws: None,
         wire_api: WireApi::Responses,
         query_params: None,
@@ -227,6 +235,7 @@ async fn responses_stream_includes_subagent_header_on_other() {
         requires_openai_auth: false,
         supports_websockets: false,
         supports_standalone_web_search: false,
+        include_internal_metadata: false,
     };
 
     let codex_home = TempDir::new().expect("failed to create TempDir");
@@ -267,12 +276,15 @@ async fn responses_stream_includes_subagent_header_on_other() {
         "test_originator".to_string(),
         config.model_verbosity,
         config.features.enabled(Feature::ContentItemKinds),
+        config.features.enabled(Feature::ReasoningEffortOverride),
         /*enable_request_compression*/ false,
         /*include_timing_metrics*/ false,
         /*beta_features_header*/ None,
         /*concurrent_reasoning_summaries_enabled*/ false,
         /*attestation_provider*/ None,
         config.http_client_factory(),
+        config.workspace_routing_context(),
+        Vec::new(),
     );
     let responses_metadata = test_turn_responses_metadata(&client, thread_id, &session_source);
     let mut client_session = client.new_session();
@@ -329,10 +341,12 @@ async fn responses_respects_model_info_overrides_from_config() {
     let provider = ModelProviderInfo {
         name: "mock".into(),
         base_url: Some(format!("{}/v1", server.uri())),
+        model_catalog_url: None,
         env_key: None,
         env_key_instructions: None,
         experimental_bearer_token: None,
         auth: None,
+        gateway_oauth: None,
         aws: None,
         wire_api: WireApi::Responses,
         query_params: None,
@@ -345,6 +359,7 @@ async fn responses_respects_model_info_overrides_from_config() {
         requires_openai_auth: false,
         supports_websockets: false,
         supports_standalone_web_search: false,
+        include_internal_metadata: false,
     };
 
     let codex_home = TempDir::new().expect("failed to create TempDir");
@@ -389,12 +404,15 @@ async fn responses_respects_model_info_overrides_from_config() {
         "test_originator".to_string(),
         config.model_verbosity,
         config.features.enabled(Feature::ContentItemKinds),
+        config.features.enabled(Feature::ReasoningEffortOverride),
         /*enable_request_compression*/ false,
         /*include_timing_metrics*/ false,
         /*beta_features_header*/ None,
         /*concurrent_reasoning_summaries_enabled*/ false,
         /*attestation_provider*/ None,
         config.http_client_factory(),
+        config.workspace_routing_context(),
+        Vec::new(),
     );
     let responses_metadata = test_turn_responses_metadata(&client, thread_id, &session_source);
     let mut client_session = client.new_session();
@@ -460,7 +478,11 @@ async fn responses_stream_includes_turn_metadata_header_for_git_workspace_e2e() 
         responses::ev_completed("resp-1"),
     ]);
 
-    let test = test_codex().build(&server).await.expect("build test codex");
+    let test = test_codex()
+        .with_config(|config| config.analytics_enabled = Some(true))
+        .build(&server)
+        .await
+        .expect("build test codex");
     let cwd = test.cwd_path();
 
     let first_request = responses::mount_sse_once(&server, response_body.clone()).await;
@@ -508,6 +530,13 @@ async fn responses_stream_includes_turn_metadata_header_for_git_workspace_e2e() 
             .expect("request body should include x-codex-turn-metadata"),
     )
     .expect("body x-codex-turn-metadata should be valid JSON");
+    assert_eq!(
+        (
+            initial_parsed["analytics_enabled"].as_bool(),
+            body_metadata["analytics_enabled"].as_bool(),
+        ),
+        (Some(true), Some(true)),
+    );
     assert_eq!(
         body_metadata
             .get("sandbox_mode")

@@ -28,7 +28,7 @@ pub(super) async fn suspend_turn_and_shutdown(
     // Previously closed descendants and concurrent future spawns remain best effort.
     if session
         .services
-        .agent_control
+        .local_agent_runtime
         .list_live_agent_subtree_thread_ids(session.thread_id)
         .await?
         .len()
@@ -107,9 +107,8 @@ pub(super) async fn suspend_turn_and_shutdown(
     live_thread.shutdown().await.map_err(|error| {
         CodexErr::Fatal(format!("close suspended root turn writer failed: {error}"))
     })?;
-    // Announce thread shutdown only after its writer closes so a replacement worker
-    // cannot write the same thread concurrently.
-    handlers::emit_thread_stop_lifecycle(session.as_ref()).await;
+    // Announce completion only after extension cleanup and writer closure so a
+    // replacement worker cannot write the same thread concurrently.
     session
         .deliver_event_raw(Event {
             id: submission_id,

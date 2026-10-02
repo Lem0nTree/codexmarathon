@@ -35,6 +35,8 @@ fn write_rollout_with_source_and_provider(
         ordinal: None,
         item: RolloutItem::SessionMeta(SessionMetaLine {
             meta: SessionMeta {
+                creator_user_id: None,
+                creator_account_id: None,
                 session_id: thread_id.into(),
                 id: thread_id,
                 forked_from_id: None,
@@ -42,6 +44,7 @@ fn write_rollout_with_source_and_provider(
                 parent_thread_id: None,
                 timestamp,
                 cwd: ".".into(),
+                runtime_workspace_roots: None,
                 originator: "test_originator".into(),
                 cli_version: "test_version".into(),
                 source,

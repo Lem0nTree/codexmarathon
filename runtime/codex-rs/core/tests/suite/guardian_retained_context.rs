@@ -1,6 +1,5 @@
 //! Retained-instruction and answer lifecycles through real sessions and durable checkpoints.
-//! Real user input covers steering, compaction and rollback; legacy replay fixtures also use
-//! the public rollout append API. Resume and child forks use production paths.
+//! Real user input covers steering and compaction. Resume and child forks use production paths.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -13,7 +12,10 @@ use codex_core::ForkSnapshot;
 use codex_core::TurnInputRequest;
 use codex_core::config::Config;
 use codex_core::config::ThreadStoreConfig;
+use codex_extension_api::ExtensionFuture;
 use codex_extension_api::ExtensionRegistryBuilder;
+use codex_extension_api::ThreadIdleInput;
+use codex_extension_api::ThreadLifecycleContributor;
 use codex_extension_api::ToolLifecycleContributor;
 use codex_extension_api::ToolLifecycleFuture;
 use codex_extension_api::ToolStartInput;
@@ -22,17 +24,23 @@ use codex_history::GuardianHistoryCheckpoint;
 use codex_history::InitialHistory;
 use codex_history::ResumedHistory;
 use codex_history::RetainedContext;
+use codex_history::RetainedContextEntry;
 use codex_history::RetainedContextEvent;
+use codex_history::RetainedContextOrder;
 use codex_history::RolloutItem;
 use codex_history::VerifiedAnswer;
 use codex_history::VerifiedQuestionAnswer;
 use codex_protocol::ResponseItemId;
+use codex_protocol::config_types::CollaborationMode;
+use codex_protocol::config_types::ModeKind;
+use codex_protocol::config_types::Settings;
 use codex_protocol::mcp::ClientMcpExtensions;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::ThreadHistoryMode;
+use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::request_user_input::RequestUserInputAnswer;
 use codex_protocol::request_user_input::RequestUserInputResponse;
 use codex_protocol::user_input::UserInput;
@@ -43,11 +51,16 @@ use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_function_call;
 use core_test_support::responses::ev_function_call_with_namespace;
+use core_test_support::responses::ev_message_item_added;
+use core_test_support::responses::ev_output_text_delta;
+use core_test_support::responses::ev_response_created;
 use core_test_support::responses::mount_sse_once_match;
 use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::sse;
 use core_test_support::responses::start_mock_server;
 use core_test_support::skip_if_no_network;
+use core_test_support::streaming_sse::StreamingSseChunk;
+use core_test_support::streaming_sse::start_streaming_sse_server;
 use core_test_support::test_codex::TestCodex;
 use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
@@ -56,17 +69,19 @@ use pretty_assertions::assert_eq;
 use serde_json::json;
 use test_case::test_case;
 use tokio::sync::Notify;
+use tokio::sync::oneshot;
 use wiremock::MockServer;
 use wiremock::matchers::header;
 
-// Keep child completion out of the parent's history while checking rollback boundaries.
+// Keep child completion out of the parent's history and wait for parent turn cleanup
+// before checking inherited authorization.
 #[derive(Default)]
-struct ChildToolGate {
+struct ForkTestLifecycle {
     entered: Notify,
     release: Notify,
 }
 
-impl ToolLifecycleContributor for ChildToolGate {
+impl ToolLifecycleContributor for ForkTestLifecycle {
     fn on_tool_start<'a>(&'a self, input: ToolStartInput<'a>) -> ToolLifecycleFuture<'a> {
         Box::pin(async move {
             if input.call_id == "child-pause" {
@@ -77,12 +92,37 @@ impl ToolLifecycleContributor for ChildToolGate {
     }
 }
 
+#[derive(Default)]
+struct ThreadIdle(Notify);
+
+impl ThreadLifecycleContributor<Config> for ForkTestLifecycle {
+    fn on_thread_idle<'a>(&'a self, input: ThreadIdleInput<'a>) -> ExtensionFuture<'a, ()> {
+        Box::pin(async move {
+            input
+                .thread_store
+                .get_or_init(ThreadIdle::default)
+                .0
+                .notify_one();
+        })
+    }
+}
+
+async fn wait_for_thread_idle(thread: &CodexThread) {
+    // TurnComplete precedes active-turn cleanup. Consume each turn's idle notification
+    // separately, and scope it to the thread so child completion cannot satisfy it.
+    let idle = thread
+        .thread_extension_data()
+        .get_or_init(ThreadIdle::default);
+    tokio::time::timeout(Duration::from_secs(10), idle.0.notified())
+        .await
+        .expect("thread should become idle");
+}
+
 async fn record_answer(
     thread: &CodexThread,
     server: &MockServer,
     call_id: &str,
     answer: &str,
-    acceptance_order: u64,
 ) -> Result<VerifiedAnswer> {
     let question = format!("May I publish {call_id}?");
     mount_sse_sequence(
@@ -141,6 +181,20 @@ async fn record_answer(
         }],
     };
     thread.ensure_rollout_materialized().await;
+    let history = thread.conversation_history_snapshot().await;
+    let acceptance_order = history
+        .retained_context()
+        .context("retained answer context")?
+        .ordered_entries()
+        .find_map(|(order, entry)| match (order, entry) {
+            (RetainedContextOrder::Local(order), RetainedContextEntry::VerifiedAnswer(answer))
+                if answer == &retained =>
+            {
+                Some(order)
+            }
+            _ => None,
+        })
+        .context("recorded answer order")?;
     let event = RolloutItem::RetainedContext(RetainedContextEvent::VerifiedAnswer {
         answer: retained.clone(),
         acceptance_order: Some(acceptance_order),
@@ -154,7 +208,7 @@ async fn load_context(test: &TestCodex, thread: &CodexThread) -> Result<Vec<Roll
     Ok(test
         .thread_store
         .load_latest_model_context(LoadThreadHistoryParams {
-            thread_id: thread.session_configured().thread_id,
+            thread_id: thread.startup_metadata().thread_id,
             include_archived: false,
         })
         .await?
@@ -162,7 +216,7 @@ async fn load_context(test: &TestCodex, thread: &CodexThread) -> Result<Vec<Roll
 }
 
 async fn resume(test: &TestCodex, thread: &CodexThread) -> Result<Arc<CodexThread>> {
-    let thread_id = thread.session_configured().thread_id;
+    let thread_id = thread.startup_metadata().thread_id;
     thread.shutdown_and_wait().await?;
     test.thread_manager.remove_thread(&thread_id).await;
     let saved = load_context(test, thread).await?;
@@ -184,13 +238,154 @@ async fn resume(test: &TestCodex, thread: &CodexThread) -> Result<Arc<CodexThrea
         .thread)
 }
 
+#[test_case("question", ModeKind::Default, ""; "server message id")]
+#[test_case("", ModeKind::Default, ""; "generated message id")]
+#[test_case("question", ModeKind::Plan, ""; "plan with server message id")]
+#[test_case("", ModeKind::Plan, ""; "plan with generated message id")]
+#[test_case("question", ModeKind::Plan, "Here is the plan:\n"; "text and plan share one order")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn streamed_question_precedes_reply_across_resume(
+    message_id: &str,
+    mode: ModeKind,
+    preamble: &str,
+) -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    const INITIAL: &str = "Prepare the deployment. Staging only.";
+    const QUESTION: &str = "Deploy abc123?";
+    const ANSWER: &str = "Yes.";
+    let (prefix, suffix) = if mode == ModeKind::Plan {
+        (format!("{preamble}<proposed_plan>\n"), "\n</proposed_plan>")
+    } else {
+        (String::new(), "")
+    };
+    let question = format!("{prefix}{QUESTION}{suffix}");
+    let (release, gate) = oneshot::channel();
+    let (server, _completions) = start_streaming_sse_server(vec![
+        vec![
+            StreamingSseChunk {
+                gate: None,
+                body: sse(vec![
+                    ev_response_created("question-response"),
+                    ev_message_item_added(message_id, ""),
+                    ev_output_text_delta(&format!("{prefix}Deploy ")),
+                    ev_output_text_delta("abc123?"),
+                    ev_output_text_delta(suffix),
+                ]),
+            },
+            StreamingSseChunk {
+                gate: Some(gate),
+                body: sse(vec![
+                    ev_assistant_message(message_id, &question),
+                    ev_completed("question-response"),
+                ]),
+            },
+        ],
+        vec![StreamingSseChunk {
+            gate: None,
+            body: sse(vec![
+                ev_assistant_message("empty-final", ""),
+                ev_completed("answer-response"),
+            ]),
+        }],
+    ])
+    .await;
+    let test = test_codex()
+        .with_model("gpt-5.4")
+        .with_history_mode(ThreadHistoryMode::Paginated)
+        .with_config(|config| {
+            config.experimental_thread_store = ThreadStoreConfig::Local;
+            config
+                .features
+                .enable(Feature::GuardianThreadContext)
+                .expect("enable retained context");
+        })
+        .build_with_streaming_server(&server)
+        .await?;
+    test.codex
+        .start_or_steer_turn(
+            TurnInputRequest::user_input(vec![UserInput::Text {
+                text: INITIAL.to_owned(),
+                text_elements: Vec::new(),
+            }])
+            .with_thread_settings(ThreadSettingsOverrides {
+                collaboration_mode: Some(CollaborationMode {
+                    mode,
+                    settings: Settings {
+                        model: test.session_configured.model.clone(),
+                        reasoning_effort: None,
+                        developer_instructions: None,
+                    },
+                }),
+                ..Default::default()
+            }),
+        )
+        .await?;
+    wait_for_event(&test.codex, |event| match event {
+        EventMsg::AgentMessageContentDelta(delta) => delta.delta.contains("abc123?"),
+        EventMsg::PlanDelta(delta) => delta.delta.contains("abc123?"),
+        _ => false,
+    })
+    .await;
+    // The reply is accepted while the question's completed item is still withheld.
+    test.codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: ANSWER.to_owned(),
+            text_elements: Vec::new(),
+        }]))
+        .await?;
+    release.send(()).expect("release question completion");
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+
+    let history = test.codex.conversation_history_snapshot().await;
+    let retained = history
+        .retained_context()
+        .context("live retained context")?;
+    assert!(!retained.has_omitted_assistant_messages());
+    assert_eq!(
+        retained
+            .ordered_entries()
+            .map(|(order, entry)| match entry {
+                RetainedContextEntry::UserMessage(message) =>
+                    (order, "user", message.text.as_str()),
+                RetainedContextEntry::AssistantMessage(message) => {
+                    (order, "assistant", message.text.as_str())
+                }
+                RetainedContextEntry::VerifiedAnswer(_) => panic!("expected plain chat messages"),
+            })
+            .collect::<Vec<_>>(),
+        vec![
+            (RetainedContextOrder::Local(0), "user", INITIAL),
+            (
+                RetainedContextOrder::Local(1),
+                "assistant",
+                question.as_str()
+            ),
+            (RetainedContextOrder::Local(2), "user", ANSWER),
+        ],
+    );
+    let resumed = resume(&test, &test.codex).await?;
+    assert_eq!(
+        resumed
+            .conversation_history_snapshot()
+            .await
+            .retained_context(),
+        Some(retained),
+    );
+    resumed.shutdown_and_wait().await?;
+    server.shutdown().await;
+    Ok(())
+}
+
 async fn compact_and_assert_answers(
     test: &TestCodex,
     thread: &CodexThread,
     expected: &[VerifiedAnswer],
 ) -> Result<RetainedContext> {
     // Inspect live state by persisting a real compaction checkpoint, not a private getter.
-    // Repeating this after resume/rollback also catches checkpoint resurrection.
+    // Repeating this after legacy rollback replay also catches checkpoint resurrection.
     thread.submit(Op::Compact).await?;
     wait_for_event(thread, |event| matches!(event, EventMsg::TurnComplete(_))).await;
     thread.flush_rollout().await?;
@@ -220,21 +415,16 @@ enum InstructionSize {
     Oversized,
 }
 
-#[test_case(ThreadHistoryMode::Legacy, true, InstructionSize::Normal; "enabled legacy rollback")]
-#[test_case(ThreadHistoryMode::Paginated, true, InstructionSize::Normal; "enabled paginated resume")]
-#[test_case(ThreadHistoryMode::Legacy, false, InstructionSize::Normal; "disabled legacy rollback")]
-#[test_case(ThreadHistoryMode::Paginated, false, InstructionSize::Normal; "disabled paginated resume")]
-#[test_case(ThreadHistoryMode::Legacy, true, InstructionSize::Oversized; "oversized instruction rollback")]
-#[test_case(ThreadHistoryMode::Paginated, true, InstructionSize::Oversized; "oversized instruction resume")]
+#[test_case(InstructionSize::Normal; "enabled paginated resume")]
+#[test_case(InstructionSize::Oversized; "oversized instruction resume")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn retained_instructions_keep_identity_across_compaction_and_resume(
-    history_mode: ThreadHistoryMode,
-    thread_context_enabled: bool,
     instruction_size: InstructionSize,
 ) -> Result<()> {
     skip_if_no_network!(Ok(()));
     const INITIAL: &str = "Never publish publicly.";
-    const STEER: &str = "Also inspect the README.";
+    const QUESTION: &str = "Should I also inspect the README?";
+    const STEER: &str = "Yes, inspect the README.";
     let initial = match instruction_size {
         InstructionSize::Normal => INITIAL.to_owned(),
         InstructionSize::Oversized => format!(
@@ -242,21 +432,12 @@ async fn retained_instructions_keep_identity_across_compaction_and_resume(
             "Project detail. ".repeat(2_000)
         ),
     };
-    // Paginated history supports checkpoint resume, but not the full-history read
-    // used by ThreadRollback. Exercise rollback on its supported legacy path.
-    let rollback_counts: &[usize] = match history_mode {
-        ThreadHistoryMode::Legacy => &[1, 0],
-        ThreadHistoryMode::Paginated => &[],
-    };
     let server = start_mock_server().await;
     let test = test_codex()
-        .with_history_mode(history_mode)
+        .with_history_mode(ThreadHistoryMode::Paginated)
         .with_config(move |config| {
             config.experimental_thread_store = ThreadStoreConfig::Local;
-            config
-                .features
-                .set_enabled(Feature::GuardianThreadContext, thread_context_enabled)
-                .expect("test context mode");
+
             // Exercise local compaction's rebuilt user messages, not an opaque checkpoint.
             config.model_provider.name = "Local compaction test provider".to_owned();
             config
@@ -277,7 +458,7 @@ async fn retained_instructions_keep_identity_across_compaction_and_resume(
     let mut responses = questions
         .iter()
         .map(|(call_id, question, _)| {
-            sse(vec![
+            let mut events = vec![
                 ev_function_call(
                     call_id,
                     "request_user_input",
@@ -291,16 +472,21 @@ async fn retained_instructions_keep_identity_across_compaction_and_resume(
                     .to_string(),
                 ),
                 ev_completed(call_id),
-            ])
+            ];
+            if *call_id == "before-steer" {
+                events.insert(
+                    /*index*/ 0,
+                    ev_assistant_message("ordinary-question", QUESTION),
+                );
+            }
+            sse(events)
         })
         .collect::<Vec<_>>();
     responses.push(sse(vec![ev_completed("done")]));
-    responses.extend((0..=rollback_counts.len()).map(|index| {
-        sse(vec![
-            ev_assistant_message(&format!("summary-{index}"), "Compacted inspection context."),
-            ev_completed(&format!("compact-{index}")),
-        ])
-    }));
+    responses.push(sse(vec![
+        ev_assistant_message("summary-0", "Compacted inspection context."),
+        ev_completed("compact-0"),
+    ]));
     let response_mock = mount_sse_sequence(&server, responses).await;
     test.codex
         .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
@@ -350,7 +536,7 @@ async fn retained_instructions_keep_identity_across_compaction_and_resume(
     })
     .await;
     // Rebuild from source events before there is a compaction checkpoint. The answer
-    // was persisted first, but the accepted steering instruction must retain order 1.
+    // was persisted first, but the accepted steering instruction must still precede it.
     let thread = resume(&test, &test.codex).await?;
     assert_eq!(answers[0].turn_id, answers[1].turn_id);
     let requests = response_mock.requests();
@@ -370,10 +556,18 @@ async fn retained_instructions_keep_identity_across_compaction_and_resume(
         }
     }
     let history = thread.conversation_history_snapshot().await;
-    let user_messages = [initial.as_str(), STEER]
+    let retained = history.retained_context().context("retained originals")?;
+    let revisions = retained
+        .ordered_entries()
+        .filter_map(|(_, entry)| retained.source(entry))
+        .map(|source| (source.id.message_id, source.revision))
+        .collect::<std::collections::HashMap<_, _>>();
+    // Shared order: initial input, ordinary question, first tool call, steer, first
+    // answer, second tool call, second answer. Recording the queued steer later must not move it.
+    let user_messages = [(0, initial.as_str()), (3, STEER)]
         .into_iter()
         .enumerate()
-        .map(|(index, text)| {
+        .map(|(index, (order, text))| {
             let message_id = history
                 .items()
                 .find(|item| {
@@ -389,8 +583,8 @@ async fn retained_instructions_keep_identity_across_compaction_and_resume(
                 .and_then(ResponseItem::id)
                 .expect("original user-message identity");
             json!({
-                "order": index, "turn_id": answers[index].turn_id,
-                "message_id": message_id.as_str(),
+                "order": order, "turn_id": answers[index].turn_id,
+                "message_id": message_id.as_str(), "revision": revisions[message_id.as_str()],
                 "text": codex_guardian_context::truncate_text(text, /*max_tokens*/ 900),
                 "complete": index != 0 || matches!(instruction_size, InstructionSize::Normal),
             })
@@ -398,93 +592,45 @@ async fn retained_instructions_keep_identity_across_compaction_and_resume(
         .collect::<Vec<_>>();
     let ordered_answers = answers
         .iter()
-        .enumerate()
-        .map(|(index, answer)| {
+        .zip([4, 6])
+        .map(|(answer, order)| {
             let mut value = json!(answer);
-            value["order"] = json!(index + 2);
+            value["order"] = json!(order);
             value
         })
         .collect::<Vec<_>>();
-    let mut expected = json!({
+    let next_order = 7_u64;
+    let expected = json!({
         "user_messages": user_messages, "user_messages_incomplete": false,
-        "verified_answers": ordered_answers, "incomplete": false, "next_order": 4,
+        "assistant_messages": [{"order": 1, "turn_id": answers[0].turn_id,
+            "message_id": "ordinary-question", "revision": revisions["ordinary-question"],
+            "text": QUESTION, "complete": true}],
+        "assistant_messages_incomplete": false,
+        "verified_answers": ordered_answers, "incomplete": false, "next_order": next_order,
     });
-    if !thread_context_enabled {
-        expected = json!({
-            "user_messages": [], "user_messages_incomplete": true,
-            "verified_answers": [], "incomplete": false, "next_order": 0,
-        });
-        answers.clear();
-        for item in load_context(&test, &thread).await? {
-            assert!(!matches!(item, RolloutItem::RetainedContext(_)));
-            if let RolloutItem::ResponseItem(envelope) = item {
-                assert!(
-                    envelope
-                        .metadata
-                        .as_ref()
-                        .is_none_or(|metadata| metadata.user_input_order.is_none())
-                );
-            }
-        }
-    }
     assert_eq!(
         serde_json::to_value(history.retained_context())?,
-        if thread_context_enabled {
-            expected.clone()
-        } else {
-            serde_json::Value::Null
-        }
+        expected.clone()
     );
     assert_eq!(
         serde_json::to_value(compact_and_assert_answers(&test, &thread, &answers).await?)?,
         expected
     );
     let compacted = thread.conversation_history_snapshot().await;
+    assert!(!compacted.items().any(|item| {
+        item.id()
+            .is_some_and(|id| id.as_str() == "ordinary-question")
+    }));
     for message in &user_messages {
         assert_eq!(
             compacted
                 .items()
                 .any(|item| item.id().map(ResponseItemId::as_str) == message["message_id"].as_str()),
-            thread_context_enabled,
-            "only thread-owned context preserves original user-message identity"
+            true,
+            "compaction preserves original user-message identity"
         );
     }
-    let mut thread = thread;
-    for &remaining in rollback_counts {
-        let remaining = if thread_context_enabled { remaining } else { 0 };
-        thread = resume(&test, &thread).await?;
-        assert_eq!(
-            serde_json::to_value(
-                thread
-                    .conversation_history_snapshot()
-                    .await
-                    .retained_context()
-            )?,
-            if thread_context_enabled {
-                expected.clone()
-            } else {
-                serde_json::Value::Null
-            }
-        );
-        thread.submit(Op::ThreadRollback { num_turns: 1 }).await?;
-        wait_for_event(&thread, |event| {
-            matches!(event, EventMsg::ThreadRolledBack(_))
-        })
-        .await;
-        expected["user_messages"]
-            .as_array_mut()
-            .expect("expected retained user messages")
-            .truncate(remaining);
-        expected["verified_answers"]
-            .as_array_mut()
-            .expect("expected retained verified answers")
-            .clear();
-        assert_eq!(
-            serde_json::to_value(compact_and_assert_answers(&test, &thread, &[]).await?)?,
-            expected
-        );
-    }
-    thread = resume(&test, &thread).await?;
+    let thread = resume(&test, &thread).await?;
     assert_eq!(
         serde_json::to_value(
             thread
@@ -492,25 +638,12 @@ async fn retained_instructions_keep_identity_across_compaction_and_resume(
                 .await
                 .retained_context()
         )?,
-        if thread_context_enabled {
-            expected.clone()
-        } else {
-            serde_json::Value::Null
-        }
+        expected.clone()
     );
     thread.shutdown_and_wait().await?;
     let requests = response_mock.requests();
-    assert_eq!(requests.len(), 4 + rollback_counts.len());
+    assert_eq!(requests.len(), 4);
     assert!(requests[3].has_message_with_input_texts("user", |texts| texts == [STEER]));
-    if history_mode == ThreadHistoryMode::Legacy {
-        assert!(
-            requests[4].has_message_with_input_texts("user", |texts| texts == [initial.as_str()])
-        );
-        assert!(!requests[4].has_message_with_input_texts("user", |texts| texts == [STEER]));
-        assert!(
-            !requests[5].has_message_with_input_texts("user", |texts| texts == [initial.as_str()])
-        );
-    }
     Ok(())
 }
 
@@ -538,10 +671,7 @@ async fn legacy_checkpoint_recovers_root_excerpt_before_discarding_backup(
         .with_history_mode(history_mode)
         .with_config(|config| {
             config.experimental_thread_store = ThreadStoreConfig::Local;
-            config
-                .features
-                .enable(Feature::GuardianThreadContext)
-                .expect("enable retained instructions");
+
             config
                 .features
                 .disable(Feature::TokenBudget)
@@ -616,7 +746,7 @@ async fn legacy_checkpoint_recovers_root_excerpt_before_discarding_backup(
                 text: "Never publish publicly.".to_owned(),
             }];
             window.push(shortened.into());
-            checkpoint.guardian_history = Some(GuardianHistoryCheckpoint(vec![source]));
+            checkpoint.guardian_history = Some(GuardianHistoryCheckpoint(vec![source.into()]));
         }
         LegacyInstructionSource::ModelWindow => window.push(source.into()),
         LegacyInstructionSource::Missing => expected = legacy,
@@ -649,253 +779,6 @@ async fn legacy_checkpoint_recovers_root_excerpt_before_discarding_backup(
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn disabled_capture_stays_incomplete_after_compaction_and_enabled_resume() -> Result<()> {
-    skip_if_no_network!(Ok(()));
-    let server = start_mock_server().await;
-    let test = test_codex()
-        .with_config(|config| {
-            config.experimental_thread_store = ThreadStoreConfig::Local;
-            config
-                .features
-                .disable(Feature::GuardianThreadContext)
-                .expect("disable instruction capture");
-            config
-                .features
-                .disable(Feature::TokenBudget)
-                .expect("use local compaction");
-            config.model_provider.name = "Local compaction test provider".to_owned();
-        })
-        .build_with_auto_env(&server)
-        .await?;
-    mount_sse_sequence(
-        &server,
-        vec![
-            sse(vec![ev_completed("initial-turn")]),
-            sse(vec![
-                ev_assistant_message("summary", "Compacted context."),
-                ev_completed("compact"),
-            ]),
-            sse(vec![
-                ev_assistant_message("summary-again", "Compacted context."),
-                ev_completed("compact-again"),
-            ]),
-        ],
-    )
-    .await;
-    test.codex
-        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
-            text: "Never publish publicly.".to_owned(),
-            text_elements: Vec::new(),
-        }]))
-        .await?;
-    wait_for_event(&test.codex, |event| {
-        matches!(event, EventMsg::TurnComplete(_))
-    })
-    .await;
-
-    let checkpoint = compact_and_assert_answers(&test, &test.codex, &[]).await?;
-    assert!(!checkpoint.user_messages_complete());
-    assert_eq!(checkpoint.ordered_entries().count(), 0);
-
-    let thread_id = test.codex.session_configured().thread_id;
-    test.codex.shutdown_and_wait().await?;
-    test.thread_manager.remove_thread(&thread_id).await;
-    let items: Vec<RolloutItem> = serde_json::from_value(serde_json::to_value(
-        load_context(&test, &test.codex).await?,
-    )?)?;
-    let mut config = test.config.clone();
-    config
-        .features
-        .enable(Feature::GuardianThreadContext)
-        .expect("enable instruction capture on resume");
-    let resumed = test
-        .thread_manager
-        .resume_thread_with_history(
-            config,
-            InitialHistory::Resumed(ResumedHistory {
-                conversation_id: thread_id,
-                history: Arc::new(items),
-                rollout_path: None,
-            }),
-            test.thread_manager.auth_manager(),
-            /*parent_trace*/ None,
-            ClientMcpExtensions::default(),
-        )
-        .await?
-        .thread;
-    assert!(
-        !resumed
-            .conversation_history_snapshot()
-            .await
-            .retained_context()
-            .expect("resumed retained context")
-            .user_messages_complete()
-    );
-    assert!(
-        !compact_and_assert_answers(&test, &resumed, &[])
-            .await?
-            .user_messages_complete()
-    );
-    resumed.shutdown_and_wait().await?;
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn retained_answers_rollback_only_the_steered_instruction() -> Result<()> {
-    skip_if_no_network!(Ok(()));
-    let server = start_mock_server().await;
-    let test = test_codex()
-        .with_history_mode(ThreadHistoryMode::Legacy)
-        .with_config(|config| {
-            config.experimental_thread_store = ThreadStoreConfig::Local;
-            // Legacy saved answers use their source calls, not acceptance-order metadata.
-            config
-                .features
-                .disable(Feature::GuardianThreadContext)
-                .expect("legacy evidence fixture");
-            for feature in [Feature::TokenBudget, Feature::DefaultModeRequestUserInput] {
-                config
-                    .features
-                    .enable(feature)
-                    .expect("enable test feature");
-            }
-        })
-        .build_with_auto_env(&server)
-        .await?;
-    let questions = [
-        ("before-steer", "Publish?", "Only privately."),
-        ("after-steer", "Publish the README?", "Do not publish it."),
-    ];
-    let mut responses = questions
-        .iter()
-        .map(|(call_id, question, _)| {
-            sse(vec![
-                ev_function_call(
-                    call_id,
-                    "request_user_input",
-                    &json!({"questions": [{
-                        "id": "publish", "header": "Publish", "question": question,
-                        "options": [
-                            {"label": "Yes", "description": "Publish privately."},
-                            {"label": "No", "description": "Keep local."}
-                        ]
-                    }]})
-                    .to_string(),
-                ),
-                ev_completed(call_id),
-            ])
-        })
-        .collect::<Vec<_>>();
-    responses.push(sse(vec![ev_completed("done")]));
-    let response_mock = mount_sse_sequence(&server, responses).await;
-    test.codex
-        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
-            text: "Check whether to publish.".to_owned(),
-            text_elements: Vec::new(),
-        }]))
-        .await?;
-    let mut answers = Vec::new();
-    for (call_id, question, answer) in questions {
-        let request = wait_for_event_match(&test.codex, |event| match event {
-            EventMsg::RequestUserInput(request) => Some(request.clone()),
-            _ => None,
-        })
-        .await;
-        if answers.is_empty() {
-            test.codex
-                .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
-                    text: "Also inspect the README.".to_owned(),
-                    text_elements: Vec::new(),
-                }]))
-                .await?;
-        }
-        test.codex
-            .submit(Op::UserInputAnswer {
-                id: request.turn_id.clone(),
-                response: RequestUserInputResponse {
-                    answers: HashMap::from([(
-                        "publish".to_owned(),
-                        RequestUserInputAnswer {
-                            answers: vec![answer.to_owned()],
-                        },
-                    )]),
-                },
-            })
-            .await?;
-        answers.push(VerifiedAnswer {
-            turn_id: request.turn_id,
-            call_id: call_id.to_owned(),
-            questions: vec![VerifiedQuestionAnswer {
-                question: question.to_owned(),
-                answer: answer.to_owned(),
-            }],
-        });
-    }
-    wait_for_event(&test.codex, |event| {
-        matches!(event, EventMsg::TurnComplete(_))
-    })
-    .await;
-    assert_eq!(answers[0].turn_id, answers[1].turn_id);
-    let requests = response_mock.requests();
-    assert_eq!(requests.len(), 3);
-    assert!(
-        requests[0].has_message_with_input_texts("user", |texts| {
-            texts == ["Check whether to publish."]
-        })
-    );
-    for (index, request) in requests.iter().skip(1).enumerate() {
-        assert!(request.has_message_with_input_texts("user", |texts| {
-            texts == ["Also inspect the README."]
-        }));
-        for answer in &answers[..=index] {
-            let (output, _) = request
-                .function_call_output_content_and_success(&answer.call_id)
-                .context("answer tool output")?;
-            let output: serde_json::Value =
-                serde_json::from_str(&output.context("answer tool output content")?)?;
-            assert_eq!(
-                output,
-                json!({"answers": {"publish": {"answers": [answer.questions[0].answer]}}})
-            );
-        }
-    }
-    test.codex
-        .append_rollout_items(
-            &answers
-                .iter()
-                .cloned()
-                .map(|answer| {
-                    RolloutItem::RetainedContext(RetainedContextEvent::VerifiedAnswer {
-                        answer,
-                        acceptance_order: None,
-                    })
-                })
-                .collect::<Vec<_>>(),
-        )
-        .await?;
-    let mut thread = resume(&test, &test.codex).await?;
-    compact_and_assert_answers(&test, &thread, &answers).await?;
-    for expected in [&answers[..1], &[]] {
-        thread.submit(Op::ThreadRollback { num_turns: 1 }).await?;
-        wait_for_event(&thread, |event| {
-            matches!(event, EventMsg::ThreadRolledBack(_))
-        })
-        .await;
-        compact_and_assert_answers(&test, &thread, expected).await?;
-        thread = resume(&test, &thread).await?;
-        compact_and_assert_answers(&test, &thread, expected).await?;
-    }
-    thread.shutdown_and_wait().await?;
-    Ok(())
-}
-
-#[derive(Clone, Copy)]
-enum LifecycleBoundary {
-    Rollback,
-    ChildFork,
-}
-
 // Cover live copied history and a truncated referenced checkpoint. Parent-answer
 // omission is already exercised by retained_answers_cross_real_session_boundaries.
 #[test_case(ThreadHistoryMode::Legacy; "copied worker history")]
@@ -918,7 +801,6 @@ async fn standalone_fork_retains_inherited_user_instructions(
             config.model_provider.name = "Local compaction test provider".to_owned();
             for feature in [
                 Feature::GuardianApproval,
-                Feature::GuardianThreadContext,
                 Feature::Collab,
                 Feature::MultiAgentV2,
                 Feature::DefaultModeRequestUserInput,
@@ -1025,34 +907,26 @@ async fn standalone_fork_retains_inherited_user_instructions(
         let prepared = test
             .thread_store
             .prepare_fork(PrepareForkParams {
-                thread_id: worker.session_configured().thread_id,
+                thread_id: worker.startup_metadata().thread_id,
                 boundary: ForkBoundary::Latest,
             })
             .await?;
         test.thread_manager
             .fork_prepared_thread(
-                test.config.clone(),
+                codex_core::StartThreadOptions::new(test.config.clone()),
                 prepared,
-                /*thread_source*/ None,
-                /*parent_trace*/ None,
-                ClientMcpExtensions::default(),
-                /*reserved_thread_id*/ None,
             )
             .await?
     } else {
         test.thread_manager
             .fork_thread_from_history(
                 ForkSnapshot::Interrupted,
-                test.config.clone(),
+                codex_core::StartThreadOptions::new(test.config.clone()),
                 InitialHistory::Resumed(ResumedHistory {
-                    conversation_id: worker.session_configured().thread_id,
+                    conversation_id: worker.startup_metadata().thread_id,
                     history: Arc::new(load_context(&test, &worker).await?),
                     rollout_path: None,
                 }),
-                /*thread_source*/ None,
-                /*parent_trace*/ None,
-                ClientMcpExtensions::default(),
-                /*reserved_thread_id*/ None,
             )
             .await?
     };
@@ -1070,9 +944,10 @@ async fn standalone_fork_retains_inherited_user_instructions(
     assert_eq!(
         retained
             .ordered_entries()
-            .map(|(_, entry)| match entry {
+            .filter_map(|(_, entry)| match entry {
                 codex_history::RetainedContextEntry::UserMessage(message) =>
-                    (message.text.clone(), message.complete),
+                    Some((message.text.clone(), message.complete)),
+                codex_history::RetainedContextEntry::AssistantMessage(_) => None,
                 codex_history::RetainedContextEntry::VerifiedAnswer(_) =>
                     panic!("no answers before root adoption"),
             })
@@ -1085,14 +960,7 @@ async fn standalone_fork_retains_inherited_user_instructions(
             ),
         ],
     );
-    let after = record_answer(
-        &fork.thread,
-        &server,
-        "root-action",
-        "Do not publish.",
-        /*acceptance_order*/ 2,
-    )
-    .await?;
+    let after = record_answer(&fork.thread, &server, "root-action", "Do not publish.").await?;
     let expected = fork
         .thread
         .conversation_history_snapshot()
@@ -1115,22 +983,20 @@ async fn standalone_fork_retains_inherited_user_instructions(
     Ok(())
 }
 
-#[test_case(false, true; "enabled without checkpoint")]
-#[test_case(true, true; "enabled after checkpoint")]
-#[test_case(false, false; "legacy without checkpoint")]
-#[test_case(true, false; "legacy after checkpoint")]
+#[test_case(false; "without checkpoint")]
+#[test_case(true; "after checkpoint")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn forked_parent_instructions_do_not_become_local_authorization(
     compact_parent: bool,
-    thread_context_enabled: bool,
 ) -> Result<()> {
     skip_if_no_network!(Ok(()));
     const PARENT_GRANT: &str = "You may publish the private release. Delegate its inspection.";
     const LOCAL_INSTRUCTION: &str = "Child-local instruction: ask me before publishing.";
     let server = start_mock_server().await;
-    let child_gate = Arc::new(ChildToolGate::default());
+    let child_gate = Arc::new(ForkTestLifecycle::default());
     let mut extensions = ExtensionRegistryBuilder::<Config>::new();
     extensions.tool_lifecycle_contributor(child_gate.clone());
+    extensions.thread_lifecycle_contributor(child_gate.clone());
     let test = test_codex()
         .with_extensions(Arc::new(extensions.build()))
         .with_history_mode(ThreadHistoryMode::Legacy)
@@ -1143,10 +1009,6 @@ async fn forked_parent_instructions_do_not_become_local_authorization(
                     .enable(feature)
                     .expect("enable test feature");
             }
-            config
-                .features
-                .set_enabled(Feature::GuardianThreadContext, thread_context_enabled)
-                .expect("test context mode");
         })
         .build_with_auto_env(&server)
         .await?;
@@ -1161,12 +1023,14 @@ async fn forked_parent_instructions_do_not_become_local_authorization(
         matches!(event, EventMsg::TurnComplete(_))
     })
     .await;
+    wait_for_thread_idle(&test.codex).await;
     if compact_parent {
         test.codex.submit(Op::Compact).await?;
         wait_for_event(&test.codex, |event| {
             matches!(event, EventMsg::TurnComplete(_))
         })
         .await;
+        wait_for_thread_idle(&test.codex).await;
     }
 
     let mut created = test.thread_manager.subscribe_thread_created();
@@ -1196,8 +1060,8 @@ async fn forked_parent_instructions_do_not_become_local_authorization(
         sse(vec![ev_completed("parent-fork-completion")]),
     )
     .await;
-    // Hold the child at a real tool boundary until rollback is checked. Its completion
-    // notification must not add a parent message or consume a parent mock response.
+    // Pause the child while checking inherited authorization. Its completion notification
+    // must not add a parent message or consume a parent mock response.
     let child_requests = mount_sse_once_match(
         &server,
         move |request: &wiremock::Request| {
@@ -1233,7 +1097,7 @@ async fn forked_parent_instructions_do_not_become_local_authorization(
     tokio::time::timeout(Duration::from_secs(30), child_gate.entered.notified())
         .await
         .context("child did not reach the paused tool call")?;
-    let child_id = child.session_configured().thread_id.to_string();
+    let child_id = child.startup_metadata().thread_id.to_string();
     let requests = child_requests.requests();
     let child_request = requests
         .iter()
@@ -1246,40 +1110,32 @@ async fn forked_parent_instructions_do_not_become_local_authorization(
             context.ordered_entries().count(),
             context.user_messages_complete()
         )),
-        thread_context_enabled.then_some((0, true)),
+        Some((0, true)),
         "inherited conversation must not populate child-local authorization",
     );
-    let root_before = child.guardian_root_snapshot().await.context("live root")?;
+    let root_snapshot = child.guardian_root_snapshot().await.context("live root")?;
     assert!(
-        root_before
+        root_snapshot
             .messages
             .contains(&codex_core::GuardianRootMessage::User(
                 PARENT_GRANT.to_owned()
             ))
     );
 
+    let goal = "Inspect only; do not publish.";
     test.codex
-        .submit(Op::ThreadRollback { num_turns: 1 })
+        .record_user_goal_update(codex_core::context::UserGoalUpdate::Set {
+            objective: Some(goal.to_owned()),
+            status: None,
+        })
         .await?;
-    wait_for_event(&test.codex, |event| {
-        matches!(event, EventMsg::ThreadRolledBack(_))
-    })
-    .await;
-    let root_after = child
+    let snapshot = child
         .guardian_root_snapshot()
         .await
-        .context("live root after rollback")?;
-    assert_ne!(
-        root_before.authorization_version,
-        root_after.authorization_version
-    );
-    assert!(
-        !root_after
-            .messages
-            .contains(&codex_core::GuardianRootMessage::User(
-                PARENT_GRANT.to_owned()
-            ))
-    );
+        .context("root after goal")?;
+    assert!(snapshot.messages.iter().any(|message| {
+        matches!(message, codex_core::GuardianRootMessage::User(text) if text.contains(goal))
+    }));
 
     mount_sse_once_match(
         &server,
@@ -1307,13 +1163,15 @@ async fn forked_parent_instructions_do_not_become_local_authorization(
     assert_eq!(
         expected.as_ref().map(|context| context
             .ordered_entries()
-            .map(|(_, entry)| match entry {
-                codex_history::RetainedContextEntry::UserMessage(message) => message.text.as_str(),
+            .filter_map(|(_, entry)| match entry {
+                codex_history::RetainedContextEntry::UserMessage(message) =>
+                    Some(message.text.as_str()),
+                codex_history::RetainedContextEntry::AssistantMessage(_) => None,
                 codex_history::RetainedContextEntry::VerifiedAnswer(_) =>
                     panic!("unexpected answer"),
             })
             .collect::<Vec<_>>()),
-        thread_context_enabled.then_some(vec![LOCAL_INSTRUCTION]),
+        Some(vec![LOCAL_INSTRUCTION]),
         "genuine child-local instructions must still be captured",
     );
     let child = resume(&test, &child).await?;
@@ -1339,13 +1197,11 @@ async fn forked_parent_instructions_do_not_become_local_authorization(
     Ok(())
 }
 
-#[test_case(ThreadHistoryMode::Legacy, LifecycleBoundary::Rollback; "legacy rollback")]
-#[test_case(ThreadHistoryMode::Legacy, LifecycleBoundary::ChildFork; "legacy child fork")]
-#[test_case(ThreadHistoryMode::Paginated, LifecycleBoundary::ChildFork; "paginated child fork")]
+#[test_case(ThreadHistoryMode::Legacy; "legacy child fork")]
+#[test_case(ThreadHistoryMode::Paginated; "paginated child fork")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn retained_answers_cross_real_session_boundaries(
     history_mode: ThreadHistoryMode,
-    boundary: LifecycleBoundary,
 ) -> Result<()> {
     skip_if_no_network!(Ok(()));
     let server = start_mock_server().await;
@@ -1358,7 +1214,6 @@ async fn retained_answers_cross_real_session_boundaries(
                 Feature::DefaultModeRequestUserInput,
                 Feature::Collab,
                 Feature::MultiAgentV2,
-                Feature::GuardianThreadContext,
             ] {
                 config
                     .features
@@ -1373,7 +1228,6 @@ async fn retained_answers_cross_real_session_boundaries(
         &server,
         "before-compact",
         "Only publish privately.",
-        /*acceptance_order*/ 1,
     )
     .await?;
     let thread = resume(&test, &test.codex).await?;
@@ -1384,7 +1238,6 @@ async fn retained_answers_cross_real_session_boundaries(
         &server,
         "after-compact",
         "Do not publish after all.",
-        /*acceptance_order*/ 3,
     )
     .await?;
     thread.flush_rollout().await?;
@@ -1419,76 +1272,57 @@ async fn retained_answers_cross_real_session_boundaries(
         events,
         vec![RetainedContextEvent::VerifiedAnswer {
             answer: after.clone(),
-            acceptance_order: Some(3)
+            acceptance_order: Some(5)
         }]
     );
     let thread = resume(&test, &thread).await?;
     let expected = [before.clone(), after];
 
-    match boundary {
-        LifecycleBoundary::Rollback => {
-            // First remove the suffix answer, then the source retained only in the checkpoint.
-            let mut thread = thread;
-            for expected in [std::slice::from_ref(&before), &[]] {
-                thread.submit(Op::ThreadRollback { num_turns: 1 }).await?;
-                wait_for_event(&thread, |event| {
-                    matches!(event, EventMsg::ThreadRolledBack(_))
-                })
-                .await;
-                compact_and_assert_answers(&test, &thread, expected).await?;
-                thread = resume(&test, &thread).await?;
-                compact_and_assert_answers(&test, &thread, expected).await?;
-            }
-            thread.shutdown_and_wait().await?;
-        }
-        LifecycleBoundary::ChildFork => {
-            // Full-history delegation must not turn parent-local answers into child-local facts.
-            let mut created = test.thread_manager.subscribe_thread_created();
-            let arguments = json!({
-                "task_name": "worker",
-                "message": "Inspect without publishing.",
-                "fork_turns": "all",
-            });
-            mount_sse_sequence(
-                &server,
-                vec![
-                    sse(vec![
-                        ev_function_call_with_namespace(
-                            "spawn",
-                            "collaboration",
-                            "spawn_agent",
-                            &arguments.to_string(),
-                        ),
-                        ev_completed("spawn-response"),
-                    ]),
-                    sse(vec![ev_completed("first-fork-completion")]),
-                    sse(vec![ev_completed("second-fork-completion")]),
-                ],
-            )
-            .await;
-            thread
-                .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
-                    text: "Delegate an inspection.".to_owned(),
-                    text_elements: Vec::new(),
-                }]))
-                .await?;
-            wait_for_event(&thread, |event| matches!(event, EventMsg::TurnComplete(_))).await;
-            let child = test.thread_manager.get_thread(created.try_recv()?).await?;
-            wait_for_event(&child, |event| matches!(event, EventMsg::TurnComplete(_))).await;
-            child.flush_rollout().await?;
-            let child_history = load_context(&test, &child).await?;
-            assert!(
-                serde_json::to_string(&child_history)?.contains("Delegate an inspection."),
-                "the child must actually inherit parent conversation context"
-            );
-            compact_and_assert_answers(&test, &child, &[]).await?;
-            let child = resume(&test, &child).await?;
-            compact_and_assert_answers(&test, &child, &[]).await?;
-            child.shutdown_and_wait().await?;
-            compact_and_assert_answers(&test, &thread, &expected).await?;
+    // Full-history delegation must not turn parent-local answers into child-local facts.
+    let mut created = test.thread_manager.subscribe_thread_created();
+    let arguments = json!({
+        "task_name": "worker",
+        "message": "Inspect without publishing.",
+        "fork_turns": "all",
+    });
+    mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_function_call_with_namespace(
+                    "spawn",
+                    "collaboration",
+                    "spawn_agent",
+                    &arguments.to_string(),
+                ),
+                ev_completed("spawn-response"),
+            ]),
+            sse(vec![ev_completed("first-fork-completion")]),
+            sse(vec![ev_completed("second-fork-completion")]),
+        ],
+    )
+    .await;
+    thread
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "Delegate an inspection.".to_owned(),
+            text_elements: Vec::new(),
+        }]))
+        .await?;
+    wait_for_event(&thread, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+    let child = test.thread_manager.get_thread(created.try_recv()?).await?;
+    wait_for_event(&child, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+    child.flush_rollout().await?;
+    let child_history = load_context(&test, &child).await?;
+    assert!(
+        serde_json::to_string(&child_history)?.contains("Delegate an inspection."),
+        "the child must actually inherit parent conversation context"
+    );
+    compact_and_assert_answers(&test, &child, &[]).await?;
+    let child = resume(&test, &child).await?;
+    compact_and_assert_answers(&test, &child, &[]).await?;
+    child.shutdown_and_wait().await?;
+    compact_and_assert_answers(&test, &thread, &expected).await?;
 
-            thread.shutdown_and_wait().await?;
-        }
-    }
+    thread.shutdown_and_wait().await?;
     Ok(())
 }

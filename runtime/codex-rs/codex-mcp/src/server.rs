@@ -8,6 +8,7 @@ use codex_api::SharedAuthProvider;
 use codex_config::AppToolApproval;
 use codex_config::McpServerAuth;
 use codex_config::McpServerConfig;
+use codex_config::McpServerOAuthConfig;
 use codex_config::McpServerTransportConfig;
 use codex_config::types::AuthKeyringBackendKind;
 use codex_config::types::OAuthCredentialsStoreMode;
@@ -22,24 +23,59 @@ use codex_utils_path_uri::PathUri;
 use rmcp::model::ElicitationCapability;
 use tracing::warn;
 
+/// Authority to resolve environment-variable credentials, retained independently of
+/// executor capabilities so a reconnect cannot promote guest configuration to host access.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum McpCredentialPolicy {
+    /// Host-configured servers retain local and legacy remote credential resolution.
+    HostFallbackAllowed,
+    /// Executor-discovered names must never be looked up in the host environment.
+    ExecutorOnly,
+}
+
 /// MCP server after runtime additions have been applied.
 #[derive(Debug, Clone)]
 pub struct EffectiveMcpServer {
     config: McpServerConfig,
+    credential_policy: McpCredentialPolicy,
     agent_plugin: bool,
+    requires_read_only_mcp_tools: bool,
 }
 
 impl EffectiveMcpServer {
-    pub fn configured(config: McpServerConfig) -> Self {
+    /// Constructs an effective server from host-owned configuration.
+    pub fn from_host_config(config: McpServerConfig) -> Self {
+        Self::from_config_with_policy(config, McpCredentialPolicy::HostFallbackAllowed)
+    }
+
+    pub(crate) fn from_config_with_policy(
+        config: McpServerConfig,
+        credential_policy: McpCredentialPolicy,
+    ) -> Self {
         Self {
             config,
+            credential_policy,
             agent_plugin: false,
+            requires_read_only_mcp_tools: false,
         }
+    }
+
+    pub(crate) fn credential_policy(&self) -> McpCredentialPolicy {
+        self.credential_policy
     }
 
     pub fn with_agent_plugin(mut self, agent_plugin: bool) -> Self {
         self.agent_plugin = agent_plugin;
         self
+    }
+
+    pub(crate) fn with_read_only_mcp_tools(mut self, requires_read_only_mcp_tools: bool) -> Self {
+        self.requires_read_only_mcp_tools = requires_read_only_mcp_tools;
+        self
+    }
+
+    pub(crate) fn requires_read_only_mcp_tools(&self) -> bool {
+        self.requires_read_only_mcp_tools
     }
 
     pub fn config(&self) -> &McpServerConfig {
@@ -96,11 +132,13 @@ pub(crate) fn has_explicit_http_authorization(config: &McpServerConfig) -> bool 
 #[derive(Clone)]
 pub(crate) struct McpServerConnectionIdentity {
     auth: McpServerAuth,
+    pub(crate) credential_policy: McpCredentialPolicy,
     transport: McpServerTransportConfig,
     environment_id: String,
     host_plugin_root: Option<PathUri>,
     oauth_store: Option<(OAuthCredentialsStoreMode, AuthKeyringBackendKind)>,
     oauth_refresh_mode: Option<McpOAuthRefreshMode>,
+    oauth_config: Option<McpServerOAuthConfig>,
     oauth_credentials: Result<Option<StoredOAuthCredentialSnapshot>, String>,
     pub(crate) oauth_store_was_contended: bool,
     resolved_environment: Result<Option<Arc<Environment>>, String>,
@@ -112,6 +150,7 @@ pub(crate) struct McpServerConnectionIdentity {
     client_elicitation_capability: ElicitationCapability,
     client_mcp_extensions: ClientMcpExtensions,
     agent_plugin: bool,
+    requires_read_only_mcp_tools: bool,
 }
 
 impl McpServerConnectionIdentity {
@@ -139,6 +178,7 @@ impl McpServerConnectionIdentity {
                 .all(|byte| byte == b'\t' || (byte >= b' ' && byte != 0x7f))
         };
         let stored_oauth_url = if runtime_auth_provider.is_none()
+            && !matches!(config.auth, McpServerAuth::EmaAuth)
             && (!matches!(config.auth, McpServerAuth::ChatGpt) || config.is_local_environment())
         {
             match &config.transport {
@@ -153,12 +193,13 @@ impl McpServerConnectionIdentity {
                         name.eq_ignore_ascii_case("authorization") && valid_http_header_value(value)
                     })
                 }) && !env_http_headers.as_ref().is_some_and(|headers| {
-                    headers.iter().any(|(name, env_var)| {
-                        name.eq_ignore_ascii_case("authorization")
-                            && std::env::var(env_var).is_ok_and(|value| {
-                                !value.trim().is_empty() && valid_http_header_value(&value)
-                            })
-                    })
+                    server.credential_policy() == McpCredentialPolicy::HostFallbackAllowed
+                        && headers.iter().any(|(name, env_var)| {
+                            name.eq_ignore_ascii_case("authorization")
+                                && std::env::var(env_var).is_ok_and(|value| {
+                                    !value.trim().is_empty() && valid_http_header_value(&value)
+                                })
+                        })
                 }) =>
                 {
                     Some(url)
@@ -203,7 +244,10 @@ impl McpServerConnectionIdentity {
                     }
             ))
         .then(|| runtime_context.local_process_cwd());
-        let referenced_environment_variables = referenced_environment_variables(config);
+        let referenced_environment_variables = match server.credential_policy() {
+            McpCredentialPolicy::HostFallbackAllowed => referenced_environment_variables(config),
+            McpCredentialPolicy::ExecutorOnly => Vec::new(),
+        };
         let runtime_auth = runtime_auth_provider.and(auth).cloned();
         let runtime_auth_token = runtime_auth.as_ref().and_then(|auth| auth.get_token().ok());
         let oauth_store_was_contended = oauth_credentials
@@ -214,6 +258,7 @@ impl McpServerConnectionIdentity {
 
         Self {
             auth: config.auth.clone(),
+            credential_policy: server.credential_policy(),
             transport: config.transport.clone(),
             environment_id: config.environment_id.clone(),
             host_plugin_root: host_plugin_root.cloned(),
@@ -221,6 +266,7 @@ impl McpServerConnectionIdentity {
                 .is_some()
                 .then_some((store_mode, keyring_backend_kind)),
             oauth_refresh_mode: stored_oauth_url.is_some().then_some(oauth_refresh_mode),
+            oauth_config: stored_oauth_url.and(config.oauth.clone()),
             oauth_credentials,
             oauth_store_was_contended,
             resolved_environment: resolved_environment.clone(),
@@ -232,6 +278,7 @@ impl McpServerConnectionIdentity {
             client_elicitation_capability,
             client_mcp_extensions,
             agent_plugin: server.is_agent_plugin(),
+            requires_read_only_mcp_tools: server.requires_read_only_mcp_tools(),
         }
     }
 
@@ -250,11 +297,17 @@ impl McpServerConnectionIdentity {
             (Some(_), None) | (None, Some(_)) => false,
         };
         self.auth == other.auth
+            && self.credential_policy == other.credential_policy
             && self.transport == other.transport
             && self.environment_id == other.environment_id
             && self.host_plugin_root == other.host_plugin_root
             && self.oauth_store == other.oauth_store
             && self.oauth_refresh_mode == other.oauth_refresh_mode
+            // Callback settings only affect a future login, not the live connection.
+            && self.oauth_config.as_ref().and_then(|oauth| oauth.client_id.as_ref())
+                == other.oauth_config.as_ref().and_then(|oauth| oauth.client_id.as_ref())
+            && self.oauth_config.as_ref().and_then(|oauth| oauth.client_secret.as_ref())
+                == other.oauth_config.as_ref().and_then(|oauth| oauth.client_secret.as_ref())
             && same_resolved_environment(&self.resolved_environment, &other.resolved_environment)
             && self.local_stdio_fallback_cwd == other.local_stdio_fallback_cwd
             && self.referenced_environment_variables == other.referenced_environment_variables
@@ -264,6 +317,7 @@ impl McpServerConnectionIdentity {
             && self.client_elicitation_capability == other.client_elicitation_capability
             && self.client_mcp_extensions == other.client_mcp_extensions
             && self.agent_plugin == other.agent_plugin
+            && self.requires_read_only_mcp_tools == other.requires_read_only_mcp_tools
     }
 
     pub(crate) fn oauth_credentials(&self) -> Result<Option<&StoredOAuthTokens>, &String> {

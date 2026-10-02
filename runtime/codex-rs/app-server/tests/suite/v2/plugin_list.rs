@@ -395,72 +395,6 @@ enabled = true
 }
 
 #[tokio::test]
-async fn plugin_installed_hides_bundled_sites_when_remote_sites_is_effective() -> Result<()> {
-    let codex_home = TempDir::new()?;
-    let server = MockServer::start().await;
-    write_curated_marketplace(
-        codex_home.path(),
-        "bundled_marketplace.json",
-        "openai-bundled",
-        Some("OpenAI Bundled"),
-        &["sites"],
-    )?;
-    write_installed_plugin(&codex_home, "openai-bundled", "sites")?;
-    write_installed_plugin(&codex_home, "openai-curated-remote", "sites")?;
-    std::fs::write(
-        codex_home.path().join("config.toml"),
-        format!(
-            r#"chatgpt_base_url = "{}/backend-api/"
-
-[features]
-plugins = true
-plugin_sharing = false
-
-[plugins."sites@openai-bundled"]
-enabled = false
-"#,
-            server.uri()
-        ),
-    )?;
-    write_remote_plugin_test_auth(codex_home.path())?;
-
-    let mut remote_sites: serde_json::Value = serde_json::from_str(&remote_installed_plugin_body(
-        "", "1.2.3", /*enabled*/ false,
-    ))?;
-    remote_sites["plugins"][0]["id"] =
-        serde_json::json!("plugins~plugin_connector_1p_689987207de08191979cf68eca2941c6");
-    remote_sites["plugins"][0]["name"] = serde_json::json!("sites");
-    remote_sites["plugins"][0]["release"]["display_name"] = serde_json::json!("Sites");
-    mount_remote_installed_plugins(&server, "GLOBAL", &serde_json::to_string(&remote_sites)?).await;
-    mount_remote_installed_plugins(&server, "WORKSPACE", empty_remote_installed_plugins_body())
-        .await;
-    mount_empty_user_installed_plugins(&server).await;
-    let mut app_server = TestAppServer::builder()
-        .with_codex_home(codex_home.path())
-        .build_initialized_with_timeout(DEFAULT_TIMEOUT)
-        .await?;
-    let request_id = app_server
-        .send_plugin_installed_request(PluginInstalledParams {
-            cwds: None,
-            install_suggestion_plugin_names: None,
-        })
-        .await?;
-    let response: PluginInstalledResponse =
-        timeout(DEFAULT_TIMEOUT, app_server.read_response(request_id)).await??;
-
-    assert_eq!(
-        response
-            .marketplaces
-            .iter()
-            .flat_map(|marketplace| &marketplace.plugins)
-            .map(|plugin| (plugin.id.as_str(), plugin.enabled))
-            .collect::<Vec<_>>(),
-        vec![("sites@openai-curated-remote", false)]
-    );
-    Ok(())
-}
-
-#[tokio::test]
 async fn plugin_installed_prefers_api_curated_conflicts_after_switching_to_api_auth() -> Result<()>
 {
     let codex_home = TempDir::new()?;
@@ -2154,12 +2088,14 @@ enum ProjectPluginConfiguration {
     Invalid,
 }
 
-#[test_case(ProjectPluginConfiguration::None; "without project override")]
-#[test_case(ProjectPluginConfiguration::Disabled; "project disables local plugins")]
-#[test_case(ProjectPluginConfiguration::Invalid; "invalid project preserves remote plugins")]
+#[test_case(ProjectPluginConfiguration::None, None; "without project override")]
+#[test_case(ProjectPluginConfiguration::Disabled, None; "project disables local plugins")]
+#[test_case(ProjectPluginConfiguration::Invalid, None; "invalid project preserves remote plugins")]
+#[test_case(ProjectPluginConfiguration::None, Some("tpp"); "configured product sku")]
 #[tokio::test]
 async fn plugin_list_includes_remote_marketplaces_when_remote_plugin_enabled(
     project_configuration: ProjectPluginConfiguration,
+    product_sku: Option<&str>,
 ) -> Result<()> {
     let codex_home = TempDir::new()?;
     let server = MockServer::start().await;
@@ -2274,13 +2210,14 @@ async fn plugin_list_includes_remote_marketplaces_when_remote_plugin_enabled(
   }
 }"#;
 
+    let expected_product_sku = product_sku.unwrap_or("codex");
     Mock::given(method("GET"))
         .and(path("/backend-api/ps/plugins/list"))
         .and(query_param("scope", "GLOBAL"))
         .and(query_param("limit", "200"))
         .and(header("authorization", "Bearer chatgpt-token"))
         .and(header("chatgpt-account-id", "account-123"))
-        .and(header("oai-product-sku", "codex"))
+        .and(header("oai-product-sku", expected_product_sku))
         .respond_with(ResponseTemplate::new(200).set_body_string(global_directory_body))
         .mount(&server)
         .await;
@@ -2290,7 +2227,7 @@ async fn plugin_list_includes_remote_marketplaces_when_remote_plugin_enabled(
         .and(query_param("limit", "200"))
         .and(header("authorization", "Bearer chatgpt-token"))
         .and(header("chatgpt-account-id", "account-123"))
-        .and(header("oai-product-sku", "codex"))
+        .and(header("oai-product-sku", expected_product_sku))
         .respond_with(ResponseTemplate::new(200).set_body_string(empty_page_body))
         .mount(&server)
         .await;
@@ -2299,7 +2236,7 @@ async fn plugin_list_includes_remote_marketplaces_when_remote_plugin_enabled(
         .and(query_param("scope", "GLOBAL"))
         .and(header("authorization", "Bearer chatgpt-token"))
         .and(header("chatgpt-account-id", "account-123"))
-        .and(header("oai-product-sku", "codex"))
+        .and(header("oai-product-sku", expected_product_sku))
         .respond_with(ResponseTemplate::new(200).set_body_string(global_installed_body))
         .mount(&server)
         .await;
@@ -2308,7 +2245,7 @@ async fn plugin_list_includes_remote_marketplaces_when_remote_plugin_enabled(
         .and(query_param("scope", "WORKSPACE"))
         .and(header("authorization", "Bearer chatgpt-token"))
         .and(header("chatgpt-account-id", "account-123"))
-        .and(header("oai-product-sku", "codex"))
+        .and(header("oai-product-sku", expected_product_sku))
         .respond_with(ResponseTemplate::new(200).set_body_string(empty_page_body))
         .mount(&server)
         .await;
@@ -2321,8 +2258,11 @@ async fn plugin_list_includes_remote_marketplaces_when_remote_plugin_enabled(
         .mount(&server)
         .await;
 
-    let mut mcp = TestAppServer::builder()
-        .with_codex_home(codex_home.path())
+    let mut builder = TestAppServer::builder().with_codex_home(codex_home.path());
+    if let Some(product_sku) = product_sku {
+        builder = builder.with_args(&["-c", &format!("apps_mcp_product_sku=\"{product_sku}\"")]);
+    }
+    let mut mcp = builder
         .build_initialized_with_timeout(DEFAULT_TIMEOUT)
         .await?;
 

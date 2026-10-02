@@ -96,8 +96,8 @@ impl TurnInputRequest {
         self
     }
 
-    /// Options consulted only by start-capable submission methods when this
-    /// request starts a turn.
+    /// Options for new turns, also consulted for input provenance and active-turn
+    /// compatibility when steering.
     pub fn on_start(mut self, start: TurnStartOptions) -> Self {
         self.start = start;
         self
@@ -135,6 +135,9 @@ pub enum TurnInputMode {
     StartOrSteer,
     /// Start only when the thread is idle.
     StartIfIdle,
+    /// Start an internal continuation when idle.
+    /// Reject if another task has started since the expected previous turn.
+    ContinueIfIdle { expected_previous_turn_id: String },
     /// Steer only if this exact turn is active.
     Steer { expected_turn_id: String },
 }
@@ -158,8 +161,8 @@ pub enum CyberAccessProgram {
 /// child input, Core also compares root lineage to detect ambiguity.
 #[derive(Clone, Debug, Default)]
 pub struct TurnStartOptions {
-    /// Source classification for the caller that starts a new turn.
-    /// Ignored when the submitted input steers an active turn.
+    /// Source classification for this request. Recorded on new turns and captured
+    /// as input provenance when steering, without changing the active turn's trigger.
     pub turn_trigger: Option<String>,
     /// Structured-output schema for a new turn. When steering, Core rejects
     /// the input if the active turn uses a different schema.
@@ -215,6 +218,12 @@ pub enum SteerSubmission {
 /// Why Core did not accept submitted turn input for turn processing.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum NotSubmittedReason {
+    /// New work superseded the expected previous turn of an internal continuation.
+    Superseded,
+
+    /// The host is draining and no longer permits new regular turns.
+    ServerDraining,
+
     /// `start_turn_if_idle` found an active turn.
     NotIdle,
 

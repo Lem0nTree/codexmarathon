@@ -169,7 +169,7 @@ async fn opening_existing_rollout_preserves_modified_time() -> std::io::Result<(
     drop(open_log_file(&rollout_path)?);
     assert_eq!(fs::metadata(&rollout_path)?.modified()?, modified);
 
-    drop(open_rollout_for_append(&rollout_path).await?);
+    drop(open_rollout_for_append(&rollout_path, /*writer_lock*/ None).await?);
     assert_eq!(fs::metadata(&rollout_path)?.modified()?, modified);
     Ok(())
 }
@@ -189,6 +189,8 @@ async fn state_db_init_backfills_before_returning() -> anyhow::Result<()> {
 
     let session_meta_line = SessionMetaLine {
         meta: SessionMeta {
+            creator_user_id: None,
+            creator_account_id: None,
             session_id: thread_id.into(),
             id: thread_id,
             forked_from_id: None,
@@ -196,6 +198,7 @@ async fn state_db_init_backfills_before_returning() -> anyhow::Result<()> {
             parent_thread_id: None,
             timestamp: "2026-01-27T12:34:56Z".to_string(),
             cwd: home.path().to_path_buf(),
+            runtime_workspace_roots: None,
             originator: "test".to_string(),
             cli_version: "test".to_string(),
             source: SessionSource::Cli,
@@ -1234,6 +1237,52 @@ async fn list_threads_db_disabled_does_not_skip_paginated_items() -> std::io::Re
 }
 
 #[tokio::test]
+async fn list_archived_threads_without_db_keeps_threads_without_previews() -> std::io::Result<()> {
+    let home = TempDir::new().expect("temp dir");
+    let config = test_config(home.path());
+    let archive_dir = home.path().join(crate::ARCHIVED_SESSIONS_SUBDIR);
+    fs::create_dir_all(&archive_dir)?;
+    let older = ThreadId::new();
+    let newer = ThreadId::new();
+    for (timestamp, thread_id) in [
+        ("2026-07-09T00-00-00", older),
+        ("2026-07-09T00-01-00", newer),
+    ] {
+        let path = archive_dir.join(format!("rollout-{timestamp}-{thread_id}.jsonl"));
+        write_paginated_rollout(&path, thread_id, &[])?;
+    }
+
+    let mut cursor = None;
+    let mut found = Vec::new();
+    for expected_more in [true, false] {
+        let page = RolloutRecorder::list_archived_threads(
+            /*state_db_ctx*/ None,
+            &config,
+            /*page_size*/ 1,
+            cursor.as_ref(),
+            ThreadSortKey::CreatedAt,
+            SortDirection::Desc,
+            &[],
+            /*model_providers*/ None,
+            /*cwd_filters*/ None,
+            config.model_provider_id.as_str(),
+            /*search_term*/ None,
+        )
+        .await?;
+        assert_eq!(page.items.len(), 1);
+        found.extend(
+            page.items
+                .into_iter()
+                .map(|item| (item.thread_id, item.preview)),
+        );
+        cursor = page.next_cursor;
+        assert_eq!(cursor.is_some(), expected_more);
+    }
+    assert_eq!(found, vec![(Some(newer), None), (Some(older), None)]);
+    Ok(())
+}
+
+#[tokio::test]
 async fn list_threads_db_enabled_preserves_metadata_for_missing_rollout_paths()
 -> std::io::Result<()> {
     let home = TempDir::new().expect("temp dir");
@@ -1797,6 +1846,7 @@ async fn resume_candidate_matches_cwd_reads_latest_turn_context() -> std::io::Re
         item: RolloutItem::TurnContext(TurnContextItem {
             turn_id: Some("turn-1".to_string()),
             root_turn_id: None,
+            disabled_plugin_ids: None,
             cwd: serde_json::from_value(serde_json::json!(&latest_cwd))
                 .expect("absolute latest cwd"),
             workspace_roots: None,

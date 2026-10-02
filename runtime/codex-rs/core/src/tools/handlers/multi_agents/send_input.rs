@@ -1,6 +1,9 @@
 use super::*;
+use crate::agent::api::AgentTarget;
+use crate::agent::child_config::build_agent_resume_config;
 use crate::agent::control::render_input_preview;
 use crate::tools::handlers::multi_agents_spec::create_send_input_tool_v1;
+use codex_protocol::protocol::MultiAgentVersion;
 use codex_tools::ToolSpec;
 
 pub(crate) struct Handler;
@@ -46,15 +49,15 @@ impl Handler {
         let receiver_thread_id = parse_agent_id_target(&args.target)?;
         let input_items = parse_collab_input(args.message, args.items)?;
         let prompt = render_input_preview(&input_items);
-        let receiver_agent = session
+        let local_agent_control = session
             .services
-            .agent_control
-            .get_agent_metadata(receiver_thread_id);
+            .local_agent_runtime
+            .control(session.session_id());
+        let receiver_agent = local_agent_control.get_agent_metadata(receiver_thread_id);
         if receiver_agent.is_some() {
-            let resume_config = build_agent_resume_config(turn.as_ref())?;
-            session
-                .services
-                .agent_control
+            let resume_config = build_agent_resume_config(turn.as_ref())
+                .map_err(FunctionCallError::RespondToModel)?;
+            local_agent_control
                 .ensure_v2_agent_loaded(resume_config, receiver_thread_id, /*parent*/ None)
                 .await
                 .map_err(|err| collab_agent_error(receiver_thread_id, err))?;
@@ -64,7 +67,11 @@ impl Handler {
             session
                 .services
                 .agent_control
-                .interrupt_agent(receiver_thread_id)
+                .interrupt(
+                    session.thread_id,
+                    AgentTarget::Id(receiver_thread_id),
+                    MultiAgentVersion::V1,
+                )
                 .await
                 .map_err(|err| collab_agent_error(receiver_thread_id, err))?;
         }
@@ -85,25 +92,21 @@ impl Handler {
                 }),
             )
             .await;
-        let agent_control = session.services.agent_control.clone();
-        let result = agent_control
+        let result = local_agent_control
             .send_input(
                 receiver_thread_id,
                 input_items,
                 crate::TurnStartOptions {
                     parent_turn_id: Some(turn.sub_id.clone()),
                     root_turn_id: turn.turn_metadata_state.root_turn_id(),
+                    turn_trigger: turn.turn_metadata_state.current_turn_trigger(),
                     cyber_access_program: turn.cyber_access_program,
                     ..Default::default()
                 },
             )
             .await
             .map_err(|err| collab_agent_error(receiver_thread_id, err));
-        let status = session
-            .services
-            .agent_control
-            .get_status(receiver_thread_id)
-            .await;
+        let status = local_agent_control.get_status(receiver_thread_id).await;
         session
             .emit_turn_item_completed(
                 &turn,

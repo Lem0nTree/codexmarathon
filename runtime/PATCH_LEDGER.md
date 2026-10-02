@@ -1,5 +1,9 @@
 # Runtime patch ledger
 
+The embedded upstream workspace was refreshed from `rust-v0.154.0` to
+`rust-v0.160.0` on 2026-10-02. The native Marathon CLI, TUI, app-server,
+account and transfer hooks were merged with the corresponding upstream changes.
+
 This ledger records the local runtime integration over the pinned Codext
 workspace. The donor checkout remains read-only and is not a Cargo dependency;
 the product builds from the tracked copy under `runtime/codex-rs`.

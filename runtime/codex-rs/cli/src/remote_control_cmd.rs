@@ -5,7 +5,6 @@ use anyhow::Context;
 use clap::Args;
 use codex_app_server::AppServerRuntimeOptions;
 use codex_app_server::AppServerTransport;
-use codex_app_server::AppServerWebsocketAuthSettings;
 use codex_app_server_daemon::LifecycleCommand as AppServerLifecycleCommand;
 use codex_app_server_daemon::LifecycleOutput as AppServerLifecycleOutput;
 use codex_app_server_daemon::LifecycleStatus as AppServerLifecycleStatus;
@@ -19,6 +18,7 @@ use codex_config::LoaderOverrides;
 use codex_protocol::protocol::SessionSource;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_cli::CliConfigOverrides;
+use codex_websocket_auth::WebsocketAuthSettings;
 use serde::Serialize;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -129,7 +129,7 @@ async fn run_foreground_remote_control(
         ..Default::default()
     };
     let (stop_rx, stop_signal_task) = foreground_stop_signal();
-    let mut app_server_task = tokio::spawn(codex_app_server::run_main_with_transport_options(
+    let app_server = codex_app_server::run_main_with_transport_options(
         arg0_paths,
         root_config_overrides,
         LoaderOverrides::default(),
@@ -137,9 +137,10 @@ async fn run_foreground_remote_control(
         /*default_analytics_enabled*/ false,
         transport,
         SessionSource::VSCode,
-        AppServerWebsocketAuthSettings::default(),
+        WebsocketAuthSettings::default(),
         runtime_options,
-    ));
+    );
+    let mut app_server_task = tokio::spawn(async move { app_server.await.map(|_| ()) });
 
     let summary = match wait_for_foreground_remote_control_start(
         &mut app_server_task,

@@ -1,8 +1,11 @@
 ---
-source: tui/src/chatwidget/tests.rs
+source: tui/src/chatwidget/tests/exec_flow.rs
+assertion_line: 1309
 expression: combined
 ---
 ↳ Interacted with background terminal · just fix
   └ pwd
 
 • Waited for background terminal · just fix
+
+  Worked for [duration] • [completion time]

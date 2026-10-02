@@ -4,6 +4,7 @@ use app_test_support::create_mock_responses_server_sequence;
 use app_test_support::write_mock_responses_config_toml;
 use codex_app_server_client::AppServerEvent;
 use codex_app_server_protocol::ClientRequest;
+use codex_app_server_protocol::ImageReference;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::SortDirection;
@@ -84,6 +85,7 @@ fn legacy_transcript_preview_scans_tail_across_compaction() {
                 window_id: None,
                 compaction_response_id: None,
                 latest_token_usage_record: None,
+                resume_metadata: None,
             }),
             rollout_user_message("recent user"),
             rollout_agent_message("commentary one\ncommentary two"),
@@ -219,6 +221,7 @@ fn legacy_transcript_preview_falls_back_for_oversized_hidden_record() {
                 window_id: None,
                 compaction_response_id: None,
                 latest_token_usage_record: None,
+                resume_metadata: None,
             }),
             rollout_agent_message("recent assistant"),
         ],
@@ -250,6 +253,7 @@ fn legacy_transcript_preview_falls_back_when_scan_budget_is_exhausted() {
         window_id: None,
         compaction_response_id: None,
         latest_token_usage_record: None,
+        resume_metadata: None,
     });
     let mut items = vec![rollout_user_message("older user")];
     items.extend(std::iter::repeat_n(compacted, 9));
@@ -362,9 +366,11 @@ async fn transcript_preview_for_history_mode(
             }
         } else {
             UserInput::Image {
-                url: String::from(
-                    "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==",
-                ),
+                image: ImageReference::Inline {
+                    url: String::from(
+                        "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==",
+                    ),
+                },
                 detail: None,
             }
         };

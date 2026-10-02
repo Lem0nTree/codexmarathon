@@ -22,7 +22,8 @@ use std::collections::BTreeMap;
 const TOOL_NAME: &str = "request_user_input_async";
 
 pub struct RequestUserInputAsyncHandler {
-    pub description: Option<String>,
+    pub description: String,
+    pub parameters: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -59,20 +60,28 @@ impl ToolExecutor<ToolInvocation> for RequestUserInputAsyncHandler {
         );
         questions.min_items = Some(1);
         let properties = BTreeMap::from([("questions".to_string(), questions)]);
+        let mut parameters = JsonSchema::object(
+            properties,
+            Some(vec!["questions".to_string()]),
+            /*additional_properties*/ Some(false.into()),
+        );
+        if let Some(parameters_override) = &self.parameters {
+            match crate::tools::catalog_parameters::parse(parameters_override) {
+                Ok(schema) => parameters = schema,
+                Err(reason) => tracing::warn!(
+                    tool = TOOL_NAME,
+                    reason,
+                    "Invalid catalog tool parameters; using bundled parameters"
+                ),
+            }
+        }
 
         ToolSpec::Function(ResponsesApiTool {
             name: TOOL_NAME.to_string(),
-            description: self.description.clone().unwrap_or_else(|| {
-                "Ask the user one or more questions during ongoing work. Use this tool only to request missing information, preferences, constraints, clarification, or approval. The tool returns immediately without ending the turn or waiting for a reply; any reply arrives asynchronously as a new user message. Keep questions concise, self-contained, and easy to understand, using a level of detail appropriate to the user and task. The UI always allows a free-text answer, including when suggested options are provided. A preselected option is not submitted automatically."
-                    .to_string()
-            }),
+            description: self.description.clone(),
             strict: false,
             defer_loading: None,
-            parameters: JsonSchema::object(
-                properties,
-                Some(vec!["questions".to_string()]),
-                /*additional_properties*/ Some(false.into()),
-            ),
+            parameters,
             output_schema: None,
         })
     }

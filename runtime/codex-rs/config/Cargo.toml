@@ -42,7 +42,7 @@ thiserror = { workspace = true }
 tokio = { workspace = true, features = ["fs"] }
 toml = { workspace = true, features = ["preserve_order"] }
 toml_edit = { workspace = true }
-tonic = { workspace = true }
+tonic = { workspace = true, features = ["tls-native-roots", "tls-ring"] }
 tonic-prost = { workspace = true }
 tracing = { workspace = true }
 wildmatch = { workspace = true }
@@ -55,6 +55,7 @@ libc = { workspace = true }
 core-foundation = "0.9"
 
 [target.'cfg(target_os = "windows")'.dependencies]
+codex-windows-sandbox = { workspace = true }
 winapi-util = { workspace = true }
 windows-sys = { version = "0.52", features = [
     "Win32_Foundation",

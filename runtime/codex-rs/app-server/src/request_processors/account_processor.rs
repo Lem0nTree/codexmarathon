@@ -5,6 +5,7 @@ use super::bedrock_auth::ensure_user_model_provider_can_be_bedrock;
 use super::*;
 use crate::auth_mode::auth_mode_to_api;
 use crate::external_auth::ExternalAuthBridge;
+use crate::outgoing_message::AccountNotification;
 use chrono::DateTime;
 use codex_app_server_protocol::DesktopOnboardingEntrypoint;
 use codex_app_server_protocol::GetAccountRateLimitsParams;
@@ -13,7 +14,9 @@ use codex_login::login_with_bedrock_access_keys;
 use codex_model_provider::is_supported_amazon_bedrock_region;
 
 mod bedrock_setup;
+mod gateway_oauth;
 mod rate_limit_resets;
+mod workspace_routing;
 
 // Duration before a browser ChatGPT login attempt is abandoned.
 const LOGIN_CHATGPT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
@@ -95,6 +98,12 @@ pub(crate) struct AccountRequestProcessor {
     /// never observes a half-applied auth transition.
     auth_transition_lock: Arc<Mutex<()>>,
     active_login: Arc<Mutex<Option<ActiveLogin>>>,
+    workspace_routing: Arc<Mutex<Option<workspace_routing::CachedWorkspaceRouting>>>,
+    workspace_routing_fetches: Arc<Mutex<workspace_routing::WorkspaceRoutingFetches>>,
+    workspace_routing_shutdown: CancellationToken,
+    gateway_login: Arc<std::sync::Mutex<Option<gateway_oauth::ActiveGatewayLogin>>>,
+    gateway_client: Arc<std::sync::Mutex<Option<Arc<codex_login::GatewayAuthManager>>>>,
+    _gateway_notifications: Arc<tokio_util::task::AbortOnDropHandle<()>>,
 }
 
 impl AccountRequestProcessor {
@@ -106,8 +115,14 @@ impl AccountRequestProcessor {
         config_manager: ConfigManager,
         thread_watch_manager: ThreadWatchManager,
         auth_transition_lock: Arc<Mutex<()>>,
-    ) -> Self {
-        Self {
+    ) -> Arc<Self> {
+        let gateway_notifications = crate::gateway_oauth_notifications::spawn(
+            Arc::clone(&auth_manager),
+            config_manager.clone(),
+            Arc::clone(&outgoing),
+        );
+        let processor = Arc::new(Self {
+            _gateway_notifications: Arc::new(gateway_notifications),
             auth_manager,
             thread_manager,
             outgoing,
@@ -116,7 +131,21 @@ impl AccountRequestProcessor {
             thread_watch_manager,
             auth_transition_lock,
             active_login: Arc::new(Mutex::new(None)),
-        }
+            gateway_login: Arc::new(std::sync::Mutex::new(/*t*/ None)),
+            gateway_client: Arc::new(std::sync::Mutex::new(/*t*/ None)),
+            workspace_routing: Arc::new(Mutex::new(None)),
+            workspace_routing_fetches: Arc::new(Mutex::new(HashMap::new())),
+            workspace_routing_shutdown: CancellationToken::new(),
+        });
+        let resolver: Arc<dyn codex_login::WorkspaceRoutingResolver> = processor.clone();
+        processor
+            .auth_manager
+            .set_workspace_routing_resolver(Arc::downgrade(&resolver));
+        let startup = processor.clone();
+        tokio::spawn(async move {
+            let _ = startup.read_account(/*request*/ None).await;
+        });
+        processor
     }
 
     /// Shared native authorities used by the embedded CodexMarathon bridge.
@@ -154,15 +183,6 @@ impl AccountRequestProcessor {
         params: CancelLoginAccountParams,
     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
         self.cancel_login_response(params)
-            .await
-            .map(|response| Some(response.into()))
-    }
-
-    pub(crate) async fn get_account(
-        &self,
-        params: GetAccountParams,
-    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
-        self.get_account_response(params)
             .await
             .map(|response| Some(response.into()))
     }
@@ -212,6 +232,7 @@ impl AccountRequestProcessor {
     }
 
     pub(crate) async fn cancel_active_login(&self) {
+        self.cancel_gateway_login();
         let mut guard = self.active_login.lock().await;
         if let Some(active_login) = guard.take() {
             drop(active_login);
@@ -219,6 +240,7 @@ impl AccountRequestProcessor {
     }
 
     pub(crate) fn clear_external_auth(&self) {
+        self.workspace_routing_shutdown.cancel();
         self.auth_manager.clear_external_auth();
     }
 
@@ -661,10 +683,7 @@ impl AccountRequestProcessor {
             });
         }
 
-        let outgoing_clone = self.outgoing.clone();
-        let config_manager = self.config_manager.clone();
-        let thread_manager = Arc::clone(&self.thread_manager);
-        let config = Arc::clone(&self.config);
+        let processor = self.clone();
         let active_login = self.active_login.clone();
         let auth_url = server.auth_url.clone();
         tokio::spawn(async move {
@@ -690,19 +709,14 @@ impl AccountRequestProcessor {
                 }
             };
 
-            Self::send_chatgpt_login_completion_notifications(
-                &outgoing_clone,
-                config_manager,
-                thread_manager,
-                config,
-                AccountLoginCompletedNotification {
+            processor
+                .send_chatgpt_login_completion_notifications(AccountLoginCompletedNotification {
                     login_id: Some(login_id.to_string()),
                     success,
                     error: error_msg,
                     onboarding_entrypoint,
-                },
-            )
-            .await;
+                })
+                .await;
 
             // Clear the active login if it matches this attempt. It may have been replaced or cancelled.
             let mut guard = active_login.lock().await;
@@ -751,10 +765,7 @@ impl AccountRequestProcessor {
         let verification_url = device_code.verification_url.clone();
         let user_code = device_code.user_code.clone();
 
-        let outgoing_clone = self.outgoing.clone();
-        let config_manager = self.config_manager.clone();
-        let thread_manager = Arc::clone(&self.thread_manager);
-        let config = Arc::clone(&self.config);
+        let processor = self.clone();
         let active_login = self.active_login.clone();
         tokio::spawn(async move {
             let (success, error_msg) = tokio::select! {
@@ -769,19 +780,14 @@ impl AccountRequestProcessor {
                 }
             };
 
-            Self::send_chatgpt_login_completion_notifications(
-                &outgoing_clone,
-                config_manager,
-                thread_manager,
-                config,
-                AccountLoginCompletedNotification {
+            processor
+                .send_chatgpt_login_completion_notifications(AccountLoginCompletedNotification {
                     login_id: Some(login_id.to_string()),
                     success,
                     error: error_msg,
                     onboarding_entrypoint: None,
-                },
-            )
-            .await;
+                })
+                .await;
 
             let mut guard = active_login.lock().await;
             if guard.as_ref().map(ActiveLogin::login_id) == Some(login_id) {
@@ -901,74 +907,81 @@ impl AccountRequestProcessor {
     }
 
     async fn send_login_success_notifications(&self, login_id: Option<Uuid>) {
-        Self::maybe_refresh_plugin_caches_for_current_config(
-            &self.config_manager,
-            &self.thread_manager,
-            self.auth_manager.auth_cached(),
-        )
-        .await;
-
-        let payload_login_completed = AccountLoginCompletedNotification {
+        self.send_account_login_notifications(AccountLoginCompletedNotification {
             login_id: login_id.map(|id| id.to_string()),
             success: true,
             error: None,
             onboarding_entrypoint: None,
-        };
-        self.outgoing
-            .send_server_notification(ServerNotification::AccountLoginCompleted(
-                payload_login_completed,
-            ))
-            .await;
-
-        self.outgoing
-            .send_server_notification(ServerNotification::AccountUpdated(
-                self.current_account_updated_notification(),
-            ))
-            .await;
+        })
+        .await;
     }
 
-    async fn send_chatgpt_login_completion_notifications(
-        outgoing: &OutgoingMessageSender,
-        config_manager: ConfigManager,
-        thread_manager: Arc<ThreadManager>,
-        config: Arc<Config>,
-        payload_v2: AccountLoginCompletedNotification,
+    async fn send_account_login_notifications(
+        &self,
+        mut payload: AccountLoginCompletedNotification,
     ) {
-        let success = payload_v2.success;
-        outgoing
-            .send_server_notification(ServerNotification::AccountLoginCompleted(payload_v2))
+        let auth_changes = self.auth_manager.auth_change_state_receiver();
+        let owner_generation = auth_changes.borrow().owner_generation;
+        if payload.success
+            && let Err(error) = self.read_account(/*request*/ None).await
+        {
+            payload.success = false;
+            payload.error = Some(error.to_string());
+        }
+        if payload.success && auth_changes.borrow().owner_generation == owner_generation {
+            Self::maybe_refresh_plugin_caches_for_current_config(
+                &self.config_manager,
+                &self.thread_manager,
+                self.auth_manager.auth_cached(),
+            )
+            .await;
+        }
+
+        let success = payload.success;
+        self.outgoing
+            .send_account_notification(
+                /*connection_id*/ None,
+                &auth_changes,
+                owner_generation,
+                AccountNotification::LoginCompleted(payload),
+            )
             .await;
 
         if success {
-            let auth_manager = thread_manager.auth_manager();
-            auth_manager.reload().await;
-            config_manager.replace_cloud_config_bundle_loader(
-                auth_manager.clone(),
-                config.chatgpt_base_url.clone(),
-                config.http_client_factory(),
-            );
-            config_manager
-                .sync_default_client_residency_requirement()
-                .await;
-
-            let auth = auth_manager.auth_cached();
-            Self::maybe_refresh_plugin_caches_for_current_config(
-                &config_manager,
-                &thread_manager,
-                auth.clone(),
-            )
-            .await;
-            let payload_v2 = AccountUpdatedNotification {
-                auth_mode: auth
-                    .as_ref()
-                    .map(CodexAuth::api_auth_mode)
-                    .map(auth_mode_to_api),
-                plan_type: auth.as_ref().and_then(CodexAuth::account_plan_type),
-            };
-            outgoing
-                .send_server_notification(ServerNotification::AccountUpdated(payload_v2))
+            let notification = self.current_account_updated_notification();
+            self.outgoing
+                .send_account_notification(
+                    /*connection_id*/ None,
+                    &auth_changes,
+                    owner_generation,
+                    AccountNotification::Updated(notification),
+                )
                 .await;
         }
+    }
+
+    async fn send_chatgpt_login_completion_notifications(
+        &self,
+        mut payload_v2: AccountLoginCompletedNotification,
+    ) {
+        if payload_v2.success {
+            self.auth_manager.reload().await;
+            let auth_changes = self.auth_manager.auth_change_state_receiver();
+            let owner_generation = auth_changes.borrow().owner_generation;
+            self.config_manager.replace_cloud_config_bundle_loader(
+                self.auth_manager.clone(),
+                self.config.chatgpt_base_url.clone(),
+                self.config.http_client_factory(),
+            );
+            self.config_manager
+                .sync_default_client_residency_requirement()
+                .await;
+            if auth_changes.borrow().owner_generation != owner_generation {
+                payload_v2.success = false;
+                payload_v2.error = Some("account changed before sign-in completed".into());
+            }
+        }
+        self.send_account_login_notifications(payload_v2).await;
     }
 
     async fn logout_common(&self) -> std::result::Result<Option<AuthMode>, JSONRPCErrorError> {
@@ -977,13 +990,7 @@ impl AccountRequestProcessor {
         }
         let config = self.load_latest_config().await;
 
-        // Cancel any active login attempt.
-        {
-            let mut guard = self.active_login.lock().await;
-            if let Some(active) = guard.take() {
-                drop(active);
-            }
-        }
+        self.cancel_active_login().await;
 
         match self.auth_manager.logout_with_revoke().await {
             Ok(_) => {}
@@ -992,11 +999,13 @@ impl AccountRequestProcessor {
             }
         }
 
+        self.config_manager.clear_cloud_config_bundle_loader();
+
         if config.model_provider.is_amazon_bedrock() {
             clear_user_model_provider_if_bedrock(&self.config_manager, &config).await?;
         }
 
-        self.config_manager.clear_cloud_config_bundle_loader();
+        *self.workspace_routing.lock().await = None;
 
         Self::maybe_refresh_plugin_caches_for_current_config(
             &self.config_manager,
@@ -1126,65 +1135,13 @@ impl AccountRequestProcessor {
         Ok(response)
     }
 
-    async fn get_account_response(
-        &self,
-        params: GetAccountParams,
-    ) -> Result<GetAccountResponse, JSONRPCErrorError> {
-        let do_refresh = params.refresh_token;
-        let mut auth_changed = false;
-
-        if params.reload_auth_from_storage {
-            let _auth_transition_guard = self.auth_transition_lock.lock().await;
-            if *self
-                .thread_watch_manager
-                .subscribe_running_turn_count()
-                .borrow()
-                == 0
-            {
-                let status = self.auth_manager.reload_with_status().await;
-                match handle_auth_reload_status(
-                    status,
-                    &self.auth_manager,
-                    &self.thread_manager,
-                    &self.config_manager,
-                    &self.outgoing,
-                    &self.config.chatgpt_base_url,
-                    self.config.http_client_factory(),
-                    "account/get",
-                )
-                .await
-                {
-                    AuthReloadStatus::Reloaded { changed } => auth_changed = changed,
-                    AuthReloadStatus::Failed => {
-                        return Err(internal_error("failed to reload auth from storage"));
-                    }
-                }
-            }
-        }
-
-        self.refresh_token_if_requested(do_refresh).await;
-
-        let config = self.load_latest_config().await;
-        let provider =
-            create_model_provider(config.model_provider, Some(self.auth_manager.clone()));
-        let account_state = match provider.account_state() {
-            Ok(account_state) => account_state,
-            Err(err) => return Err(invalid_request(err.to_string())),
-        };
-        let account = account_state.account.map(Account::from);
-
-        Ok(GetAccountResponse {
-            account,
-            requires_openai_auth: account_state.requires_openai_auth,
-            auth_changed,
-        })
-    }
-
     async fn get_account_rate_limits_response(
         &self,
         params: GetAccountRateLimitsParams,
     ) -> Result<GetAccountRateLimitsResponse, JSONRPCErrorError> {
-        let Some(auth) = self.auth_manager.auth().await else {
+        let Some((auth, http_client_factory)) =
+            self.auth_manager.auth_with_http_client_factory().await
+        else {
             return Err(invalid_request(
                 "codex account authentication required to read rate limits",
             ));
@@ -1199,7 +1156,7 @@ impl AccountRequestProcessor {
         let client = BackendClient::from_auth(
             self.config.chatgpt_base_url.clone(),
             &auth,
-            self.config.http_client_factory(),
+            http_client_factory,
         );
 
         let usage_request = async {
@@ -1257,11 +1214,15 @@ impl AccountRequestProcessor {
 
         // Match desktop's account readiness check before exposing account-bound CTA content.
         // Normal rate limits remain available when older backends omit identity or banner data.
-        let matches_active_account = !auth.is_fedramp_account()
-            && response.account_id.is_some()
-            && response.account_id == auth.get_account_id()
-            && response.user_id.is_some()
-            && response.user_id == auth.get_chatgpt_user_id();
+        // Login can change while the backend read is in flight.
+        let active_auth = self.auth_manager.auth().await;
+        let matches_active_account = active_auth.is_some_and(|auth| {
+            !auth.is_fedramp_account()
+                && response.account_id.is_some()
+                && response.account_id == auth.get_account_id()
+                && response.user_id.is_some()
+                && response.user_id == auth.get_chatgpt_user_id()
+        });
         let rate_limit_upsell = response
             .rate_limit_upsell
             .filter(|_| matches_active_account);
@@ -1295,7 +1256,9 @@ impl AccountRequestProcessor {
             })
             .transpose()?;
 
-        let Some(auth) = self.auth_manager.auth().await else {
+        let Some((auth, http_client_factory)) =
+            self.auth_manager.auth_with_http_client_factory().await
+        else {
             return Err(invalid_request(
                 "codex account authentication required to read token usage",
             ));
@@ -1310,7 +1273,7 @@ impl AccountRequestProcessor {
         let client = BackendClient::from_auth(
             self.config.chatgpt_base_url.clone(),
             &auth,
-            self.config.http_client_factory(),
+            http_client_factory,
         );
         if let Some(thread_id) = thread_id {
             let thread_id = thread_id.to_string();
@@ -1380,7 +1343,9 @@ impl AccountRequestProcessor {
     async fn get_workspace_messages_response(
         &self,
     ) -> Result<GetWorkspaceMessagesResponse, JSONRPCErrorError> {
-        let Some(auth) = self.auth_manager.auth().await else {
+        let Some((auth, http_client_factory)) =
+            self.auth_manager.auth_with_http_client_factory().await
+        else {
             return Err(invalid_request(
                 "codex account authentication required to read workspace messages",
             ));
@@ -1395,7 +1360,7 @@ impl AccountRequestProcessor {
         let client = BackendClient::from_auth(
             self.config.chatgpt_base_url.clone(),
             &auth,
-            self.config.http_client_factory(),
+            http_client_factory,
         );
         let messages = tokio::time::timeout(
             ACCOUNT_WORKSPACE_MESSAGES_FETCH_TIMEOUT,
@@ -1472,7 +1437,9 @@ impl AccountRequestProcessor {
         &self,
         params: SendAddCreditsNudgeEmailParams,
     ) -> Result<AddCreditsNudgeEmailStatus, JSONRPCErrorError> {
-        let Some(auth) = self.auth_manager.auth().await else {
+        let Some((auth, http_client_factory)) =
+            self.auth_manager.auth_with_http_client_factory().await
+        else {
             return Err(invalid_request(
                 "codex account authentication required to notify workspace owner",
             ));
@@ -1487,7 +1454,7 @@ impl AccountRequestProcessor {
         let client = BackendClient::from_auth(
             self.config.chatgpt_base_url.clone(),
             &auth,
-            self.config.http_client_factory(),
+            http_client_factory,
         );
 
         match client

@@ -276,6 +276,7 @@ fn catalog_cache_invalidation_clears_global_collections_and_preserves_other_scop
     let config = RemotePluginServiceConfig::new(
         "https://chatgpt.com/backend-api".to_string(),
         crate::test_support::test_http_client_factory(),
+        /*product_sku*/ None,
     );
     let auth = CodexAuth::create_dummy_chatgpt_auth_for_testing();
     for scope in [RemotePluginScope::Global, RemotePluginScope::Workspace] {
@@ -596,6 +597,7 @@ fn workspace_share_context_preserves_publish_capability() {
 
 fn directory_plugin(id: &str, name: &str) -> RemotePluginDirectoryItem {
     RemotePluginDirectoryItem {
+        canonical_app_id: None,
         id: id.to_string(),
         name: name.to_string(),
         scope: RemotePluginScope::Global,
@@ -639,6 +641,7 @@ fn directory_plugin(id: &str, name: &str) -> RemotePluginDirectoryItem {
                 screenshot_urls: Vec::new(),
             },
             skills: Vec::new(),
+            onboarding_skill_name: None,
             mcp_servers: Vec::new(),
             scheduled_tasks: None,
         },

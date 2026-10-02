@@ -8,7 +8,6 @@ use codex_config::types::ResumeCwdMode;
 use codex_config::types::SessionPickerViewMode;
 use codex_config::types::ToolSuggestDisabledTool;
 use codex_features::FEATURES;
-use codex_protocol::config_types::Personality;
 use codex_protocol::config_types::ServiceTier;
 use codex_protocol::config_types::TrustLevel;
 use codex_protocol::openai_models::ReasoningEffort;
@@ -39,12 +38,8 @@ pub enum ConfigEdit {
     },
     /// Update the service tier preference for future turns.
     SetServiceTier { service_tier: Option<String> },
-    /// Update the active (or default) model personality.
-    SetModelPersonality { personality: Option<Personality> },
     /// Toggle the acknowledgement flag under `[notice]`.
     SetNoticeHideFullAccessWarning(bool),
-    /// Toggle the Windows world-writable directories warning acknowledgement flag.
-    SetNoticeHideWorldWritableWarning(bool),
     /// Toggle the rate limit model nudge acknowledgement flag.
     SetNoticeHideRateLimitModelNudge(bool),
     /// Toggle the model migration prompt acknowledgement flag.
@@ -245,16 +240,8 @@ impl ConfigDocument {
                     value(config_value)
                 }),
             )),
-            ConfigEdit::SetModelPersonality { personality } => Ok(self.write_optional_value(
-                &["personality"],
-                personality.map(|personality| value(personality.to_string())),
-            )),
             ConfigEdit::SetNoticeHideFullAccessWarning(acknowledged) => Ok(self.write_value(
                 &[NOTICE_TABLE_KEY, "hide_full_access_warning"],
-                value(*acknowledged),
-            )),
-            ConfigEdit::SetNoticeHideWorldWritableWarning(acknowledged) => Ok(self.write_value(
-                &[NOTICE_TABLE_KEY, "hide_world_writable_warning"],
                 value(*acknowledged),
             )),
             ConfigEdit::SetNoticeHideRateLimitModelNudge(acknowledged) => Ok(self.write_value(
@@ -349,7 +336,10 @@ impl ConfigDocument {
                             item.as_table_like()?.get(segment)
                         })
                         .and_then(TomlItem::as_table_like)
-                        .is_some_and(|feature| feature.contains_key("credential_broker"));
+                        .is_some_and(|feature| {
+                            feature.contains_key("credential_broker")
+                                || feature.contains_key("credentials")
+                        });
                 if preserves_broker_settings {
                     let mut enabled_segments = segments.clone();
                     enabled_segments.push("enabled".to_string());
@@ -827,12 +817,6 @@ impl ConfigEditsBuilder {
     pub fn set_hide_full_access_warning(mut self, acknowledged: bool) -> Self {
         self.edits
             .push(ConfigEdit::SetNoticeHideFullAccessWarning(acknowledged));
-        self
-    }
-
-    pub fn set_hide_world_writable_warning(mut self, acknowledged: bool) -> Self {
-        self.edits
-            .push(ConfigEdit::SetNoticeHideWorldWritableWarning(acknowledged));
         self
     }
 

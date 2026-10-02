@@ -7,6 +7,7 @@ use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::PermissionProfileSnapshot;
 use codex_protocol::permissions::NetworkSandboxPolicy;
+use codex_protocol::sandbox::SandboxType;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
 #[cfg(windows)]
@@ -277,10 +278,7 @@ async fn workspace_roots_allow_file_and_command_writes_in_secondary_root(
                     ),
                     shell_environment_policy: Default::default(),
                     windows_sandbox_level: WindowsSandboxLevel::RestrictedToken,
-                    windows_sandbox_private_desktop: test
-                        .config
-                        .permissions
-                        .windows_sandbox_private_desktop,
+                    windows_sandbox_type: SandboxType::WindowsRestrictedToken,
                     use_legacy_landlock: test.config.features.use_legacy_landlock(),
                     exec_policy: None,
                     mcp_policy: None,
@@ -345,7 +343,7 @@ async fn workspace_roots_allow_file_and_command_writes_in_secondary_root(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn workspace_roots_allow_patches_but_protect_metadata_directories() -> Result<()> {
     const PATCH_CONTENTS: &str = "workspace root patch access";
-    const PROTECTED_METADATA_DIRECTORIES: [&str; 3] = [".git", ".agents", ".codex"];
+    const PROTECTED_METADATA_DIRECTORIES: [&str; 4] = [".git", ".agents", ".codex", ".aws"];
 
     skip_if_wine_exec!(
         Ok(()),

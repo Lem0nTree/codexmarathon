@@ -123,11 +123,25 @@ async fn end_to_end_login_flow_persists_auth_json() -> Result<()> {
 
     // Run server in background
     let server_home = codex_home.clone();
+    let content = codex_http_client::NetworkPolicyController::default();
+    let local = codex_http_client::NetworkPolicyController::default();
+    let local_policy = local.policy();
+    local.publish(
+        local_policy.revision(),
+        codex_http_client::DestinationPolicy::Unrestricted,
+    );
+    let factory = codex_http_client::HttpClientFactory::new(
+        codex_http_client::OutboundProxyPolicy::ReqwestDefault,
+    );
+    let routes = codex_login::AuthRouteConfig::from_http_client_factory(
+        factory.clone().with_network_policy(content.policy()),
+    )
+    .with_local_bootstrap_factory(factory.with_network_policy(local_policy));
 
     let opts = ServerOptions {
         codex_home: server_home,
         cli_auth_credentials_store_mode: AuthCredentialsStoreMode::File,
-        auth_route_config: codex_login::test_support::transport_default_auth_route_config(),
+        auth_route_config: routes,
         client_id: codex_login::CLIENT_ID.to_string(),
         issuer,
         port: 0,
@@ -146,19 +160,51 @@ async fn end_to_end_login_flow_persists_auth_json() -> Result<()> {
         "auth URL should include forced workspace parameter"
     );
     let login_port = server.actual_port;
+    let callback_url = Url::parse(&server.auth_url)?
+        .query_pairs()
+        .find_map(|(key, value)| (key == "redirect_uri").then(|| value.into_owned()))
+        .expect("auth URL should include a redirect URI");
+    assert_eq!(
+        callback_url,
+        format!("http://127.0.0.1:{login_port}/auth/callback")
+    );
 
     // Simulate browser callback and assert the local success redirect before following it.
     let client = HttpClientBuilder::new()
         .without_redirects()
         .build_direct()?;
-    let url = format!(
-        "http://127.0.0.1:{login_port}/auth/callback?code=abc&state=test_state_123.onboarding_entrypoint=life_sciences"
+    // Reject unrecognized metadata before processing codes or provider errors.
+    for state in [
+        "wrong_state.onboarding_entrypoint=life_sciences",
+        "test_state_123.onboarding_entrypoint=unknown",
+        "test_state_123.onboarding_entrypoint=life_sciences.onboarding_entrypoint=life_sciences",
+        "test_state_123.extra=value.onboarding_entrypoint=life_sciences",
+    ] {
+        let response = client
+            .get(&callback_url)
+            .query(&[
+                ("state", state),
+                ("code", "untrusted"),
+                ("error", "access_denied"),
+            ])
+            .send()
+            .await?;
+        assert_eq!(response.status(), 400);
+        assert_eq!(response.text().await?, "State mismatch");
+    }
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&std::fs::read_to_string(
+            codex_home.join("auth.json")
+        )?)?,
+        stale_auth
     );
+    let url =
+        format!("{callback_url}?code=abc&state=test_state_123.onboarding_entrypoint=life_sciences");
     let resp = client.get(&url).send().await?;
     assert_eq!(resp.status(), 302);
     let success_url = resp.headers()["location"].to_str()?;
     let success_url = Url::parse(success_url)?;
-    assert_eq!(success_url.host_str(), Some("localhost"));
+    assert_eq!(success_url.origin(), Url::parse(&callback_url)?.origin());
     assert_eq!(success_url.path(), "/success");
 
     let success_resp = client.get(success_url).send().await?;
@@ -605,7 +651,7 @@ async fn falls_back_to_registered_fallback_port_when_default_port_is_in_use() ->
 
     assert_eq!(actual_port, FALLBACK_LOGIN_PORT);
     assert!(auth_url.contains(&format!(
-        "redirect_uri=http%3A%2F%2Flocalhost%3A{FALLBACK_LOGIN_PORT}%2Fauth%2Fcallback"
+        "redirect_uri=http%3A%2F%2F127.0.0.1%3A{FALLBACK_LOGIN_PORT}%2Fauth%2Fcallback"
     )));
 
     Ok(())

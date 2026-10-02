@@ -14,7 +14,7 @@ fn experimental_context_is_eligible(auth_mode: AuthMode, plan_type: Option<PlanT
     auth_mode == AuthMode::Chatgpt
         && matches!(
             plan_type,
-            Some(PlanType::Plus | PlanType::Pro | PlanType::ProLite)
+            Some(PlanType::Plus | PlanType::Pro | PlanType::ProLite | PlanType::ProMax)
         )
 }
 
@@ -189,8 +189,12 @@ pub(super) async fn maybe_record(
                     &config.reminder_message_template,
                     base_window_tokens_remaining,
                 ));
-            sess.record_conversation_items(turn_context, std::slice::from_ref(&response_item))
-                .await;
+            sess.record_conversation_items(
+                turn_context,
+                turn_context.model_info(),
+                std::slice::from_ref(&response_item),
+            )
+            .await;
         }
     }
 
@@ -211,8 +215,12 @@ pub(super) async fn maybe_record(
 
     let response_item =
         ContextualUserFragment::into(crate::context::AutoCompactFallbackPrompt::new(prompt));
-    sess.record_conversation_items(turn_context, std::slice::from_ref(&response_item))
-        .await;
+    sess.record_conversation_items(
+        turn_context,
+        turn_context.model_info(),
+        std::slice::from_ref(&response_item),
+    )
+    .await;
 }
 
 #[cfg(test)]
@@ -227,6 +235,7 @@ mod tests {
             (AuthMode::Chatgpt, PlanType::Plus, true),
             (AuthMode::Chatgpt, PlanType::Pro, true),
             (AuthMode::Chatgpt, PlanType::ProLite, true),
+            (AuthMode::Chatgpt, PlanType::ProMax, true),
             (AuthMode::Chatgpt, PlanType::Free, false),
             (AuthMode::Chatgpt, PlanType::Enterprise, false),
             (AuthMode::ApiKey, PlanType::Pro, false),

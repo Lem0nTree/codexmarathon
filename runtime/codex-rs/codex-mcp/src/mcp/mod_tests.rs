@@ -1,6 +1,10 @@
 use super::*;
 use crate::McpPluginAttribution;
 use crate::McpServerRegistration;
+use crate::connection_manager::tests::create_ready_async_managed_client;
+use crate::mcp::auth::McpAuthStatusEntry;
+use crate::rmcp_client::StartupOutcomeError;
+use crate::server::McpCredentialPolicy;
 use codex_config::Constrained;
 use codex_config::types::AppToolApproval;
 use codex_config::types::AuthKeyringBackendKind;
@@ -12,17 +16,81 @@ use codex_protocol::models::PermissionProfile;
 use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::GranularApprovalConfig;
+use codex_rmcp_client::McpAuthState;
+use futures::FutureExt;
 use pretty_assertions::assert_eq;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+#[tokio::test]
+async fn status_snapshot_only_downgrades_oauth_authentication_failures() {
+    let auth_failure = StartupOutcomeError::Failed {
+        error: "OAuth refresh token was rejected".to_string(),
+        is_authentication_required: true,
+    };
+    let mut manager = McpConnectionSet::empty(/*prefix_mcp_tool_names*/ true);
+    let mut auth_status_entries = HashMap::new();
+    for (name, auth_state, startup_error) in [
+        (
+            "oauth-failed",
+            McpAuthState::OAuth,
+            Some(auth_failure.clone()),
+        ),
+        ("oauth-ready", McpAuthState::OAuth, None),
+        (
+            "oauth-provider-error",
+            McpAuthState::OAuth,
+            Some(StartupOutcomeError::Failed {
+                error: "provider temporarily unavailable".to_string(),
+                is_authentication_required: false,
+            }),
+        ),
+        ("bearer", McpAuthState::BearerToken, Some(auth_failure)),
+    ] {
+        let mut client = create_ready_async_managed_client(Vec::new()).await;
+        if let Some(error) = startup_error {
+            client.client = futures::future::ready(Err(error)).boxed().shared();
+        }
+        manager.insert_test_client(name, client);
+        auth_status_entries.insert(
+            name.to_string(),
+            McpAuthStatusEntry {
+                config: None,
+                auth_state,
+            },
+        );
+    }
+
+    let server_names = auth_status_entries.keys().cloned().collect();
+    let snapshot = collect_mcp_server_status_snapshot_from_manager(
+        &manager,
+        auth_status_entries,
+        server_names,
+        McpSnapshotDetail::ToolsAndAuthOnly,
+    )
+    .await;
+
+    assert_eq!(
+        snapshot.auth_statuses,
+        HashMap::from([
+            ("oauth-failed".to_string(), McpAuthStatus::NotLoggedIn),
+            ("oauth-ready".to_string(), McpAuthStatus::OAuth),
+            ("oauth-provider-error".to_string(), McpAuthStatus::OAuth),
+            ("bearer".to_string(), McpAuthStatus::BearerToken),
+        ]),
+    );
+}
+
 pub(crate) fn test_mcp_config(codex_home: PathBuf) -> McpConfig {
     McpConfig {
         chatgpt_base_url: "https://chatgpt.com".to_string(),
         apps_mcp_product_sku: None,
+        requires_read_only_mcp_tools: false,
         codex_home,
+        mcp_enterprise_managed_auth: None,
+        xaa_enabled: false,
         mcp_oauth_credentials_store_mode: OAuthCredentialsStoreMode::default(),
         oauth_refresh_mode: McpOAuthRefreshMode::Legacy,
         auth_keyring_backend_kind: AuthKeyringBackendKind::default(),
@@ -42,6 +110,7 @@ pub(crate) fn test_mcp_config(codex_home: PathBuf) -> McpConfig {
         prefix_mcp_tool_names: true,
         non_prefixed_mcp_tool_servers: Vec::new(),
         protocol_mode: McpProtocolMode::Legacy,
+        host_owned_apps_protocol_mode: McpProtocolMode::Legacy,
         client_elicitation_capability: ElicitationCapability::default(),
         mcp_server_catalog: ResolvedMcpCatalog::default(),
         connector_snapshot: codex_connectors::ConnectorSnapshot::default(),
@@ -60,6 +129,64 @@ pub(crate) fn test_elicitation_config(
         .server_permission_profiles
         .insert(server_name.to_string(), permission_profile);
     Arc::new(config)
+}
+
+#[test]
+fn ema_catalog_supports_configured_installed_and_selected_plugins_without_widening_policy() {
+    let server: McpServerConfig = serde_json::from_value(serde_json::json!({
+        "url": "https://resource.example/mcp", "auth": "ema_auth",
+        "oauth": { "client_id": "resource-client", "authorization_server_issuer": "https://as.example" }
+    })).unwrap();
+    let plugin = McpPluginAttribution::agent_plugin("plugin@test".into(), "Plugin".into());
+    let mut catalog = ResolvedMcpCatalog::builder();
+    catalog.register(McpServerRegistration::from_config(
+        "configured".into(),
+        server.clone(),
+    ));
+    catalog.register(McpServerRegistration::from_plugin(
+        "installed".into(),
+        plugin.clone(),
+        /*plugin_order*/ 0,
+        server.clone(),
+    ));
+    catalog.register(McpServerRegistration::from_selected_plugin(
+        "selected".into(),
+        plugin,
+        /*selection_order*/ 0,
+        codex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID,
+        server,
+    ));
+    let mut config = test_mcp_config(PathBuf::new());
+    let idp = codex_config::McpServerIdpOAuthConfig {
+        issuer: "https://idp.example".into(),
+        client_id: "enterprise-client".into(),
+    };
+    let deny_all = codex_protocol::mcp_policy::EnvironmentMcpPolicy {
+        servers: Some(Default::default()),
+        plugins: None,
+    };
+    for (xaa_enabled, denied) in [(true, false), (true, true), (false, false)] {
+        let mut catalog = catalog.clone();
+        if xaa_enabled {
+            catalog.enable_ema(idp.clone());
+        }
+        config.mcp_server_catalog = catalog.build_with_environment_authority(|_| {
+            if denied {
+                crate::McpEnvironmentAuthority::Restricted(&deny_all)
+            } else {
+                crate::McpEnvironmentAuthority::Unrestricted
+            }
+        });
+        let servers = effective_mcp_servers(&config, /*auth*/ None);
+        for name in ["configured", "installed", "selected"] {
+            assert_eq!(servers[name].enabled(), xaa_enabled && !denied, "{name}");
+            assert_eq!(
+                servers[name].config().oauth_idp(),
+                xaa_enabled.then_some(&idp)
+            );
+            assert_eq!(servers[name].config().auth, McpServerAuth::EmaAuth);
+        }
+    }
 }
 
 #[test]
@@ -91,6 +218,7 @@ fn mcp_server_permissions_handle_unattached_and_threadless_servers() {
         "selected".to_string(),
         McpPluginAttribution::new("selected@test".to_string(), "Selected".to_string()),
         /*selection_order*/ 0,
+        codex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID,
         selected_server,
     ));
     config.mcp_server_catalog = catalog.build();
@@ -188,7 +316,7 @@ fn mcp_prompt_auto_approval_rejects_auto_mode_in_default_permission_mode() {
 }
 
 #[test]
-fn tool_plugin_provenance_collects_app_and_mcp_sources() {
+fn tool_plugin_context_collects_app_and_mcp_sources() {
     let mut config = test_mcp_config(PathBuf::new());
     let mut catalog = ResolvedMcpCatalog::builder();
     catalog.register(McpServerRegistration::from_plugin(
@@ -224,11 +352,12 @@ fn tool_plugin_provenance_collects_app_and_mcp_sources() {
                 ..PluginCapabilitySummary::default()
             },
         ]);
-    let provenance = tool_plugin_provenance(&config);
+    let provenance = tool_plugin_context(&config);
 
     assert_eq!(
         provenance,
-        ToolPluginProvenance {
+        ToolPluginContext {
+            disabled_connector_ids: HashSet::new(),
             plugin_display_names_by_connector_id: HashMap::from([
                 (
                     "connector_example".to_string(),
@@ -268,6 +397,7 @@ fn selected_mcp_attribution_does_not_join_an_unrelated_local_summary() {
             "Executor GitHub".to_string(),
         ),
         /*selection_order*/ 0,
+        "executor-1",
         codex_apps_mcp_server_config(
             "https://github.example",
             /*apps_mcp_product_sku*/ None,
@@ -286,11 +416,12 @@ fn selected_mcp_attribution_does_not_join_an_unrelated_local_summary() {
             },
         ]);
 
-    let provenance = tool_plugin_provenance(&config);
+    let provenance = tool_plugin_context(&config);
 
     assert_eq!(
         provenance,
-        ToolPluginProvenance {
+        ToolPluginContext {
+            disabled_connector_ids: HashSet::new(),
             plugin_display_names_by_connector_id: HashMap::new(),
             plugin_display_names_by_mcp_server_name: HashMap::from([(
                 "github".to_string(),
@@ -425,6 +556,55 @@ fn codex_apps_server_config_forwards_originator_and_configured_product_sku_heade
 }
 
 #[test]
+fn effective_mcp_servers_preserve_executor_credential_policy() {
+    let mut config = test_mcp_config(PathBuf::new());
+    let server: McpServerConfig = serde_json::from_value(serde_json::json!({
+        "url": "https://executor.example/mcp",
+        "environment_id": "remote",
+        "bearer_token_env_var": "MCP_EXECUTOR_CREDENTIAL_CANARY",
+    }))
+    .expect("valid MCP server config");
+    let mut catalog = ResolvedMcpCatalog::builder();
+    catalog.register(McpServerRegistration::from_executor_config(
+        "executor".to_string(),
+        server.clone(),
+    ));
+    catalog.register(McpServerRegistration::from_config(
+        "host".to_string(),
+        server,
+    ));
+    config.mcp_server_catalog = catalog.build();
+    let effective = effective_mcp_servers(&config, /*auth*/ None);
+
+    assert_eq!(
+        effective["executor"].credential_policy(),
+        McpCredentialPolicy::ExecutorOnly,
+    );
+    assert_eq!(
+        effective["host"].credential_policy(),
+        McpCredentialPolicy::HostFallbackAllowed,
+    );
+}
+
+#[test]
+#[should_panic(expected = "materialized MCP server must have a catalog registration")]
+fn effective_mcp_servers_require_catalog_registration() {
+    let config = test_mcp_config(PathBuf::new());
+    let server: McpServerConfig = serde_json::from_value(serde_json::json!({
+        "url": "https://executor.example/mcp",
+        "environment_id": "remote",
+        "bearer_token_env_var": "MCP_EXECUTOR_CREDENTIAL_CANARY",
+    }))
+    .expect("valid MCP server config");
+
+    effective_mcp_servers_from_configured(
+        HashMap::from([("unregistered".to_string(), server)]),
+        &config,
+        /*auth*/ None,
+    );
+}
+
+#[test]
 fn effective_mcp_servers_preserve_chatgpt_auth_for_staging() {
     for url in [
         "https://chatgpt-staging.com",
@@ -435,6 +615,12 @@ fn effective_mcp_servers_preserve_chatgpt_auth_for_staging() {
         let server = codex_apps_mcp_server_config(
             url, /*apps_mcp_product_sku*/ None, /*originator*/ None,
         );
+        let mut catalog = ResolvedMcpCatalog::builder();
+        catalog.register(McpServerRegistration::from_config(
+            "staging".to_string(),
+            server.clone(),
+        ));
+        config.mcp_server_catalog = catalog.build();
         let configured = HashMap::from([("staging".to_string(), server)]);
         let effective =
             effective_mcp_servers_from_configured(configured, &config, /*auth*/ None);
@@ -465,7 +651,9 @@ async fn effective_mcp_servers_preserve_runtime_servers() {
             environment_id: codex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string(),
             enabled: true,
             required: false,
+            startup_readiness: Default::default(),
             supports_parallel_tool_calls: false,
+            tool_input_schema_max_bytes: None,
             omit_tools_from: None,
             disabled_reason: None,
             startup_timeout_sec: None,
@@ -493,7 +681,9 @@ async fn effective_mcp_servers_preserve_runtime_servers() {
             environment_id: codex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string(),
             enabled: true,
             required: false,
+            startup_readiness: Default::default(),
             supports_parallel_tool_calls: false,
+            tool_input_schema_max_bytes: None,
             omit_tools_from: None,
             disabled_reason: None,
             startup_timeout_sec: None,

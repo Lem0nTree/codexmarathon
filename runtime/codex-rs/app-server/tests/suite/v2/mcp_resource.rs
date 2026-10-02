@@ -1,6 +1,7 @@
 use std::path::Path;
 use std::pin::pin;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
@@ -28,6 +29,7 @@ use codex_app_server_protocol::InitializeParams;
 use codex_app_server_protocol::McpResourceContent;
 use codex_app_server_protocol::McpResourceReadParams;
 use codex_app_server_protocol::McpResourceReadResponse;
+use codex_app_server_protocol::McpResourceReadTarget;
 use codex_app_server_protocol::McpServerToolCallParams;
 use codex_app_server_protocol::McpServerToolCallResponse;
 use codex_app_server_protocol::ProjectCreateParams;
@@ -70,9 +72,16 @@ use codex_core::config::ConfigBuilder;
 use codex_exec_server::EnvironmentManager;
 use codex_features::Feature;
 use codex_feedback::CodexFeedback;
+use codex_protocol::ThreadId;
 use codex_protocol::models::ContentItem;
+use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::ThreadSettingsAppliedEvent;
+use codex_rollout::RolloutItem;
+use codex_rollout::RolloutRecorder;
+use codex_rollout::append_rollout_item_to_path;
 use codex_state::PINNED_THREAD_SECTION_ID;
 use codex_state::PINNED_THREAD_SECTION_NAME;
 use codex_utils_absolute_path::AbsolutePathBuf;
@@ -110,6 +119,9 @@ use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
+#[path = "mcp_resource/plugin_metadata_refresh.rs"]
+mod plugin_metadata_refresh;
+
 pub(super) const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(10);
 const TEST_RESOURCE_URI: &str = "test://codex/resource";
 pub(super) const TEST_WIDGET_RESOURCE_URI: &str = "ui://widget/checkout-session.html";
@@ -121,7 +133,6 @@ const TEST_ELICITATION_RESOURCE_URI: &str = "test://codex/elicitation";
 const TEST_ELICITATION_RESOURCE_TEXT: &str = "Threadless elicitation was declined.";
 const SKILL_NAME: &str = "demo-plugin:deploy";
 const RAW_SKILL_DESCRIPTION: &str = "Deploy\nthrough the <hosted> orchestrator.";
-const SKILL_DESCRIPTION: &str = "Deploy through the &lt;hosted&gt; orchestrator.";
 const SKILL_RESOURCE_URI: &str = "skill://plugin_demo/deploy";
 const SKILL_MAIN_PROMPT_URI: &str = "skill://plugin_demo/deploy/SKILL.md";
 const SKILL_REFERENCE_URI: &str = "skill://plugin_demo/deploy/references/deploy.md";
@@ -137,15 +148,11 @@ const SKILL_CONTENTS: &str = concat!(
 );
 const SKILL_REFERENCE_CONTENTS: &str =
     "# Deploy reference\n\nUse the orchestrator deployment API.\n";
-const SKILLS_LIST_CALL_ID: &str = "skills-list";
-const SKILLS_READ_MAIN_CALL_ID: &str = "skills-read-main";
-const SKILLS_READ_CALL_ID: &str = "skills-read";
-const SKILLS_READ_AGAIN_CALL_ID: &str = "skills-read-again";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mcp_resource_read_returns_resource_contents() -> Result<()> {
     let responses_server = responses::start_mock_server().await;
-    let (apps_server_url, _apps_server_calls, apps_server_handle) =
+    let (apps_server_url, apps_server_calls, apps_server_handle) =
         start_resource_apps_mcp_server().await?;
     let responses_server_uri = responses_server.uri();
     let (_codex_home, mut mcp) = start_resource_test_app_server(
@@ -161,19 +168,54 @@ async fn mcp_resource_read_returns_resource_contents() -> Result<()> {
             ..Default::default()
         })
         .await?;
-    let read_response: McpResourceReadResponse = mcp
-        .request(|request_id| ClientRequest::McpResourceRead {
-            request_id,
-            params: McpResourceReadParams {
-                thread_id: Some(thread.id),
-                origin_call_id: None,
-                server: "codex_apps".to_string(),
-                uri: TEST_RESOURCE_URI.to_string(),
-                connector_id: None,
-            },
-        })
-        .await?;
-    assert_eq!(read_response, expected_resource_read_response());
+    for thread_id in [Some(thread.id), None] {
+        for target in [
+            None,
+            Some(McpResourceReadTarget {
+                connector_id: "calendar".to_string(),
+                link_id: Some("link_calendar".to_string()),
+            }),
+            Some(McpResourceReadTarget {
+                connector_id: "calendar".to_string(),
+                link_id: None,
+            }),
+        ] {
+            let read_response: McpResourceReadResponse = mcp
+                .request(|request_id| ClientRequest::McpResourceRead {
+                    request_id,
+                    params: McpResourceReadParams {
+                        thread_id: thread_id.clone(),
+                        origin_call_id: None,
+                        server: "codex_apps".to_string(),
+                        uri: TEST_RESOURCE_URI.to_string(),
+                        connector_id: None,
+                        target: target.clone(),
+                    },
+                })
+                .await?;
+            assert_eq!(read_response, expected_resource_read_response());
+            let metadata = apps_server_calls
+                .read_metadata
+                .lock()
+                .expect("read metadata lock");
+            let metadata = metadata
+                .last()
+                .expect("resource read reached the MCP server");
+            assert_eq!(
+                (
+                    metadata.get("connector_id").cloned(),
+                    metadata.get("link_id").cloned()
+                ),
+                match &target {
+                    Some(target) => (
+                        Some(json!(target.connector_id)),
+                        Some(json!(target.link_id)),
+                    ),
+                    None => (None, None),
+                },
+            );
+        }
+    }
 
     apps_server_handle.abort();
     let _ = apps_server_handle.await;
@@ -232,6 +274,7 @@ async fn mcp_resource_read_preserves_protocol_errors(protocol: ProtocolVersion) 
                     server: server.to_string(),
                     uri: TEST_ERROR_RESOURCE_URI.to_string(),
                     connector_id: None,
+                    target: None,
                 })
                 .await?;
             let error = timeout(
@@ -252,282 +295,7 @@ async fn mcp_resource_read_preserves_protocol_errors(protocol: ProtocolVersion) 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn orchestrator_skill_can_read_referenced_resource_without_an_executor() -> Result<()> {
-    let responses_server = responses::start_mock_server().await;
-    let (apps_server_url, apps_server_calls, apps_server_handle) =
-        start_resource_apps_mcp_server().await?;
-    let responses_server_uri = responses_server.uri();
-    let (_codex_home, mut mcp) = start_resource_test_app_server(
-        &apps_server_url,
-        &responses_server_uri,
-        ResourceTestEnvironment::Auto,
-    )
-    .await?;
-
-    let thread_start_id = mcp
-        .send_thread_start_request(ThreadStartParams {
-            model: Some("gpt-5.5".to_string()),
-            environments: Some(Vec::new()),
-            ..Default::default()
-        })
-        .await?;
-    let ThreadStartResponse { thread, .. } =
-        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(thread_start_id)).await??;
-
-    let response_mock = responses::mount_sse_sequence(
-        &responses_server,
-        vec![
-            responses::sse(vec![
-                responses::ev_response_created("resp-skills-read-main"),
-                responses::ev_function_call_with_namespace(
-                    SKILLS_READ_MAIN_CALL_ID,
-                    "skills",
-                    "read",
-                    &json!({
-                        "package": SKILL_RESOURCE_URI,
-                    })
-                    .to_string(),
-                ),
-                responses::ev_completed("resp-skills-read-main"),
-            ]),
-            responses::sse(vec![
-                responses::ev_response_created("resp-skills-list"),
-                responses::ev_function_call_with_namespace(
-                    SKILLS_LIST_CALL_ID,
-                    "skills",
-                    "list",
-                    &json!({
-                        "authority": {
-                            "kind": "orchestrator",
-                        },
-                    })
-                    .to_string(),
-                ),
-                responses::ev_completed("resp-skills-list"),
-            ]),
-            responses::sse(vec![
-                responses::ev_response_created("resp-skills-read"),
-                responses::ev_function_call_with_namespace(
-                    SKILLS_READ_CALL_ID,
-                    "skills",
-                    "read",
-                    &json!({
-                        "package": SKILL_RESOURCE_URI,
-                        "authority": {
-                            "kind": "orchestrator",
-                        },
-                        "resource": SKILL_REFERENCE_URI,
-                    })
-                    .to_string(),
-                ),
-                responses::ev_completed("resp-skills-read"),
-            ]),
-            responses::sse(vec![
-                responses::ev_response_created("resp-skills-read-again"),
-                responses::ev_function_call_with_namespace(
-                    SKILLS_READ_AGAIN_CALL_ID,
-                    "skills",
-                    "read",
-                    &json!({
-                        "package": SKILL_RESOURCE_URI,
-                        "resource": SKILL_REFERENCE_URI,
-                    })
-                    .to_string(),
-                ),
-                responses::ev_completed("resp-skills-read-again"),
-            ]),
-            responses::sse(vec![
-                responses::ev_response_created("resp-orchestrator-skill"),
-                responses::ev_assistant_message("msg-orchestrator-skill", "Done"),
-                responses::ev_completed("resp-orchestrator-skill"),
-            ]),
-            responses::sse(vec![
-                responses::ev_response_created("resp-orchestrator-skill-after-refresh"),
-                responses::ev_assistant_message("msg-orchestrator-skill-after-refresh", "Done"),
-                responses::ev_completed("resp-orchestrator-skill-after-refresh"),
-            ]),
-        ],
-    )
-    .await;
-    let turn_start_id = mcp
-        .send_turn_start_request(TurnStartParams {
-            thread_id: thread.id.clone(),
-            input: vec![UserInput::Text {
-                text: "Use the deployment capability.".to_string(),
-                text_elements: Vec::new(),
-            }],
-            ..Default::default()
-        })
-        .await?;
-    let _: TurnStartResponse =
-        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(turn_start_id)).await??;
-    timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_notification_message("turn/completed"),
-    )
-    .await??;
-
-    let requests = response_mock.requests();
-    assert_eq!(requests.len(), 5);
-    let first_request = &requests[0];
-    assert!(first_request.tool_by_name("skills", "list").is_some());
-    let read_tool = first_request
-        .tool_by_name("skills", "read")
-        .ok_or_else(|| anyhow::anyhow!("skills.read should be available"))?;
-    assert_eq!(read_tool["parameters"]["required"], json!(["package"]));
-    assert!(
-        read_tool["parameters"]["properties"]
-            .get("authority")
-            .is_none()
-    );
-    assert!(first_request.tool_by_name("skills", "search").is_none());
-
-    let developer_messages = first_request.message_input_texts("developer");
-    let catalog_line =
-        format!("- {SKILL_NAME}: {SKILL_DESCRIPTION} (orchestrator package: o0/deploy)");
-    assert!(
-        developer_messages
-            .iter()
-            .any(|text| text.contains("- `o0` = `skill://plugin_demo`"))
-    );
-    assert_eq!(
-        1,
-        developer_messages
-            .iter()
-            .filter(|text| text.contains(&catalog_line))
-            .count()
-    );
-    assert!(
-        developer_messages
-            .iter()
-            .all(|text| !text.contains("ignored-plugin:ignored"))
-    );
-    assert!(
-        developer_messages
-            .iter()
-            .any(|text| text.contains("do not treat `skill://` identifiers as filesystem paths"))
-    );
-    assert!(
-        first_request
-            .message_input_texts("user")
-            .into_iter()
-            .all(|text| !text.starts_with("<skill>"))
-    );
-
-    let main_read_output = requests[1]
-        .function_call_output_text(SKILLS_READ_MAIN_CALL_ID)
-        .ok_or_else(|| anyhow::anyhow!("skills.read output should be sent to the model"))?;
-    assert_eq!(
-        serde_json::from_str::<serde_json::Value>(&main_read_output)?,
-        json!({
-            "resource": SKILL_MAIN_PROMPT_URI,
-            "contents": SKILL_CONTENTS,
-            "next_cursor": null,
-        })
-    );
-
-    let list_output = requests[2]
-        .function_call_output_text(SKILLS_LIST_CALL_ID)
-        .ok_or_else(|| anyhow::anyhow!("skills.list output should be sent to the model"))?;
-    assert_eq!(
-        serde_json::from_str::<serde_json::Value>(&list_output)?,
-        json!({
-            "skills": [{
-                "authority": {
-                    "kind": "orchestrator",
-                },
-                "package": SKILL_RESOURCE_URI,
-                "name": SKILL_NAME,
-                "description": SKILL_DESCRIPTION,
-                "main_resource": SKILL_MAIN_PROMPT_URI,
-            }],
-            "warnings": ["Orchestrator skill discovery stopped after 2 resource pages: failed to list orchestrator skill resources: resources/list failed for `codex_apps`: Mcp error: -32603: simulated later-page failure"],
-            "next_cursor": null,
-        })
-    );
-
-    let read_output = requests[3]
-        .function_call_output_text(SKILLS_READ_CALL_ID)
-        .ok_or_else(|| anyhow::anyhow!("skills.read output should be sent to the model"))?;
-    assert_eq!(
-        serde_json::from_str::<serde_json::Value>(&read_output)?,
-        json!({
-            "resource": SKILL_REFERENCE_URI,
-            "contents": SKILL_REFERENCE_CONTENTS,
-            "next_cursor": null,
-        })
-    );
-    let repeated_read_output = requests[4]
-        .function_call_output_text(SKILLS_READ_AGAIN_CALL_ID)
-        .ok_or_else(|| {
-            anyhow::anyhow!("repeated skills.read output should be sent to the model")
-        })?;
-    assert_eq!(read_output, repeated_read_output);
-    assert_eq!(
-        ResourceAppsMcpCallCounts {
-            list_resources: 3,
-            main_prompt_reads: 1,
-            reference_reads: 1,
-        },
-        apps_server_calls.snapshot()
-    );
-
-    let refresh_request_id = mcp
-        .send_raw_request("config/mcpServer/reload", /*params*/ None)
-        .await?;
-    timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(refresh_request_id)),
-    )
-    .await??;
-
-    let refreshed_turn_start_id = mcp
-        .send_turn_start_request(TurnStartParams {
-            thread_id: thread.id,
-            input: vec![UserInput::Text {
-                text: format!("Use ${SKILL_NAME} after refreshing MCP"),
-                text_elements: Vec::new(),
-            }],
-            ..Default::default()
-        })
-        .await?;
-    let _: TurnStartResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_response(refreshed_turn_start_id),
-    )
-    .await??;
-    timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_notification_message("turn/completed"),
-    )
-    .await??;
-
-    let requests = response_mock.requests();
-    assert_eq!(requests.len(), 6);
-    let skill_fragments = requests[5]
-        .message_input_texts("user")
-        .into_iter()
-        .filter(|text| text.starts_with("<skill>"))
-        .collect::<Vec<_>>();
-    assert_eq!(1, skill_fragments.len());
-    assert!(skill_fragments[0].contains(&format!("<name>{SKILL_NAME}</name>")));
-    assert!(skill_fragments[0].contains(SKILL_MARKER));
-    assert!(skill_fragments[0].contains(SKILL_REFERENCE_URI));
-    assert_eq!(
-        ResourceAppsMcpCallCounts {
-            list_resources: 6,
-            main_prompt_reads: 2,
-            reference_reads: 1,
-        },
-        apps_server_calls.snapshot()
-    );
-    apps_server_handle.abort();
-    let _ = apps_server_handle.await;
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn local_executor_does_not_expose_orchestrator_skills() -> Result<()> {
+async fn local_executor_does_not_expose_cloud_skills() -> Result<()> {
     let responses_server = responses::start_mock_server().await;
     let (apps_server_url, _apps_server_calls, apps_server_handle) =
         start_resource_apps_mcp_server().await?;
@@ -597,8 +365,12 @@ async fn local_executor_does_not_expose_orchestrator_skills() -> Result<()> {
     Ok(())
 }
 
+#[test_case(""; "default_off")]
+#[test_case("[cloud.skills]\nenabled = false"; "explicitly_disabled")]
+#[test_case("[orchestrator.skills]\nenabled = true"; "legacy_setting_ignored")]
+#[test_case("[cloud.skills]\nenabled = true"; "enabled_without_provider")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn disabled_orchestrator_skills_do_not_expose_skills_namespace() -> Result<()> {
+async fn missing_cloud_provider_does_not_expose_skills_namespace(extra_config: &str) -> Result<()> {
     let responses_server = responses::start_mock_server().await;
     let (apps_server_url, apps_server_calls, apps_server_handle) =
         start_resource_apps_mcp_server().await?;
@@ -606,10 +378,7 @@ async fn disabled_orchestrator_skills_do_not_expose_skills_namespace() -> Result
     let (_codex_home, mut mcp) = start_resource_test_app_server_with_extra_config(
         &apps_server_url,
         &responses_server_uri,
-        r#"
-[orchestrator.skills]
-enabled = false
-"#,
+        extra_config,
         ResourceTestEnvironment::Auto,
     )
     .await?;
@@ -721,6 +490,7 @@ apps = true
                 server: "codex_apps".to_string(),
                 uri: TEST_RESOURCE_URI.to_string(),
                 connector_id: None,
+                target: None,
             },
         })
         .await?;
@@ -734,6 +504,7 @@ apps = true
                 server: "codex_apps".to_string(),
                 uri: TEST_ELICITATION_RESOURCE_URI.to_string(),
                 connector_id: None,
+                target: None,
             },
         })
         .await?;
@@ -775,6 +546,7 @@ async fn mcp_resource_read_returns_error_for_unknown_thread() -> Result<()> {
                 server: "codex_apps".to_string(),
                 uri: TEST_RESOURCE_URI.to_string(),
                 connector_id: None,
+                target: None,
             },
         })
         .await;
@@ -899,6 +671,7 @@ async fn metadata_and_mcp_requests_complete_while_unrelated_resume_loads_config(
                         server: "resource_server".to_string(),
                         uri: TEST_RESOURCE_URI.to_string(),
                         connector_id: None,
+                        target: None,
                     },
                 }),
                 sender.request(ClientRequest::McpServerToolCall {
@@ -1258,6 +1031,104 @@ async fn resume_revalidates_persisted_thread_after_config_load(
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resume_reloads_config_when_saved_workspace_roots_change() -> Result<()> {
+    let responses_server = create_mock_responses_server_repeating_assistant("Ready").await;
+    let codex_home = TempDir::new()?;
+    MockResponsesConfig::new(&responses_server.uri()).write(codex_home.path())?;
+    let filename_timestamp = "2025-01-05T12-00-00";
+    let thread_id = create_fake_rollout(
+        codex_home.path(),
+        filename_timestamp,
+        "2025-01-05T12:00:00Z",
+        "Saved user message",
+        Some("mock_provider"),
+        /*git_info*/ None,
+    )?;
+    let path = rollout_path(codex_home.path(), filename_timestamp, &thread_id);
+    let resume_cwd = TempDir::new()?;
+    let saved_workspace = TempDir::new()?;
+    let cwd = AbsolutePathBuf::from_absolute_path(resume_cwd.path())?;
+    let saved_root = AbsolutePathBuf::from_absolute_path(saved_workspace.path())?;
+    let settings: ThreadSettingsAppliedEvent = serde_json::from_value(json!({
+        "thread_id": thread_id,
+        "thread_settings": {
+            "model": "gpt-5.4",
+            "model_provider_id": "mock_provider",
+            "cwd": cwd,
+            "runtime_workspace_roots": [saved_root],
+            "approval_policy": "never",
+            "approvals_reviewer": "user",
+            "permission_profile": PermissionProfile::read_only(),
+            "collaboration_mode": { "mode": "default", "settings": { "model": "gpt-5.4" } },
+        },
+    }))?;
+    append_rollout_item_to_path(
+        &path,
+        &RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(settings.clone())),
+    )
+    .await?;
+
+    let blocked_resume = Arc::new(BlockedResumeConfig {
+        cwd: cwd.clone(),
+        matching_loads: AtomicUsize::new(0),
+        entered: Notify::new(),
+        release: Notify::new(),
+    });
+    let client =
+        start_resource_in_process_client(codex_home.path(), blocked_resume.clone()).await?;
+    let sender = client.sender();
+    let mut resume = pin!(sender.request(ClientRequest::ThreadResume {
+        request_id: RequestId::Integer(1),
+        params: ThreadResumeParams {
+            thread_id: thread_id.clone(),
+            cwd: Some(cwd.to_string_lossy().into_owned()),
+            ..Default::default()
+        },
+    }));
+    assert!(poll!(&mut resume).is_pending());
+    let update_result = async {
+        timeout(DEFAULT_READ_TIMEOUT, blocked_resume.entered.notified())
+            .await
+            .context("resume did not enter config loading")?;
+        let mut cleared = settings;
+        cleared.thread_settings.runtime_workspace_roots = Some(Vec::new());
+        append_rollout_item_to_path(
+            &path,
+            &RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(cleared)),
+        )
+        .await?;
+        anyhow::Ok(())
+    }
+    .await;
+    blocked_resume.release.notify_one();
+    update_result?;
+    let resumed: ThreadResumeResponse = serde_json::from_value(
+        timeout(DEFAULT_READ_TIMEOUT, &mut resume)
+            .await??
+            .expect("resume updated thread"),
+    )?;
+    let (items, _, _) = RolloutRecorder::load_rollout_items(&path).await?;
+    client.shutdown().await?;
+
+    assert_eq!(resumed.runtime_workspace_roots, Vec::new());
+    assert!(
+        blocked_resume.matching_loads.load(Ordering::Relaxed) >= 2,
+        "roots-only updates must reload config"
+    );
+    let expected_thread_id = ThreadId::from_string(&thread_id)?;
+    let latest_roots = items.into_iter().rev().find_map(|item| match item {
+        RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(event))
+            if event.thread_id == Some(expected_thread_id) =>
+        {
+            Some(event.thread_settings.runtime_workspace_roots)
+        }
+        _ => None,
+    });
+    assert_eq!(latest_roots, Some(Some(Vec::new())));
+    Ok(())
+}
+
 async fn complete_in_process_turn(
     client: &mut in_process::InProcessClientHandle,
     request_id: RequestId,
@@ -1345,6 +1216,7 @@ async fn start_resource_in_process_client(
         loader_overrides,
         strict_config: false,
         cloud_config_bundle: CloudConfigBundleLoader::default(),
+        embedded_network_policy: Default::default(),
         thread_config_loader,
         feedback: CodexFeedback::new(),
         log_db: None,
@@ -1377,7 +1249,7 @@ pub(super) async fn start_resource_test_app_server(
     start_resource_test_app_server_with_extra_config(
         apps_server_url,
         responses_server_uri,
-        "",
+        "[cloud.skills]\nenabled = true",
         environment,
     )
     .await
@@ -1471,6 +1343,7 @@ fn expected_resource_read_response() -> McpResourceReadResponse {
 
 #[derive(Debug, Default)]
 pub(super) struct ResourceAppsMcpCalls {
+    read_metadata: Mutex<Vec<serde_json::Map<String, serde_json::Value>>>,
     list_resources: AtomicUsize,
     main_prompt_reads: AtomicUsize,
     reference_reads: AtomicUsize,
@@ -1617,6 +1490,11 @@ impl ServerHandler for ResourceAppsMcpServer {
         request: ReadResourceRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<rmcp::model::ReadResourceResponse, rmcp::ErrorData> {
+        self.calls
+            .read_metadata
+            .lock()
+            .expect("read metadata lock")
+            .push(context.meta.0.0.clone());
         let uri = request.uri;
         if uri == TEST_ERROR_RESOURCE_URI {
             return Err(rmcp::ErrorData::new(

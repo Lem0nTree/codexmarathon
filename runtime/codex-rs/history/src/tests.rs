@@ -1,10 +1,135 @@
 use anyhow::Result;
 use codex_protocol::models::ConfigurationReasoning;
 use codex_protocol::openai_models::ReasoningEffort;
+use codex_protocol::protocol::ThreadSettingsSnapshot;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 
 use super::*;
+
+fn thread_settings_snapshot(disabled_plugin_ids: Vec<String>) -> Result<ThreadSettingsSnapshot> {
+    Ok(serde_json::from_value(json!({
+        "model": "gpt-5",
+        "model_provider_id": "openai",
+        "approval_policy": "never",
+        "approvals_reviewer": "user",
+        "permission_profile": codex_protocol::models::PermissionProfile::read_only(),
+        "cwd": std::env::current_dir()?,
+        "collaboration_mode": {
+            "mode": "default",
+            "settings": {
+                "model": "gpt-5",
+                "reasoning_effort": null,
+                "developer_instructions": null
+            }
+        },
+        "disabled_plugin_ids": disabled_plugin_ids
+    }))?)
+}
+
+#[test]
+fn latest_disabled_plugin_ids_preserves_owned_updates_and_clears() -> Result<()> {
+    let thread_id = ThreadId::new();
+    let ancestor_id = ThreadId::new();
+    let selected = thread_settings_snapshot(vec!["example@marketplace".to_string()])?;
+    let cleared = thread_settings_snapshot(Vec::new())?;
+    let item = |thread_id, thread_settings| {
+        RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(
+            codex_protocol::protocol::ThreadSettingsAppliedEvent {
+                thread_id,
+                thread_settings,
+            },
+        ))
+    };
+    let foreign_items = vec![
+        item(Some(ancestor_id), selected.clone()),
+        item(/*thread_id*/ None, selected.clone()),
+    ];
+    assert_eq!(latest_disabled_plugin_ids(&foreign_items, thread_id), None);
+
+    let mut history = vec![item(Some(thread_id), selected.clone())];
+    history.extend(foreign_items.clone());
+    assert_eq!(
+        latest_disabled_plugin_ids(&history, thread_id),
+        Some(selected.disabled_plugin_ids.as_slice())
+    );
+
+    history.push(item(Some(thread_id), cleared.clone()));
+    history.extend(foreign_items);
+    history.push(turn_context_with_disabled_plugins(Some(
+        selected.disabled_plugin_ids,
+    ))?);
+    assert_eq!(
+        latest_disabled_plugin_ids(&history, thread_id),
+        Some(cleared.disabled_plugin_ids.as_slice())
+    );
+    Ok(())
+}
+
+fn turn_context_with_disabled_plugins(
+    disabled_plugin_ids: Option<Vec<String>>,
+) -> Result<RolloutItem> {
+    let mut context: TurnContextItem = serde_json::from_value(json!({
+        "cwd": std::env::current_dir()?,
+        "approval_policy": "never",
+        "sandbox_policy": { "type": "danger-full-access" },
+        "model": "gpt-5",
+        "summary": "auto"
+    }))?;
+    context.disabled_plugin_ids = disabled_plugin_ids;
+    Ok(RolloutItem::TurnContext(context))
+}
+
+#[test]
+fn latest_disabled_plugin_ids_falls_back_only_to_latest_turn_context() -> Result<()> {
+    let thread_id = ThreadId::new();
+    let selected = vec!["example@marketplace".to_string()];
+    let mut history = vec![turn_context_with_disabled_plugins(Some(selected.clone()))?];
+    assert_eq!(
+        latest_disabled_plugin_ids(&history, thread_id),
+        Some(selected.as_slice())
+    );
+
+    history.push(RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(
+        codex_protocol::protocol::ThreadSettingsAppliedEvent {
+            thread_id: Some(ThreadId::new()),
+            thread_settings: thread_settings_snapshot(Vec::new())?,
+        },
+    )));
+    assert_eq!(
+        latest_disabled_plugin_ids(&history, thread_id),
+        Some(selected.as_slice())
+    );
+
+    let cleared = Vec::new();
+    history.push(turn_context_with_disabled_plugins(Some(cleared.clone()))?);
+    assert_eq!(
+        latest_disabled_plugin_ids(&history, thread_id),
+        Some(cleared.as_slice())
+    );
+
+    history.push(turn_context_with_disabled_plugins(
+        /*disabled_plugin_ids*/ None,
+    )?);
+    assert_eq!(latest_disabled_plugin_ids(&history, thread_id), None);
+    Ok(())
+}
+
+#[test]
+fn older_thread_settings_snapshot_defaults_disabled_plugins_to_empty() -> Result<()> {
+    let expected = thread_settings_snapshot(Vec::new())?;
+    let mut legacy = serde_json::to_value(&expected)?;
+    legacy
+        .as_object_mut()
+        .unwrap()
+        .remove("disabled_plugin_ids");
+
+    assert_eq!(
+        serde_json::from_value::<ThreadSettingsSnapshot>(legacy)?,
+        expected
+    );
+    Ok(())
+}
 
 #[test]
 fn response_item_envelope_accessors_preserve_item() {
@@ -34,6 +159,74 @@ fn response_item_envelope_accessors_preserve_item() {
     *envelope = replacement_item.clone();
 
     assert_eq!(envelope.into_item(), replacement_item);
+}
+
+#[test]
+fn mcp_checkpoint_handles_missing_or_unknown_identity() -> Result<()> {
+    let metadata: CodexHarnessMetadata = serde_json::from_value(json!({}))?;
+    assert_eq!(metadata.mcp_attribution, None);
+
+    let restored: CodexHarnessMetadata = serde_json::from_value(json!({
+        "mcp_attribution": {
+            "status": "complete",
+            "sources": [{
+                "server_name": "example",
+                "tool_name": "search",
+                "first_turn_id": "turn_1",
+                "future_identity": "unknown to this reader"
+            }]
+        }
+    }))?;
+    assert_eq!(
+        restored.mcp_attribution,
+        Some(McpAttribution {
+            status: McpAttributionStatus::AttributionError,
+            error_reason: None,
+            sources: Vec::new(),
+        })
+    );
+    Ok(())
+}
+
+#[test]
+fn mcp_error_diagnostics_do_not_invalidate_checkpoints() -> Result<()> {
+    let metadata = CodexHarnessMetadata {
+        mcp_attribution: Some(McpAttribution {
+            status: McpAttributionStatus::AttributionError,
+            error_reason: Some(
+                codex_protocol::mcp::McpAttributionErrorReason::HistoryMissingCheckpoint,
+            ),
+            sources: Vec::new(),
+        }),
+        ..Default::default()
+    };
+    for (reason, expected_reason) in [
+        (None, None),
+        (
+            Some(json!("future_reason")),
+            Some(codex_protocol::mcp::McpAttributionErrorReason::Unknown),
+        ),
+        (Some(json!({"invalid": true})), None),
+    ] {
+        let mut serialized = serde_json::to_value(&metadata)?;
+        let attribution = serialized["mcp_attribution"]
+            .as_object_mut()
+            .expect("attribution object");
+        if let Some(reason) = reason {
+            attribution.insert("error_reason".to_string(), reason);
+        } else {
+            attribution.remove("error_reason");
+        }
+        let restored: CodexHarnessMetadata = serde_json::from_value(serialized)?;
+        let mut expected = metadata.clone();
+        expected
+            .mcp_attribution
+            .as_mut()
+            .expect("attribution checkpoint")
+            .error_reason = expected_reason;
+        assert_eq!(restored, expected);
+    }
+    Ok(())
 }
 
 #[test]
@@ -68,6 +261,87 @@ fn response_item_rollout_line_preserves_shape() -> Result<()> {
 }
 
 #[test]
+fn delivered_assistant_rollout_survives_an_earlier_read_and_rewrite() -> Result<()> {
+    #[derive(serde::Serialize, serde::Deserialize)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    enum EarlierRolloutItem {
+        ResponseItem {
+            payload: ResponseItem,
+            metadata: CodexHarnessMetadata,
+        },
+    }
+
+    for complete in [true, false] {
+        let original = RetainedContextEvent::DeliveredAssistantMessage {
+            message: RetainedUserMessage {
+                origin: crate::UserInputOrigin::User,
+                turn_id: "root-turn".to_owned(),
+                message_id: Some("code-cell:message".to_owned()),
+                text: "May I deploy staging?".to_owned(),
+                complete,
+                phase: None,
+            },
+            acceptance_order: 7,
+        };
+        let wire = serde_json::to_value(RolloutItem::RetainedContext(original.clone()))?;
+        let earlier = serde_json::from_value::<EarlierRolloutItem>(wire)?;
+        let EarlierRolloutItem::ResponseItem { payload, metadata } = &earlier;
+        let ResponseItem::Message {
+            role,
+            content,
+            phase,
+            ..
+        } = payload
+        else {
+            panic!("older readers need an assistant message");
+        };
+        assert_eq!(role, "assistant");
+        // The preceding client's Guardian projection excludes commentary.
+        assert_eq!(phase, &None);
+        assert_eq!(metadata.user_input_order, Some(7));
+        let [ContentItem::OutputText { text }] = content.as_slice() else {
+            panic!("older readers need plain assistant text");
+        };
+        if complete {
+            assert_eq!(text, "May I deploy staging?");
+        } else {
+            assert!(!text.contains("deploy staging"));
+            assert!(text.contains("unavailable"));
+        }
+        let mut earlier_checkpoint = RetainedContext::default();
+        earlier_checkpoint.record_assistant_message(
+            RetainedUserMessage {
+                origin: crate::UserInputOrigin::User,
+                turn_id: payload.turn_id().unwrap().to_owned(),
+                message_id: payload.id().map(ToString::to_string),
+                text: text.clone(),
+                complete: true,
+                phase: None,
+            },
+            RetainedInputSource::Local(metadata.user_input_order),
+        );
+        let rewritten_checkpoint =
+            serde_json::from_value(serde_json::to_value(earlier_checkpoint)?)?;
+        let mut restored_checkpoint = RetainedContext::default();
+        restored_checkpoint.restore(Some(&rewritten_checkpoint), &[]);
+        let preserved = restored_checkpoint
+            .ordered_entries()
+            .find_map(|(_, entry)| match entry {
+                RetainedContextEntry::AssistantMessage(message) => Some(message.text.as_str()),
+                _ => None,
+            });
+        assert_eq!(preserved, Some(text.as_str()));
+
+        let rewritten = serde_json::to_value(earlier)?;
+        let RolloutItem::RetainedContext(restored) = serde_json::from_value(rewritten)? else {
+            panic!("new readers need the model-invisible delivery event");
+        };
+        assert_eq!(restored, original);
+    }
+    Ok(())
+}
+
+#[test]
 /// Keeps harness metadata beside, rather than inside, response-item payloads.
 fn response_item_envelope_stores_metadata_beside_rollout_payload() -> Result<()> {
     let response_item = response_message("developer");
@@ -78,7 +352,7 @@ fn response_item_envelope_stores_metadata_beside_rollout_payload() -> Result<()>
             item: response_item.clone(),
             metadata: Some(CodexHarnessMetadata {
                 client_authored: true,
-                fallback_token_limit_override: Some(20_000),
+                history_truncation_token_limit: Some(20_000),
                 inherited_user_message: true,
                 ..Default::default()
             }),
@@ -110,7 +384,7 @@ fn response_item_envelope_stores_metadata_beside_rollout_payload() -> Result<()>
         envelope.metadata,
         Some(CodexHarnessMetadata {
             client_authored: true,
-            fallback_token_limit_override: Some(20_000),
+            history_truncation_token_limit: Some(20_000),
             inherited_user_message: true,
             ..Default::default()
         })
@@ -263,6 +537,7 @@ fn compacted_replacement_history_stores_metadata_in_an_aligned_sidecar() -> Resu
         window_id: None,
         compaction_response_id: None,
         latest_token_usage_record: None,
+        resume_metadata: None,
     };
 
     let serialized = serde_json::to_value(item)?;
@@ -297,6 +572,34 @@ fn compacted_replacement_history_stores_metadata_in_an_aligned_sidecar() -> Resu
             },
         ])
     );
+    Ok(())
+}
+
+#[test]
+fn compacted_resume_metadata_presence_round_trips_empty_values() -> Result<()> {
+    let resume_metadata = CompactionResumeMetadata {
+        multi_agent_version: None,
+        last_started_turn_id: None,
+        previous_turn_settings: None,
+    };
+    let item = CompactedItem {
+        message: "summary".to_string(),
+        replacement_history: None,
+        retained_context: None,
+        guardian_history: None,
+        mcp_resource_origins: None,
+        window_number: None,
+        first_window_id: None,
+        previous_window_id: None,
+        window_id: None,
+        compaction_response_id: None,
+        latest_token_usage_record: None,
+        resume_metadata: Some(resume_metadata.clone()),
+    };
+
+    let serialized = serde_json::to_value(&item)?;
+    assert_eq!(serialized["resume_metadata"], json!(resume_metadata));
+    assert_eq!(serde_json::from_value::<CompactedItem>(serialized)?, item);
     Ok(())
 }
 
@@ -361,7 +664,17 @@ fn compacted_metadata_remains_compatible_with_legacy_response_item_readers() -> 
     };
     assert_eq!(*legacy_response, response_item);
 
-    let checkpoint = crate::GuardianHistoryCheckpoint(vec![response_item.clone()]);
+    let checkpoint = crate::GuardianHistoryCheckpoint(vec![envelope.clone()]);
+    assert_eq!(
+        serde_json::from_value::<Vec<ResponseItem>>(serde_json::to_value(&checkpoint)?)?,
+        vec![response_item.clone()],
+    );
+    assert_eq!(
+        serde_json::from_value::<crate::GuardianHistoryCheckpoint>(serde_json::to_value(vec![
+            response_item.clone()
+        ])?)?,
+        crate::GuardianHistoryCheckpoint(vec![response_item.clone().into()]),
+    );
     let compacted_line = serde_json::to_value(RolloutItem::Compacted(CompactedItem {
         message: "summary".to_string(),
         replacement_history: Some(vec![envelope]),
@@ -374,6 +687,11 @@ fn compacted_metadata_remains_compatible_with_legacy_response_item_readers() -> 
         window_id: None,
         compaction_response_id: None,
         latest_token_usage_record: None,
+        resume_metadata: Some(CompactionResumeMetadata {
+            multi_agent_version: Some(MultiAgentVersion::V2),
+            last_started_turn_id: Some("turn-1".to_string()),
+            previous_turn_settings: None,
+        }),
     }))?;
 
     let restored: RolloutItem = serde_json::from_value(compacted_line.clone())?;
@@ -582,6 +900,7 @@ fn compacted_item_serializes_window_number_and_id() -> Result<()> {
         window_id: Some("019b3f6e-7a10-7cc3-8b6e-1d09e2f7a001".to_string()),
         compaction_response_id: None,
         latest_token_usage_record: None,
+        resume_metadata: None,
     };
 
     assert_eq!(
@@ -621,6 +940,7 @@ fn compacted_item_migrates_legacy_numeric_window_id() -> Result<()> {
             window_id: None,
             compaction_response_id: None,
             latest_token_usage_record: None,
+            resume_metadata: None,
         }
     );
     Ok(())
@@ -698,6 +1018,22 @@ fn multi_agent_version_uses_newest_present_session_meta_value() -> Result<()> {
             ],
             Some(thread_id),
         ),
+        Some(MultiAgentVersion::V2)
+    );
+    Ok(())
+}
+
+#[test]
+fn multi_agent_version_uses_compaction_metadata_without_turn_context() -> Result<()> {
+    let compacted = serde_json::from_value::<CompactedItem>(json!({
+        "message": "summary",
+        "replacement_history": [],
+        "window_number": 1,
+        "resume_metadata": {"multi_agent_version": "v2"}
+    }))?;
+
+    assert_eq!(
+        InitialHistory::Forked(vec![RolloutItem::Compacted(compacted)]).get_multi_agent_version(),
         Some(MultiAgentVersion::V2)
     );
     Ok(())

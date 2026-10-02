@@ -2,7 +2,9 @@
 
 use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::models::BaseInstructionsProvenance;
+#[cfg(test)]
 use codex_protocol::models::ResponseItem;
+use codex_protocol::openai_models::ReasoningEffort;
 use codex_sandboxing::policy_transforms::merge_permission_profiles;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -16,8 +18,8 @@ use crate::context_manager::ContextManager;
 use crate::context_manager::HistoryReplacement;
 use crate::session::PreviousTurnSettings;
 use crate::session::session::SessionConfiguration;
+use crate::session::startup_prewarm::SessionStartupPrewarmHandle;
 use crate::session::time_reminder::CurrentTimeReminderState;
-use crate::session_startup_prewarm::SessionStartupPrewarmHandle;
 use codex_history::ResponseItemEnvelope;
 use codex_protocol::SessionId;
 use codex_protocol::ThreadId;
@@ -26,15 +28,53 @@ use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::TokenUsageInfo;
 use codex_protocol::protocol::TokenUsageRecord;
 use codex_protocol::protocol::TurnContextItem;
-use codex_utils_output_truncation::TruncationPolicy;
+use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
+
+/// Runtime request effort, initially unset and established by prewarm or sampling.
+/// Successful compaction allows a fresh baseline without an override.
+pub(crate) enum ReasoningEffortPin {
+    Unset,
+    Compacted,
+    Active {
+        model: String,
+        effort: ReasoningEffort,
+    },
+}
+
+impl ReasoningEffortPin {
+    pub(crate) fn get(&self, model: &str) -> Option<ReasoningEffort> {
+        match self {
+            Self::Active {
+                model: pinned_model,
+                effort,
+            } if pinned_model == model => Some(effort.clone()),
+            Self::Unset | Self::Compacted | Self::Active { .. } => None,
+        }
+    }
+
+    pub(crate) fn pin(&mut self, model: &str, effort: ReasoningEffort) -> ReasoningEffort {
+        if let Some(pinned) = self.get(model) {
+            return pinned;
+        }
+        *self = Self::Active {
+            model: model.to_owned(),
+            effort: effort.clone(),
+        };
+        effort
+    }
+}
 
 /// Persistent, session-scoped state previously stored directly on `Session`.
 pub(crate) struct SessionState {
     pub(crate) session_configuration: SessionConfiguration,
+    /// Plugin selection of the last admitted task; settings updates take effect on the next task.
+    pub(crate) active_disabled_plugin_ids: Vec<String>,
     /// Persisted origin of the session base instructions, when known.
     pub(crate) base_instructions_provenance: Option<BaseInstructionsProvenance>,
     pub(crate) history: ContextManager,
+    /// Cancels work bound to discarded history or a superseded Guardian evidence policy.
+    pub(crate) history_reset: CancellationToken,
     pub(crate) latest_rate_limits: Option<RateLimitSnapshot>,
     pub(crate) latest_token_usage_record: Option<TokenUsageRecord>,
     pub(crate) server_reasoning_included: bool,
@@ -44,9 +84,16 @@ pub(crate) struct SessionState {
     /// model/realtime handling on subsequent regular turns (including full-context
     /// reinjection after resume or `/compact`).
     previous_turn_settings: Option<PreviousTurnSettings>,
+    /// Latest task admitted in this runtime, retained across completion and history edits.
+    /// Cleared by standalone settings changes to invalidate pending continuation.
+    pub(crate) last_started_turn_id: Option<String>,
     /// Runtime accounting state for the active auto-compaction window.
     auto_compact_window: AutoCompactWindow,
-    /// Startup prewarmed session prepared during session initialization.
+    /// Original request effort for the current model while configuration updates remain active.
+    pub(crate) reasoning_effort_pin: ReasoningEffortPin,
+    /// Set under the state lock before shutdown takes the last warmup handle.
+    pub(crate) shutting_down: bool,
+    /// Background model warmup scheduled at startup or while resuming an idle thread.
     pub(crate) startup_prewarm: Option<SessionStartupPrewarmHandle>,
     /// Retained after completion so later turns do not repeat speculative captures.
     pub(crate) shell_snapshot_prewarm: Option<AbortOnDropHandle<()>>,
@@ -74,16 +121,21 @@ impl SessionState {
         history: ContextManager,
     ) -> Self {
         Self {
+            active_disabled_plugin_ids: Vec::new(),
             session_configuration,
             base_instructions_provenance: None,
             history,
+            history_reset: CancellationToken::new(),
             latest_rate_limits: None,
             latest_token_usage_record: None,
             server_reasoning_included: false,
             mcp_dependency_prompted: HashSet::new(),
             additional_context: AdditionalContextStore::default(),
             previous_turn_settings: None,
+            last_started_turn_id: None,
             auto_compact_window: AutoCompactWindow::new_with_ids(auto_compact_window_ids),
+            reasoning_effort_pin: ReasoningEffortPin::Unset,
+            shutting_down: false,
             startup_prewarm: None,
             shell_snapshot_prewarm: None,
             current_time_reminder: CurrentTimeReminderState::default(),
@@ -92,15 +144,6 @@ impl SessionState {
             granted_permissions_by_environment_id: HashMap::new(),
             next_turn_is_first: true,
         }
-    }
-
-    // History helpers
-    pub(crate) fn record_items<I>(&mut self, items: I, policy: TruncationPolicy)
-    where
-        I: IntoIterator,
-        I::Item: std::ops::Deref<Target = ResponseItem>,
-    {
-        self.history.record_items(items, policy);
     }
 
     pub(crate) fn previous_turn_settings(&self) -> Option<PreviousTurnSettings> {
@@ -133,10 +176,11 @@ impl SessionState {
         items: Vec<ResponseItem>,
         reference_context_item: Option<TurnContextItem>,
     ) {
-        self.history.replace(items);
-        self.history
-            .set_reference_context_item(reference_context_item);
-        self.auto_compact_window.clear_prefill();
+        self.replace_annotated_history(
+            items.into_iter().map(ResponseItemEnvelope::new).collect(),
+            reference_context_item,
+            HistoryReplacement::Reset,
+        );
     }
 
     pub(crate) fn replace_annotated_history(
@@ -145,9 +189,19 @@ impl SessionState {
         reference_context_item: Option<TurnContextItem>,
         replacement: HistoryReplacement,
     ) {
-        match replacement {
-            HistoryReplacement::Compaction => self.history.replace_compacted(items),
-            HistoryReplacement::Reset => self.history.replace_annotated(items),
+        let invalidate_reviews = match replacement {
+            HistoryReplacement::Compaction {
+                reviewer_compaction_hash,
+            } => self
+                .history
+                .replace_compacted(items, reviewer_compaction_hash.as_deref()),
+            HistoryReplacement::Reset => {
+                self.history.replace_annotated(items);
+                true
+            }
+        };
+        if invalidate_reviews {
+            std::mem::take(&mut self.history_reset).cancel();
         }
         self.history
             .set_reference_context_item(reference_context_item);

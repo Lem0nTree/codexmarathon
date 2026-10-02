@@ -1,8 +1,8 @@
 //! Structured transcript evidence shared by synchronous and asynchronous Guardian.
 //!
 //! Entry kinds preserve source attribution for consumer-specific retention and
-//! rendering. Text is bounded during collection, with its original size retained
-//! for truncation accounting.
+//! rendering. User text and manual approvals stay complete for admission; other text is
+//! capped during collection, with its original size retained for accounting.
 
 /// Semantic role of one parent-conversation transcript entry.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -40,13 +40,38 @@ impl ConversationTranscriptEntryKind {
     }
 }
 
-/// Structured text evidence shared by sync Guardian and async scoring.
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// Text or an opaque native message that only the backend can decode.
+#[derive(Clone, PartialEq)]
+pub enum TranscriptContent {
+    Text(String),
+    AgentMessage(Box<codex_protocol::models::ResponseItem>),
+}
+
+impl std::fmt::Debug for TranscriptContent {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Text(_) => "Text(..)",
+            Self::AgentMessage(_) => "AgentMessage(..)",
+        })
+    }
+}
+
+/// Structured evidence shared by sync Guardian and async scoring.
+#[derive(Clone, Debug, PartialEq)]
 pub struct ConversationTranscriptEntry {
     /// Semantic role used for consumer-specific retention and truncation.
     pub kind: ConversationTranscriptEntryKind,
-    /// Text bounded by the current request's per-entry limits.
-    pub text: String,
+    /// Complete authorization evidence, or other text bounded by per-entry limits.
+    pub content: TranscriptContent,
     /// Size before truncation, retained for omission and truncation accounting.
     pub original_bytes: usize,
+    /// Original source revision and display order, established from host metadata.
+    pub retained_source: Option<RetainedTranscriptSource>,
+}
+
+/// Display ordering is separate from source identity and cannot establish delivery.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RetainedTranscriptSource {
+    pub order: String,
+    pub source: codex_history::RetainedSource,
 }

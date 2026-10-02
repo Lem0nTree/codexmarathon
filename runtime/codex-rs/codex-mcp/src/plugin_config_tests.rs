@@ -535,7 +535,9 @@ fn stdio_server(
         environment_id: environment_id.to_string(),
         enabled: true,
         required: false,
+        startup_readiness: Default::default(),
         supports_parallel_tool_calls: false,
+        tool_input_schema_max_bytes: None,
         omit_tools_from: None,
         disabled_reason: None,
         startup_timeout_sec: None,
@@ -571,7 +573,9 @@ fn declared_placement_preserves_local_plugin_normalization() {
         environment_id: DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string(),
         enabled: true,
         required: false,
+        startup_readiness: Default::default(),
         supports_parallel_tool_calls: false,
+        tool_input_schema_max_bytes: None,
         omit_tools_from: None,
         disabled_reason: None,
         startup_timeout_sec: None,
@@ -582,8 +586,10 @@ fn declared_placement_preserves_local_plugin_normalization() {
         scopes: None,
         oauth: Some(McpServerOAuthConfig {
             client_id: Some("client-id".to_string()),
+            client_secret: Some("plugin-client-secret".into()),
             callback_url: Some("http://127.0.0.1/callback/registered".to_string()),
             callback_port: Some(9876),
+            ..Default::default()
         }),
         oauth_resource: None,
         tools: HashMap::new(),
@@ -612,7 +618,7 @@ fn declared_placement_preserves_local_plugin_normalization() {
             "hosted": {
                 "type": "http",
                 "url": "https://example.com/mcp",
-                "oauth": {"clientId": "client-id", "callbackUrl": "http://127.0.0.1/callback/registered", "callbackPort": 9876}
+                "oauth": {"clientId": "client-id", "clientSecret": "plugin-client-secret", "callbackUrl": "http://127.0.0.1/callback/registered", "callbackPort": 9876}
             },
             "helper": {"type":"http","url":"https://example.com/mcp","http_headers_helper":"./auth.sh"}
         }"#,
@@ -630,6 +636,33 @@ fn declared_placement_preserves_local_plugin_normalization() {
             errors: Vec::new(),
         }
     );
+}
+
+#[test]
+fn native_plugin_mcp_cannot_self_declare_ema_auth() {
+    let server = serde_json::json!({
+        "type": "http",
+        "url": "https://resource.example/mcp",
+        "auth": "ema_auth"
+    });
+    for contents in [
+        serde_json::json!({"enterprise": server}),
+        serde_json::json!({"mcpServers": {"enterprise": server}}),
+    ] {
+        let outcome = parse_plugin_mcp_config(&plugin_root(), &contents.to_string())
+            .expect("parse plugin MCP config");
+
+        assert_eq!(
+            outcome,
+            PluginMcpConfigParseOutcome {
+                servers: BTreeMap::new(),
+                errors: vec![PluginMcpServerParseError {
+                    name: "enterprise".to_string(),
+                    message: "plugin MCP declarations cannot select ema_auth; configure enterprise authentication in host policy".to_string(),
+                }],
+            }
+        );
+    }
 }
 
 #[test]
@@ -862,7 +895,9 @@ fn local_environment_placement_preserves_http_env_references() {
                     environment_id: DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string(),
                     enabled: true,
                     required: false,
+                    startup_readiness: Default::default(),
                     supports_parallel_tool_calls: false,
+                    tool_input_schema_max_bytes: None,
                     omit_tools_from: None,
                     disabled_reason: None,
                     startup_timeout_sec: None,

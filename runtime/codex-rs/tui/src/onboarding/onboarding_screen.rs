@@ -3,7 +3,7 @@
 //! The onboarding flow is a small state machine over visible steps
 //! (welcome/auth/trust). This module decides which step receives key/paste
 //! events and enforces flow-level safety rules that cut across individual step
-//! widgets.
+//! widgets. Folder-entry consent reuses this same event loop for startup and in-app navigation.
 //!
 //! In particular, onboarding quit handling has a text-entry guard for API-key
 //! input: the printable `q` quit key is treated as text input while the user is
@@ -18,8 +18,6 @@ use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ServerNotification;
 use codex_exec_server::LOCAL_FS;
 use codex_git_utils::resolve_root_git_project_for_trust;
-#[cfg(target_os = "windows")]
-use codex_protocol::config_types::WindowsSandboxLevel;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use crossterm::event::KeyEventKind;
@@ -35,10 +33,13 @@ use codex_protocol::config_types::ForcedLoginMethod;
 
 use crate::LoginStatus;
 use crate::app_server_session::AppServerSession;
+use crate::clipboard_copy::CopyFormat;
+use crate::clipboard_copy::CopyStatus;
 use crate::config_update::RemoteProjectTrust;
 use crate::config_update::format_config_error;
 use crate::config_update::replace_config_value;
 use crate::config_update::write_trusted_project;
+use crate::empty_state_animation::Presentation;
 use crate::key_hint::KeyBindingListExt;
 use crate::legacy_core::config::Config;
 use crate::onboarding::auth::AuthModeWidget;
@@ -49,6 +50,7 @@ use crate::onboarding::trust_directory::TrustDirectorySelection;
 use crate::onboarding::trust_directory::TrustDirectoryWidget;
 use crate::onboarding::welcome::WelcomeWidget;
 use crate::tui::FrameRequester;
+use crate::tui::OverlayInput;
 use crate::tui::Tui;
 use crate::tui::TuiEvent;
 use color_eyre::eyre::Result;
@@ -56,6 +58,11 @@ use color_eyre::eyre::WrapErr;
 use std::sync::Arc;
 use std::sync::RwLock;
 use uuid::Uuid;
+
+#[path = "directory_trust.rs"]
+mod directory_trust;
+pub(crate) use directory_trust::DirectoryTrustOptions;
+pub(crate) use directory_trust::check_directory_trust;
 
 #[allow(clippy::large_enum_variant)]
 enum Step {
@@ -94,10 +101,12 @@ pub(crate) struct OnboardingScreenArgs {
     pub show_login_screen: bool,
     pub bedrock_setup_enabled: bool,
     pub login_status: LoginStatus,
+    pub app_server_target: crate::AppServerTarget,
     pub app_server_request_handle: Option<AppServerRequestHandle>,
     pub config: Config,
 }
 
+#[derive(Default)]
 pub(crate) struct OnboardingResult {
     pub directory_trust_persisted: bool,
     pub should_exit: bool,
@@ -119,6 +128,7 @@ impl OnboardingScreen {
             show_login_screen,
             bedrock_setup_enabled,
             login_status,
+            app_server_target,
             app_server_request_handle,
             config,
         } = args;
@@ -132,8 +142,24 @@ impl OnboardingScreen {
         steps.push(Step::Welcome(WelcomeWidget::new(
             !matches!(login_status, LoginStatus::NotAuthenticated),
             tui.frame_requester(),
-            local_settings.tui.animations,
+            local_settings.tui.animations && local_settings.tui.effects.welcome,
         )));
+        #[cfg(target_os = "windows")]
+        let show_windows_create_sandbox_hint = if show_trust_screen
+            && remote_project_trust.is_none()
+            && let Some(handle) = &app_server_request_handle
+        {
+            crate::windows_sandbox::WindowsSandboxConfig::read(
+                handle.clone(),
+                config.cwd.display().to_string(),
+            )
+            .await
+            .is_ok_and(|state| !state.is_enabled())
+        } else {
+            false
+        };
+        #[cfg(not(target_os = "windows"))]
+        let show_windows_create_sandbox_hint = false;
         if show_login_screen {
             let highlighted_mode =
                 if auth_config.is_login_method_allowed(ForcedLoginMethod::Chatgpt) {
@@ -148,25 +174,24 @@ impl OnboardingScreen {
                     error: Arc::new(RwLock::new(None)),
                     sign_in_state: Arc::new(RwLock::new(SignInState::PickMode)),
                     login_status,
+                    app_server_target,
                     app_server_request_handle,
                     auth_config,
                     bedrock_setup_enabled,
-                    animations_enabled: local_settings.tui.animations,
+                    animations_enabled: local_settings.tui.animations
+                        && local_settings.tui.effects.shimmer,
                     animations_suppressed: std::cell::Cell::new(false),
                 }));
             } else {
                 tracing::warn!("skipping onboarding login step without app-server request handle");
             }
         }
-        #[cfg(target_os = "windows")]
-        let show_windows_create_sandbox_hint = remote_project_trust.is_none()
-            && crate::windows_sandbox::level_from_config(&config) == WindowsSandboxLevel::Disabled;
-        #[cfg(not(target_os = "windows"))]
-        let show_windows_create_sandbox_hint = false;
         let highlighted = TrustDirectorySelection::Trust;
         if show_trust_screen {
             let (cwd, trust_target) = match remote_project_trust {
-                Some(RemoteProjectTrust { cwd, trust_target }) => (cwd, trust_target),
+                Some(RemoteProjectTrust {
+                    cwd, trust_target, ..
+                }) => (cwd, trust_target),
                 None => {
                     let trust_target =
                         resolve_root_git_project_for_trust(LOCAL_FS.as_ref(), &config.cwd)
@@ -177,6 +202,9 @@ impl OnboardingScreen {
                 }
             };
             steps.push(Step::TrustDirectory(TrustDirectoryWidget {
+                restricted: false,
+                existing_task: false,
+                cancel: super::trust_directory::TrustCancelAction::Quit,
                 cwd,
                 trust_target,
                 show_windows_create_sandbox_hint,
@@ -385,9 +413,16 @@ fn suppress_quit_while_typing(key_event: KeyEvent, text_entry_context: TextEntry
 impl WidgetRef for &OnboardingScreen {
     fn render_ref(&self, area: Rect, buf: &mut Buffer) {
         let suppress_animations = self.should_suppress_animations();
+        let logo_presentation = if suppress_animations {
+            Presentation::Hidden
+        } else if self.text_entry_context().active {
+            Presentation::Faded
+        } else {
+            Presentation::Animated
+        };
         for step in self.current_steps() {
             match step {
-                Step::Welcome(widget) => widget.set_animations_suppressed(suppress_animations),
+                Step::Welcome(widget) => widget.set_presentation(logo_presentation),
                 Step::Auth(widget) => widget.set_animations_suppressed(suppress_animations),
                 Step::TrustDirectory(_) => {}
             }
@@ -503,16 +538,49 @@ impl WidgetRef for Step {
 
 pub(crate) async fn run_onboarding_app(
     args: OnboardingScreenArgs,
+    app_server: Option<&mut AppServerSession>,
+    tui: &mut Tui,
+) -> Result<OnboardingResult> {
+    let request_handle = args.app_server_request_handle.clone();
+    let screen = OnboardingScreen::new(tui, args).await;
+    run_onboarding_screen(screen, request_handle, app_server, tui).await
+}
+
+async fn run_onboarding_screen(
+    onboarding_screen: OnboardingScreen,
+    app_server_request_handle: Option<AppServerRequestHandle>,
+    app_server: Option<&mut AppServerSession>,
+    tui: &mut Tui,
+) -> Result<OnboardingResult> {
+    // Let the terminal select and copy login URLs and device codes, even in fullscreen mode.
+    let previous_input = tui.overlay_input;
+    let result = match tui.set_overlay_input(OverlayInput::Onboarding) {
+        Ok(()) => {
+            run_onboarding_screen_inner(
+                onboarding_screen,
+                app_server_request_handle,
+                app_server,
+                tui,
+            )
+            .await
+        }
+        Err(error) => Err(error.into()),
+    };
+    let restore = tui.set_overlay_input(previous_input);
+    result.and_then(|result| restore.map(|()| result).map_err(Into::into))
+}
+
+async fn run_onboarding_screen_inner(
+    mut onboarding_screen: OnboardingScreen,
+    app_server_request_handle: Option<AppServerRequestHandle>,
     mut app_server: Option<&mut AppServerSession>,
     tui: &mut Tui,
 ) -> Result<OnboardingResult> {
     use tokio_stream::StreamExt;
-
-    let app_server_request_handle = args.app_server_request_handle.clone();
-    let mut onboarding_screen = OnboardingScreen::new(tui, args).await;
     let mut directory_trust_persisted = false;
     // One-time guard to fully clear the screen after ChatGPT login success message is shown
     let mut did_full_clear_after_success = false;
+    let mut pending_copy: Option<(u64, String)> = None;
 
     tui.draw(u16::MAX, |frame| {
         frame.render_widget_ref(&onboarding_screen, frame.area());
@@ -530,7 +598,36 @@ pub(crate) async fn run_onboarding_app(
                     tui.screen_size_for_event(&event)?;
                     match event {
                         TuiEvent::Key(key_event) => {
-                            onboarding_screen.handle_key_event(key_event);
+                            let copy_link = if key_event.kind == KeyEventKind::Press
+                                && keys::COPY_LINK.is_pressed(key_event)
+                                && let Some(Step::Auth(widget)) = onboarding_screen.current_steps().last()
+                                && let Ok(state) = widget.sign_in_state.read()
+                                && let SignInState::ChatGptContinueInBrowser(state) = &*state
+                                && !state.auth_url.is_empty()
+                            {
+                                Some((state.login_id.clone(), Arc::<str>::from(state.auth_url.as_str())))
+                            } else {
+                                None
+                            };
+                            if let Some((login_id, url)) = copy_link {
+                                let result = tui.clipboard.copy(url, CopyFormat::PlainText, tui.frame_requester());
+                                let message = match result {
+                                    Ok(CopyStatus::Pending(id)) => {
+                                        pending_copy = Some((id, login_id));
+                                        "Copying link…".to_string()
+                                    }
+                                    Ok(CopyStatus::Busy) => "Clipboard busy; try again".to_string(),
+                                    Ok(CopyStatus::Confirmed) => "Copied link to clipboard".to_string(),
+                                    Ok(CopyStatus::Unconfirmed) => "Copy requested; check your clipboard".to_string(),
+                                    Err(error) => format!("Could not copy link: {error}"),
+                                };
+                                if let Some(Step::Auth(widget)) = onboarding_screen.current_steps_mut().into_iter().last() {
+                                    *widget.error.write().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(message);
+                                }
+                                tui.frame_requester().schedule_frame();
+                            } else {
+                                onboarding_screen.handle_key_event(key_event);
+                            }
                             if !directory_trust_persisted {
                                 directory_trust_persisted = persist_selected_trust(
                                     &mut onboarding_screen,
@@ -545,7 +642,35 @@ pub(crate) async fn run_onboarding_app(
                         TuiEvent::Draw
                         | TuiEvent::Resume
                         | TuiEvent::Resize(_)
-                        | TuiEvent::FocusGained => {
+                        | TuiEvent::FocusGained
+                        | TuiEvent::FocusLost => {
+                            if let Some((id, result)) = tui.clipboard.poll().cloned()
+                                && let Some((pending_id, login_id)) = &pending_copy
+                                && id == *pending_id
+                            {
+                                if let Some(Step::Auth(widget)) = onboarding_screen.current_steps_mut().into_iter().last()
+                                    && widget.sign_in_state.read().is_ok_and(|state| {
+                                        matches!(&*state, SignInState::ChatGptContinueInBrowser(state) if state.login_id == *login_id)
+                                    })
+                                {
+                                    let message = match result {
+                                        Ok(CopyStatus::Confirmed) => "Copied link to clipboard".to_string(),
+                                        Ok(CopyStatus::Unconfirmed) => "Copy requested; check your clipboard".to_string(),
+                                        Ok(CopyStatus::Busy | CopyStatus::Pending(_)) => "Clipboard busy; try again".to_string(),
+                                        Err(error) => format!("Could not copy link: {error}"),
+                                    };
+                                    *widget.error.write().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(message);
+                                }
+                                pending_copy = None;
+                            }
+                            for step in &onboarding_screen.steps {
+                                if let Step::Welcome(widget) = step {
+                                    if matches!(&event, TuiEvent::Resume) {
+                                        widget.set_presentation(crate::empty_state_animation::Presentation::Hidden);
+                                    }
+                                    widget.set_focused(tui.is_terminal_focused());
+                                }
+                            }
                             if !did_full_clear_after_success
                                 && onboarding_screen.steps.iter().any(|step| {
                                     if let Step::Auth(w) = step {
@@ -580,7 +705,7 @@ pub(crate) async fn run_onboarding_app(
                                 frame.render_widget_ref(&onboarding_screen, frame.area());
                             });
                         }
-                        TuiEvent::FocusLost => {}
+                        TuiEvent::Mouse(_) => {}
                     }
                 }
             }
@@ -650,6 +775,7 @@ async fn persist_selected_trust(
         .find_map(|(index, step)| {
             if let Step::TrustDirectory(widget) = step
                 && widget.selection == Some(TrustDirectorySelection::Trust)
+                && !widget.restricted
             {
                 return Some((index, widget.trust_target.clone()));
             }
@@ -783,6 +909,9 @@ mod tests {
         let mut onboarding_screen = OnboardingScreen {
             request_frame: FrameRequester::test_dummy(),
             steps: vec![Step::TrustDirectory(TrustDirectoryWidget {
+                restricted: false,
+                existing_task: false,
+                cancel: super::super::trust_directory::TrustCancelAction::Quit,
                 cwd: PathBuf::from("/workspace/project"),
                 trust_target: PathBuf::from("/workspace/project"),
                 show_windows_create_sandbox_hint: false,
@@ -842,10 +971,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn restricted_acceptance_and_cancellation_do_not_persist_trust() {
+        for key in [KeyCode::Enter, KeyCode::Esc] {
+            let mut screen = OnboardingScreen {
+                request_frame: FrameRequester::test_dummy(),
+                steps: vec![Step::TrustDirectory(TrustDirectoryWidget {
+                    restricted: true,
+                    existing_task: false,
+                    cancel: super::super::trust_directory::TrustCancelAction::AgentsOverview,
+                    cwd: PathBuf::from("/workspace/project"),
+                    trust_target: PathBuf::from("/workspace/project"),
+                    show_windows_create_sandbox_hint: false,
+                    should_quit: false,
+                    selection: None,
+                    highlighted: TrustDirectorySelection::Trust,
+                    error: None,
+                })],
+                remote_trust_key: Some("/workspace/project".to_string()),
+                is_done: false,
+                should_exit: false,
+            };
+            screen.handle_key_event(key.into());
+            assert!(!persist_selected_trust(&mut screen, /*request_handle*/ None).await);
+            assert!(screen.is_done());
+            assert_eq!(screen.should_exit(), key == KeyCode::Esc);
+            let Step::TrustDirectory(widget) = &screen.steps[0] else {
+                panic!("trust step")
+            };
+            assert_eq!(widget.error, None);
+        }
+    }
+
+    #[tokio::test]
     async fn trust_persistence_failure_keeps_trust_step_in_progress() {
         let mut onboarding_screen = OnboardingScreen {
             request_frame: FrameRequester::test_dummy(),
             steps: vec![Step::TrustDirectory(TrustDirectoryWidget {
+                restricted: false,
+                existing_task: false,
+                cancel: super::super::trust_directory::TrustCancelAction::Quit,
                 cwd: PathBuf::from("/workspace/project"),
                 trust_target: PathBuf::from("/workspace/project"),
                 show_windows_create_sandbox_hint: false,

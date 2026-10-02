@@ -71,7 +71,7 @@ async fn ripgrep_rollout_paths(
         return Ok(Some(HashSet::new()));
     }
 
-    let output = match Command::new(rg_command)
+    let output = match Command::from(codex_utils_process::background_command(rg_command))
         .arg("-l")
         .arg("--fixed-strings")
         .arg("--ignore-case")
@@ -146,7 +146,16 @@ async fn scan_rollout_matches(
             };
             if rollout_file.is_compressed() {
                 if let Some(snippet) =
-                    first_rollout_content_match_snippet(rollout_file.path(), search_term).await?
+                    first_rollout_content_match_snippet(rollout_file.path(), search_term)
+                        .await
+                        .unwrap_or_else(|err| {
+                            tracing::warn!(
+                                path = %rollout_file.path().display(),
+                                %err,
+                                "Failed to search compressed rollout"
+                            );
+                            None
+                        })
                 {
                     matches.insert(
                         compression::plain_rollout_path(rollout_file.path()),
@@ -221,7 +230,16 @@ async fn scan_compressed_rollout_matches(
                 continue;
             }
             if let Some(snippet) =
-                first_rollout_content_match_snippet(rollout_file.path(), search_term).await?
+                first_rollout_content_match_snippet(rollout_file.path(), search_term)
+                    .await
+                    .unwrap_or_else(|err| {
+                        tracing::warn!(
+                            path = %rollout_file.path().display(),
+                            %err,
+                            "Failed to search compressed rollout"
+                        );
+                        None
+                    })
             {
                 matches.insert(
                     compression::plain_rollout_path(rollout_file.path()),

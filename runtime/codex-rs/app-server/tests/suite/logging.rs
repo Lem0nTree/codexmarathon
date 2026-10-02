@@ -59,11 +59,13 @@ async fn credentials_stay_out_of_persisted_and_feedback_logs() -> Result<()> {
     let initial_token = encode_id_token(
         &ChatGptIdTokenClaims::new()
             .email("initial@example.com")
+            .chatgpt_user_id("logging-user")
             .chatgpt_account_id(account_id),
     )?;
     let refreshed_token = encode_id_token(
         &ChatGptIdTokenClaims::new()
             .email("refreshed@example.com")
+            .chatgpt_user_id("logging-user")
             .chatgpt_account_id(account_id),
     )?;
     let server = MockServer::start().await;
@@ -97,7 +99,7 @@ supports_websockets = false
 "#
         ))
         .write(codex_home.path())?;
-    write_models_cache(codex_home.path())?;
+    write_models_cache(codex_home.path()).await?;
     let mut app_server = TestAppServer::builder()
         .with_codex_home(codex_home.path())
         .with_env_overrides(&[("OPENAI_API_KEY", None)])

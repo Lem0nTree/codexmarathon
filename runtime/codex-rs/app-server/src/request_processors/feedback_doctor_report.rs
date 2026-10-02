@@ -20,7 +20,9 @@ use tokio::process::Command;
 use tokio::time::timeout;
 use tracing::warn;
 
-const DOCTOR_FEEDBACK_REPORT_TIMEOUT: Duration = Duration::from_secs(25);
+// Keep the existing 25-second diagnostic allowance plus the filesystem
+// probe budget (eight seconds) and a small amount of process overhead.
+const DOCTOR_FEEDBACK_REPORT_TIMEOUT: Duration = Duration::from_secs(35);
 const MAX_DOCTOR_TAG_VALUE_LEN: usize = 256;
 
 /// Redacted doctor report data that can be merged into a feedback upload.
@@ -104,7 +106,7 @@ pub(crate) async fn doctor_feedback_report(
 }
 
 fn doctor_command(executable: &Path, cwd: &Path, codex_home: &Path) -> Command {
-    let mut command = Command::new(executable);
+    let mut command = Command::from(codex_utils_process::background_command(executable));
     command
         .arg("--cd")
         .arg(cwd)

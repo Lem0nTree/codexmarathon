@@ -1,7 +1,10 @@
 ---
-source: tui/src/chatwidget/tests.rs
+source: tui/src/chatwidget/tests/exec_flow.rs
+assertion_line: 1092
 expression: combined
 ---
 • Waited for background terminal · cargo test -p codex-core
 
 • Streaming response.
+
+  Worked for [duration] • [completion time]

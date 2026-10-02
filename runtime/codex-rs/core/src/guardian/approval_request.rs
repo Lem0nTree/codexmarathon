@@ -12,12 +12,7 @@ use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::LegacyAppPathString;
 use codex_utils_path_uri::PathUri;
 use serde::Serialize;
-use serde::ser::Error as _;
 use serde_json::Value;
-
-use super::GUARDIAN_MAX_ACTION_BYTES;
-use super::GUARDIAN_MAX_ACTION_STRING_TOKENS;
-use super::prompt::guardian_truncate_text;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum GuardianApprovalRequest {
@@ -47,6 +42,7 @@ pub(crate) enum GuardianApprovalRequest {
     #[cfg(unix)]
     Execve {
         id: String,
+        environment_id: String,
         source: GuardianCommandSource,
         program: String,
         argv: Vec<String>,
@@ -55,6 +51,7 @@ pub(crate) enum GuardianApprovalRequest {
     },
     ApplyPatch {
         id: String,
+        environment_id: String,
         cwd: PathUri,
         files: Vec<PathUri>,
         patch: String,
@@ -62,6 +59,7 @@ pub(crate) enum GuardianApprovalRequest {
     NetworkAccess {
         id: String,
         turn_id: String,
+        environment_id: String,
         target: String,
         host: String,
         protocol: NetworkApprovalProtocol,
@@ -83,10 +81,27 @@ pub(crate) enum GuardianApprovalRequest {
     },
     RequestPermissions {
         id: String,
+        environment_id: String,
         turn_id: String,
         reason: Option<String>,
         permissions: RequestPermissionProfile,
     },
+}
+
+impl GuardianApprovalRequest {
+    /// The environment owning this action, independent of the reviewer's default environment.
+    pub(super) fn target_environment_id(&self) -> Option<&str> {
+        match self {
+            Self::ExecCommand { environment_id, .. }
+            | Self::WriteStdin { environment_id, .. }
+            | Self::ApplyPatch { environment_id, .. }
+            | Self::RequestPermissions { environment_id, .. }
+            | Self::NetworkAccess { environment_id, .. } => Some(environment_id),
+            #[cfg(unix)]
+            Self::Execve { environment_id, .. } => Some(environment_id),
+            Self::McpToolCall { .. } => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -140,7 +155,6 @@ struct ApplyPatchApprovalAction<'a> {
 #[derive(Serialize)]
 struct WriteStdinApprovalAction<'a> {
     tool: &'static str,
-    environment_id: &'a str,
     session_id: i32,
     chars: &'a str,
     cwd: LegacyAppPathString,
@@ -249,53 +263,10 @@ fn guardian_command_source_tool_name(source: GuardianCommandSource) -> &'static 
     }
 }
 
-fn truncate_guardian_action_value(value: Value) -> (Value, bool) {
-    match value {
-        Value::String(text) => {
-            let (text, truncated) =
-                guardian_truncate_text(&text, GUARDIAN_MAX_ACTION_STRING_TOKENS);
-            (Value::String(text), truncated)
-        }
-        Value::Array(values) => {
-            let mut truncated = false;
-            let values = values
-                .into_iter()
-                .map(|value| {
-                    let (value, value_truncated) = truncate_guardian_action_value(value);
-                    truncated |= value_truncated;
-                    value
-                })
-                .collect::<Vec<_>>();
-            (Value::Array(values), truncated)
-        }
-        Value::Object(values) => {
-            let mut entries = values.into_iter().collect::<Vec<_>>();
-            entries.sort_by(|(left, _), (right, _)| left.cmp(right));
-            let mut truncated = false;
-            let values = entries
-                .into_iter()
-                .map(|(key, value)| {
-                    let (value, value_truncated) = truncate_guardian_action_value(value);
-                    truncated |= value_truncated;
-                    (key, value)
-                })
-                .collect();
-            (Value::Object(values), truncated)
-        }
-        other => (other, false),
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct FormattedGuardianAction {
-    pub(crate) text: String,
-    pub(crate) truncated: bool,
-}
-
 pub(crate) fn guardian_approval_request_to_json(
     action: &GuardianApprovalRequest,
 ) -> serde_json::Result<Value> {
-    match action {
+    let mut value = match action {
         GuardianApprovalRequest::ExecCommand {
             id: _,
             environment_id: _,
@@ -316,7 +287,6 @@ pub(crate) fn guardian_approval_request_to_json(
             Some(*tty),
         ),
         GuardianApprovalRequest::WriteStdin {
-            environment_id,
             process_id,
             input,
             cwd,
@@ -326,7 +296,6 @@ pub(crate) fn guardian_approval_request_to_json(
             ..
         } => serialize_guardian_action(WriteStdinApprovalAction {
             tool: "write_stdin",
-            environment_id,
             session_id: *process_id,
             chars: input,
             cwd: cwd.clone().into(),
@@ -337,6 +306,7 @@ pub(crate) fn guardian_approval_request_to_json(
         #[cfg(unix)]
         GuardianApprovalRequest::Execve {
             id: _,
+            environment_id: _,
             source,
             program,
             argv,
@@ -351,6 +321,7 @@ pub(crate) fn guardian_approval_request_to_json(
         }),
         GuardianApprovalRequest::ApplyPatch {
             id: _,
+            environment_id: _,
             cwd,
             files,
             patch,
@@ -363,6 +334,7 @@ pub(crate) fn guardian_approval_request_to_json(
         GuardianApprovalRequest::NetworkAccess {
             id: _,
             turn_id: _,
+            environment_id: _,
             target,
             host,
             protocol,
@@ -409,6 +381,7 @@ pub(crate) fn guardian_approval_request_to_json(
         }),
         GuardianApprovalRequest::RequestPermissions {
             id: _,
+            environment_id: _,
             turn_id,
             reason,
             permissions,
@@ -418,7 +391,11 @@ pub(crate) fn guardian_approval_request_to_json(
             reason: reason.as_ref(),
             permissions,
         }),
+    }?;
+    if let Some(environment_id) = action.target_environment_id() {
+        value["environment_id"] = environment_id.into();
     }
+    Ok(value)
 }
 
 pub(crate) fn guardian_assessment_action(
@@ -464,6 +441,7 @@ pub(crate) fn guardian_assessment_action(
         GuardianApprovalRequest::NetworkAccess {
             id: _id,
             turn_id: _turn_id,
+            environment_id: _,
             target,
             host,
             protocol,
@@ -511,7 +489,7 @@ pub(crate) fn guardian_reviewed_action(
             ..
         } => GuardianReviewedAction::UnifiedExec {
             sandbox_permissions: *sandbox_permissions,
-            additional_permissions: additional_permissions.clone(),
+            additional_permissions: additional_permissions.as_ref().map(Into::into),
             tty: *tty,
         },
         GuardianApprovalRequest::WriteStdin { tty, .. } => {
@@ -520,13 +498,11 @@ pub(crate) fn guardian_reviewed_action(
         #[cfg(unix)]
         GuardianApprovalRequest::Execve {
             source,
-            program,
             additional_permissions,
             ..
         } => GuardianReviewedAction::Execve {
             source: *source,
-            program: program.clone(),
-            additional_permissions: additional_permissions.clone(),
+            additional_permissions: additional_permissions.as_ref().map(Into::into),
         },
         GuardianApprovalRequest::ApplyPatch { .. } => GuardianReviewedAction::ApplyPatch {},
         GuardianApprovalRequest::NetworkAccess { protocol, port, .. } => {
@@ -586,26 +562,9 @@ pub(crate) fn guardian_request_turn_id<'a>(
 
 pub(crate) fn format_guardian_action_pretty(
     action: &GuardianApprovalRequest,
-) -> serde_json::Result<FormattedGuardianAction> {
-    let value = guardian_approval_request_to_json(action)?;
-    let (value, truncated) = truncate_guardian_action_value(value);
-    let text = enforce_guardian_action_byte_limit(serde_json::to_string_pretty(&value)?)?;
-    Ok(FormattedGuardianAction { text, truncated })
-}
-
-fn enforce_guardian_action_byte_limit(text: String) -> serde_json::Result<String> {
-    if text.len() > GUARDIAN_MAX_ACTION_BYTES {
-        return Err(serde_json::Error::custom(format!(
-            "Guardian action exceeds the {GUARDIAN_MAX_ACTION_BYTES}-byte review limit"
-        )));
-    }
-    Ok(text)
-}
-
-pub(crate) fn format_guardian_action_compact(
-    action: &GuardianApprovalRequest,
 ) -> serde_json::Result<String> {
-    enforce_guardian_action_byte_limit(serde_json::to_string(&guardian_approval_request_to_json(
-        action,
-    )?)?)
+    let mut value =
+        codex_guardian_context::action_for_review(guardian_approval_request_to_json(action)?);
+    value.sort_all_objects();
+    serde_json::to_string_pretty(&value)
 }

@@ -1,5 +1,7 @@
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 
 use anyhow::Result;
 use codex_config::ConfigLayerEntry;
@@ -9,6 +11,7 @@ use codex_config::ConfigRequirements;
 use codex_config::ConfigRequirementsToml;
 use codex_core::StartThreadOptions;
 use codex_core::TurnInputRequest;
+use codex_core::WaitForEnvironmentToolConfig;
 use codex_core::config::Config;
 use codex_exec_server::CreateDirectoryOptions;
 use codex_exec_server::EnvironmentManager;
@@ -22,11 +25,21 @@ use codex_extension_api::ExtensionWarning;
 use codex_extension_api::SkillInvocationContributor;
 use codex_extension_api::SkillInvocationInput;
 use codex_features::Feature;
+use codex_history::InitialHistory;
+use codex_history::ResumedHistory;
+use codex_history::RolloutItem;
 use codex_login::CodexAuth;
 use codex_mcp::CODEX_APPS_MCP_SERVER_NAME;
+use codex_models_manager::bundled_models_response;
+use codex_otel::OtelExporter;
+use codex_otel::OtelHttpProtocol;
+use codex_otel::OtelProvider;
+use codex_otel::OtelSettings;
+use codex_otel::THREAD_SKILLS_KEPT_TOTAL_METRIC;
 use codex_protocol::capabilities::CapabilityRootLocation;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
 use codex_protocol::models::PermissionProfile;
+use codex_protocol::openai_models::ModelsResponse;
 use codex_protocol::openai_models::TruncationPolicyConfig;
 use codex_protocol::permissions::FileSystemAccessMode;
 use codex_protocol::permissions::FileSystemPath;
@@ -34,13 +47,17 @@ use codex_protocol::permissions::FileSystemSandboxEntry;
 use codex_protocol::permissions::FileSystemSandboxPolicy;
 use codex_protocol::permissions::FileSystemSpecialPath;
 use codex_protocol::permissions::NetworkSandboxPolicy;
+use codex_protocol::protocol::EnvironmentConfigState;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::Op;
 use codex_protocol::protocol::ThreadSettingsOverrides;
+use codex_protocol::protocol::TurnEnvironmentSelection;
+use codex_protocol::protocol::TurnSettingsUpdate;
+use codex_protocol::protocol::TurnSettingsUpdateOutcome;
 use codex_protocol::user_input::UserInput;
 use codex_skills_extension::ExecutorSkillProvider;
 use codex_skills_extension::HostSkillProvider;
-use codex_skills_extension::OrchestratorSkillProvider;
 use codex_skills_extension::SkillProvider;
 use codex_skills_extension::SkillProviderSource;
 use codex_skills_extension::SkillProviders;
@@ -60,11 +77,14 @@ use codex_skills_extension::provider::SkillListQuery;
 use codex_skills_extension::provider::SkillProviderFuture;
 use codex_skills_extension::provider::SkillReadRequest;
 use codex_skills_extension::provider::SkillSearchRequest;
+use codex_thread_store::LoadThreadHistoryParams;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
 use codex_utils_string::approx_token_count;
 use core_test_support::apps_test_server::AppsTestServer;
 use core_test_support::apps_test_server::apps_enabled_builder;
+use core_test_support::context_snapshot;
+use core_test_support::context_snapshot::ContextSnapshotOptions;
 use core_test_support::responses;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_response_created;
@@ -75,11 +95,14 @@ use core_test_support::skip_if_no_network;
 use core_test_support::skip_if_remote;
 use core_test_support::skip_if_target_windows;
 use core_test_support::skip_if_wine_exec;
+use core_test_support::test_codex::environment_config_for_selection;
 use core_test_support::test_codex::test_codex;
 use core_test_support::test_codex::test_env;
 use core_test_support::test_codex::turn_permission_fields;
 use core_test_support::wait_for_event;
 use core_test_support::wait_for_mcp_server;
+use opentelemetry_sdk::metrics::data::AggregatedMetrics;
+use opentelemetry_sdk::metrics::data::MetricData;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
 use serde_json::json;
@@ -92,20 +115,60 @@ use toml::toml;
 use tracing::Level;
 use tracing_subscriber::fmt::format::FmtSpan;
 use tracing_test::internal::MockWriter;
-use wiremock::Mock;
 use wiremock::MockServer;
-use wiremock::Request;
-use wiremock::ResponseTemplate;
-use wiremock::matchers::method;
-use wiremock::matchers::path_regex;
+
+#[path = "skills_extension/cloud_skill_tests.rs"]
+mod cloud_skill_tests;
+
+#[path = "skills_extension/cloud_lifecycle_tests.rs"]
+mod cloud_lifecycle_tests;
 
 struct StaticSkillProvider {
     catalog: SkillCatalog,
     main_prompt_contents: Option<String>,
 }
 
-struct CatalogSkillProvider {
-    catalog: SkillCatalog,
+pub(super) struct CatalogSkillProvider {
+    pub(super) catalog: SkillCatalog,
+}
+
+struct PausedCatalogSkillProvider {
+    inner: CatalogSkillProvider,
+    first_discovery: AtomicBool,
+    started: tokio::sync::mpsc::UnboundedSender<String>,
+    resume: tokio::sync::Semaphore,
+}
+
+impl SkillProvider for PausedCatalogSkillProvider {
+    fn list(&self, query: SkillListQuery) -> SkillProviderFuture<'_, SkillCatalog> {
+        Box::pin(async move {
+            if query.host_snapshot.is_none() {
+                return Ok(SkillCatalog::default());
+            }
+            if self.first_discovery.swap(/*val*/ false, Ordering::SeqCst) {
+                self.started
+                    .send(query.turn_id.clone())
+                    .expect("discovery receiver");
+                self.resume
+                    .acquire()
+                    .await
+                    .expect("resume discovery")
+                    .forget();
+            }
+            self.inner.list(query).await
+        })
+    }
+
+    fn read<'a>(
+        &'a self,
+        request: SkillReadRequest<'a>,
+    ) -> SkillProviderFuture<'a, SkillReadResult> {
+        self.inner.read(request)
+    }
+
+    fn search(&self, request: SkillSearchRequest) -> SkillProviderFuture<'_, SkillSearchResult> {
+        self.inner.search(request)
+    }
 }
 
 #[derive(Debug)]
@@ -294,7 +357,7 @@ fn catalog_extensions(
             include_instructions: config.include_skill_instructions,
             max_context_tokens: config.skill_max_context_tokens,
             bundled_skills_enabled: false,
-            orchestrator_skills_enabled: false,
+            cloud_skill_enabled: false,
             shadow_selection_enabled: false,
         }
     });
@@ -571,7 +634,7 @@ async fn capability_sections_render_in_order_with_host_repo_and_plugin_skills() 
         include_instructions: config.include_skill_instructions,
         max_context_tokens: config.skill_max_context_tokens,
         bundled_skills_enabled: config.bundled_skills_enabled(),
-        orchestrator_skills_enabled: config.orchestrator_skills_enabled,
+        cloud_skill_enabled: config.cloud_skill_enabled,
         shadow_selection_enabled: config.features.enabled(Feature::SkillSearch),
     });
     let mut builder = test_codex()
@@ -851,558 +914,6 @@ async fn explicit_skill_prompt_precedes_plugin_instructions() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn explicit_only_orchestrator_skill_is_hidden_but_can_be_invoked() -> Result<()> {
-    skip_if_no_network!(Ok(()));
-
-    const SKILL_PACKAGE: &str = "skill://demo/explicit-only";
-    const MAIN_RESOURCE: &str = "skill://demo/explicit-only/SKILL.md";
-    const REFERENCED_RESOURCE: &str = "skill://demo/explicit-only/references/guide.md";
-    const READ_CALL_ID: &str = "read-explicit-only-resource";
-    const LIST_CALL_ID: &str = "list-model-visible-skills";
-    const CODE_MODE_LIST_CALL_ID: &str = "list-skills-through-code-mode";
-    const CONTINUATION_CALL_ID: &str = "read-explicit-only-resource-continuation";
-    const MAIN_READ_CALL_ID: &str = "read-explicit-only-main";
-    const REPEATED_MAIN_READ_CALL_ID: &str = "read-explicit-only-main-again";
-    const INVALID_CURSOR_CALL_ID: &str = "read-explicit-only-invalid-cursor";
-    const MISSING_PACKAGE_CALL_ID: &str = "read-missing-package";
-    const CODE_MODE_CALL_ID: &str = "code-mode-skill-read";
-
-    // Fill the shared 300-byte page through the emoji; ignoring escaping would fit everything.
-    let read_prefix = "a".repeat(184);
-    let referenced_contents = format!("{read_prefix}😀\"\\\nabcdefghijklm");
-    let read_contents = referenced_contents.clone();
-    let server = responses::start_mock_server().await;
-    let apps_server = AppsTestServer::mount(&server).await?;
-    let response = responses::mount_sse_sequence(
-        &server,
-        vec![
-            sse(vec![
-                ev_response_created("resp-1"),
-                responses::ev_function_call_with_namespace(
-                    READ_CALL_ID,
-                    "skills",
-                    "read",
-                    &json!({
-                        "package": SKILL_PACKAGE,
-                        "authority": {
-                            "kind": "orchestrator",
-                        },
-                        "resource": REFERENCED_RESOURCE,
-                    })
-                    .to_string(),
-                ),
-                responses::ev_function_call_with_namespace(
-                    LIST_CALL_ID,
-                    "skills",
-                    "list",
-                    &json!({ "authority": { "kind": "orchestrator" } }).to_string(),
-                ),
-                responses::ev_custom_tool_call(
-                    CODE_MODE_LIST_CALL_ID,
-                    "exec",
-                    r#"const result = await tools.skills__list({ authority: { kind: "orchestrator" } });
-text({ names: result.skills.map(skill => skill.name), warnings: result.warnings, next_cursor: result.next_cursor });"#,
-                ),
-                ev_completed("resp-1"),
-            ]),
-            sse(vec![ev_response_created("resp-2"), ev_completed("resp-2")]),
-        ],
-    )
-    .await;
-
-    Mock::given(method("POST"))
-        .and(path_regex("^/api/codex/ps/mcp/?$"))
-        .and(|request: &Request| {
-            serde_json::from_slice::<Value>(&request.body).is_ok_and(|body| {
-                matches!(
-                    body["method"].as_str(),
-                    Some("resources/list" | "resources/read")
-                )
-            })
-        })
-        .respond_with(move |request: &Request| {
-            let body: Value = serde_json::from_slice(&request.body)
-                .expect("MCP resource request should be valid JSON");
-            let result = match body["method"].as_str() {
-                Some("resources/list") => {
-                    let resources = [
-                        ("visible", Some(json!(true))),
-                        ("explicit-only", Some(json!(false))),
-                        ("missing-policy", None),
-                        ("non-boolean-policy", Some(json!("false"))),
-                    ]
-                    .map(|(name, allow_implicit_invocation)| {
-                        let mut metadata = json!({
-                            "plugin_name": "demo",
-                            "skill_name": name,
-                        });
-                        if let Some(allow_implicit_invocation) = allow_implicit_invocation {
-                            metadata["allow_implicit_invocation"] = allow_implicit_invocation;
-                        }
-                        json!({
-                            "name": name,
-                            "uri": format!("skill://demo/{name}"),
-                            "mimeType": "mcp/skill",
-                            "_meta": metadata,
-                        })
-                    });
-                    json!({ "resources": resources })
-                }
-                Some("resources/read") => {
-                    let uri = body["params"]["uri"]
-                        .as_str()
-                        .expect("MCP resource read should include a resource URI");
-                    let contents = match uri {
-                        MAIN_RESOURCE => {
-                            format!("# Explicit-only instructions\nRead {REFERENCED_RESOURCE}.")
-                        }
-                        REFERENCED_RESOURCE => read_contents.clone(),
-                        _ => unreachable!("unexpected MCP resource URI: {uri}"),
-                    };
-                    json!({
-                        "contents": [{
-                            "uri": uri,
-                            "mimeType": "text/markdown",
-                            "text": contents,
-                        }],
-                    })
-                }
-                method => unreachable!("unexpected MCP resource method: {method:?}"),
-            };
-            ResponseTemplate::new(/*status*/ 200).set_body_json(json!({
-                "jsonrpc": "2.0",
-                "id": body["id"],
-                "result": result,
-            }))
-        })
-        .with_priority(/*p*/ 1)
-        .mount(&server)
-        .await;
-
-    let mut extensions = ExtensionRegistryBuilder::new();
-    install_with_providers(
-        &mut extensions,
-        SkillProviders::new()
-            .with_orchestrator_provider(Arc::new(OrchestratorSkillProvider::new())),
-        |config: &Config| SkillsExtensionConfig {
-            include_instructions: config.include_skill_instructions,
-            max_context_tokens: config.skill_max_context_tokens,
-            bundled_skills_enabled: false,
-            orchestrator_skills_enabled: true,
-            shadow_selection_enabled: false,
-        },
-    );
-    let mut builder = apps_enabled_builder(apps_server.chatgpt_base_url)
-        // Local executors disable orchestrator skill discovery.
-        .with_exec_server_url("none")
-        .with_extensions(Arc::new(extensions.build()))
-        .with_model_info_override("gpt-5.5", |model_info| {
-            model_info.truncation_policy = TruncationPolicyConfig::bytes(/*limit*/ 250);
-        })
-        .with_config(|config| {
-            config.include_skill_instructions = true;
-            config.orchestrator_skills_enabled = true;
-            config
-                .features
-                .enable(Feature::CodeMode)
-                .expect("code mode should be configurable in tests");
-        });
-    let test = builder.build_with_auto_env(&server).await?;
-    wait_for_mcp_server(&test.codex, CODEX_APPS_MCP_SERVER_NAME).await?;
-
-    test.submit_turn("Use $demo:explicit-only.").await?;
-
-    let requests = response.requests();
-    assert_eq!(requests.len(), 2);
-    let request = &requests[0];
-    let developer_messages = request.message_input_texts("developer");
-    for name in ["visible", "missing-policy", "non-boolean-policy"] {
-        let catalog_entry = format!("- demo:{name}:");
-        assert!(
-            developer_messages
-                .iter()
-                .any(|message| message.contains(&catalog_entry)),
-            "model-visible skills should include `{name}`: {developer_messages:?}"
-        );
-    }
-    assert!(
-        developer_messages
-            .iter()
-            .all(|message| !message.contains("- demo:explicit-only:")),
-        "model-visible skills should omit the explicit-only skill: {developer_messages:?}"
-    );
-    let user_messages = request.message_input_texts("user");
-    let skill_instructions = user_messages
-        .iter()
-        .find(|message| {
-            message.contains("<name>demo:explicit-only</name>")
-                && message.contains("# Explicit-only instructions")
-                && message.contains(REFERENCED_RESOURCE)
-        })
-        .expect("explicit invocation should inject the hidden skill instructions and reference");
-    let resource_access = skill_instructions
-        .split_once("<resource_access>")
-        .and_then(|(_, remainder)| remainder.split_once("</resource_access>"))
-        .map(|(metadata, _)| metadata)
-        .expect("hidden orchestrator skills should include resource-access metadata");
-    assert_eq!(
-        serde_json::from_str::<Value>(resource_access)?,
-        json!({
-            "authority": { "kind": "orchestrator" },
-            "package": SKILL_PACKAGE,
-            "main_resource": MAIN_RESOURCE,
-        })
-    );
-    let first_output = requests[1]
-        .function_call_output_text(READ_CALL_ID)
-        .expect("skills.read should return the referenced resource");
-    assert!(first_output.len() <= 300);
-    let first_page = serde_json::from_str::<Value>(&first_output)?;
-    let cursor = first_page["next_cursor"]
-        .as_str()
-        .ok_or_else(|| anyhow::anyhow!("skills.read should return a continuation cursor"))?
-        .to_string();
-    assert_eq!(
-        first_page,
-        json!({
-            "resource": REFERENCED_RESOURCE,
-            "contents": format!("{read_prefix}😀"),
-            "next_cursor": cursor,
-        })
-    );
-    let mut list_output = requests[1]
-        .function_call_output_text(LIST_CALL_ID)
-        .expect("skills.list should return the model-visible catalog");
-    let code_mode_output = requests[1].custom_tool_call_output(CODE_MODE_LIST_CALL_ID);
-    let code_mode_text = code_mode_output["output"]
-        .as_array()
-        .and_then(|items| items.last())
-        .and_then(|item| item["text"].as_str())
-        .ok_or_else(|| {
-            anyhow::anyhow!("Code Mode should return its skills.list result: {code_mode_output}")
-        })?;
-    assert_eq!(
-        serde_json::from_str::<Value>(code_mode_text)?,
-        json!({
-            "names": ["demo:visible", "demo:missing-policy", "demo:non-boolean-policy"],
-            "warnings": [],
-            "next_cursor": null,
-        })
-    );
-    let events = wait_for_analytics_events(&server, "skill_invocation", /*expected_count*/ 1).await;
-    assert_eq!(events.len(), 1);
-    assert_eq!(events[0]["skill_name"], "demo:explicit-only");
-    assert_eq!(events[0]["event_params"]["invoke_type"], "explicit");
-
-    let response = responses::mount_sse_sequence(
-        &server,
-        vec![
-            sse(vec![
-                ev_response_created("resp-3"),
-                responses::ev_function_call_with_namespace(
-                    CONTINUATION_CALL_ID,
-                    "skills",
-                    "read",
-                    &json!({
-                        "package": SKILL_PACKAGE,
-                        "resource": REFERENCED_RESOURCE,
-                        "cursor": cursor,
-                    })
-                    .to_string(),
-                ),
-                responses::ev_function_call_with_namespace(
-                    MAIN_READ_CALL_ID,
-                    "skills",
-                    "read",
-                    &json!({ "package": SKILL_PACKAGE }).to_string(),
-                ),
-                responses::ev_function_call_with_namespace(
-                    REPEATED_MAIN_READ_CALL_ID,
-                    "skills",
-                    "read",
-                    &json!({ "package": SKILL_PACKAGE, "resource": MAIN_RESOURCE }).to_string(),
-                ),
-                responses::ev_function_call_with_namespace(
-                    INVALID_CURSOR_CALL_ID,
-                    "skills",
-                    "read",
-                    &json!({ "package": SKILL_PACKAGE, "cursor": "invalid" }).to_string(),
-                ),
-                responses::ev_function_call_with_namespace(
-                    MISSING_PACKAGE_CALL_ID,
-                    "skills",
-                    "read",
-                    &json!({ "package": "skill://demo/missing" }).to_string(),
-                ),
-                ev_completed("resp-3"),
-            ]),
-            sse(vec![ev_response_created("resp-4"), ev_completed("resp-4")]),
-        ],
-    )
-    .await;
-
-    test.submit_turn("Continue without explicitly selecting a skill.")
-        .await?;
-    let requests = response.requests();
-    assert_eq!(requests.len(), 2);
-    let continuation_output = requests[1]
-        .function_call_output_text(CONTINUATION_CALL_ID)
-        .expect("skills.read should return the next referenced-resource page");
-    assert!(continuation_output.len() <= 300);
-    let continuation_page = serde_json::from_str::<Value>(&continuation_output)?;
-    assert_eq!(
-        continuation_page,
-        json!({
-            "resource": REFERENCED_RESOURCE,
-            "contents": "\"\\\nabcdefghijklm",
-            "next_cursor": null,
-        })
-    );
-    assert_eq!(
-        format!(
-            "{}{}",
-            first_page["contents"].as_str().unwrap_or_default(),
-            continuation_page["contents"].as_str().unwrap_or_default()
-        ),
-        referenced_contents
-    );
-    for call_id in [MAIN_READ_CALL_ID, REPEATED_MAIN_READ_CALL_ID] {
-        let output = requests[1]
-            .function_call_output_text(call_id)
-            .expect("skills.read should return the main resource");
-        assert_eq!(
-            serde_json::from_str::<Value>(&output)?["resource"],
-            MAIN_RESOURCE
-        );
-    }
-    for call_id in [INVALID_CURSOR_CALL_ID, MISSING_PACKAGE_CALL_ID] {
-        assert!(
-            requests[1].function_call_output_text(call_id).is_some(),
-            "failed skills.read should return a tool error for {call_id}"
-        );
-    }
-
-    let events = wait_for_analytics_events(&server, "skill_invocation", /*expected_count*/ 2).await;
-    assert_eq!(events.len(), 2, "repeated main reads must be deduplicated");
-    assert_eq!(events[1]["skill_name"], "demo:explicit-only");
-    assert_eq!(
-        events[1]["skill_id"],
-        format!("{:x}", sha1::Sha1::digest(MAIN_RESOURCE.as_bytes()))
-    );
-    assert_eq!(events[1]["event_params"]["invoke_type"], "implicit");
-
-    for (name, has_more) in [
-        ("visible", true),
-        ("missing-policy", true),
-        ("non-boolean-policy", false),
-    ] {
-        assert!(list_output.len() <= 300);
-        let list_response = serde_json::from_str::<Value>(&list_output)?;
-        let next_cursor = list_response["next_cursor"].as_str();
-        assert_eq!(next_cursor.is_some(), has_more);
-        assert_eq!(
-            list_response,
-            json!({
-                "skills": [{
-                    "authority": {"kind": "orchestrator"},
-                    "package": format!("skill://demo/{name}"),
-                    "name": format!("demo:{name}"),
-                    "description": "",
-                    "main_resource": format!("skill://demo/{name}/SKILL.md"),
-                }],
-                "warnings": [],
-                "next_cursor": next_cursor,
-            })
-        );
-        if let Some(cursor) = next_cursor {
-            let call_id = format!("list-after-{name}");
-            let page = responses::mount_sse_sequence(
-                &server,
-                vec![
-                    sse(vec![
-                        ev_response_created(&call_id),
-                        responses::ev_function_call_with_namespace(
-                            &call_id,
-                            "skills",
-                            "list",
-                            &json!({
-                                "authority": { "kind": "orchestrator" },
-                                "cursor": cursor,
-                            })
-                            .to_string(),
-                        ),
-                        ev_completed(&call_id),
-                    ]),
-                    sse(vec![ev_response_created("listed"), ev_completed("listed")]),
-                ],
-            )
-            .await;
-            test.submit_turn("Continue listing skills.").await?;
-            list_output = page.requests()[1]
-                .function_call_output_text(&call_id)
-                .expect("skills.list should return the next page");
-        }
-    }
-
-    let response = responses::mount_sse_sequence(
-        &server,
-        vec![
-            sse(vec![
-                ev_response_created("resp-5"),
-                responses::ev_custom_tool_call(
-                    CODE_MODE_CALL_ID,
-                    "exec",
-                    &format!(
-                        "const result = await tools.skills__read({{package: {SKILL_PACKAGE:?}, resource: {REFERENCED_RESOURCE:?}}}); text(JSON.stringify({{contents: result.contents, next_cursor: result.next_cursor}}));"
-                    ),
-                ),
-                ev_completed("resp-5"),
-            ]),
-            sse(vec![ev_response_created("resp-6"), ev_completed("resp-6")]),
-        ],
-    )
-    .await;
-    test.submit_turn("Read the complete skill resource using code mode.")
-        .await?;
-    let requests = response.requests();
-    assert_eq!(requests.len(), 2);
-    let output = requests[1].custom_tool_call_output(CODE_MODE_CALL_ID);
-    let nested_result = output["output"]
-        .as_array()
-        .and_then(|items| items.last())
-        .and_then(|item| item["text"].as_str())
-        .ok_or_else(|| anyhow::anyhow!("code mode should return the nested skill result"))?;
-    assert_eq!(
-        serde_json::from_str::<Value>(nested_result)?,
-        json!({"contents": referenced_contents, "next_cursor": null})
-    );
-
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn production_turn_aliases_discovered_singleton_orchestrator_root() -> Result<()> {
-    skip_if_no_network!(Ok(()));
-
-    const SKILL_ROOT: &str = "skill://plugin_connector_1p_2330815c823c8191941e5dc465bb899f";
-    const SKILL_BODY: &str = "ORCHESTRATOR_SKILL_REMAINS_AVAILABLE_WITHOUT_HOST_DISCOVERY";
-
-    let server = responses::start_mock_server().await;
-    let apps_server = AppsTestServer::mount(&server).await?;
-    let response = mount_sse_once(
-        &server,
-        sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
-    )
-    .await;
-
-    Mock::given(method("POST"))
-        .and(path_regex("^/api/codex/ps/mcp/?$"))
-        .and(|request: &Request| {
-            serde_json::from_slice::<Value>(&request.body).is_ok_and(|body| {
-                matches!(
-                    body["method"].as_str(),
-                    Some("resources/list" | "resources/read")
-                )
-            })
-        })
-        .respond_with(|request: &Request| {
-            let body: Value = serde_json::from_slice(&request.body)
-                .expect("MCP resource request should be valid JSON");
-            let result = if body["method"] == "resources/read" {
-                let uri = format!("{SKILL_ROOT}/search/SKILL.md");
-                assert_eq!(body["params"]["uri"], uri);
-                json!({
-                    "contents": [{
-                        "uri": uri,
-                        "mimeType": "text/markdown",
-                        "text": SKILL_BODY,
-                    }],
-                })
-            } else {
-                json!({
-                    "resources": [{
-                        "name": "search",
-                        "uri": format!("{SKILL_ROOT}/search"),
-                        "description": "Search company knowledge.",
-                        "mimeType": "mcp/skill",
-                        "_meta": {
-                            "plugin_name": "demo",
-                            "skill_name": "search",
-                            "allow_implicit_invocation": true,
-                        },
-                    }],
-                })
-            };
-            ResponseTemplate::new(/*status*/ 200).set_body_json(json!({
-                "jsonrpc": "2.0",
-                "id": body["id"],
-                "result": result,
-            }))
-        })
-        .with_priority(/*p*/ 1)
-        .mount(&server)
-        .await;
-
-    let mut extensions = ExtensionRegistryBuilder::new();
-    install_with_providers(
-        &mut extensions,
-        SkillProviders::new()
-            .with_orchestrator_provider(Arc::new(OrchestratorSkillProvider::new())),
-        |config: &Config| SkillsExtensionConfig {
-            include_instructions: config.include_skill_instructions,
-            max_context_tokens: config.skill_max_context_tokens,
-            bundled_skills_enabled: false,
-            orchestrator_skills_enabled: true,
-            shadow_selection_enabled: false,
-        },
-    );
-    let mut builder = apps_enabled_builder(apps_server.chatgpt_base_url)
-        .with_exec_server_url("none")
-        .with_extensions(Arc::new(extensions.build()))
-        .with_model_info_override("gpt-5.5", |model_info| {
-            model_info.context_window = Some(1_000);
-            model_info.max_context_window = None;
-        })
-        .with_config(|config| {
-            config.include_skill_instructions = true;
-            config.orchestrator_skills_enabled = true;
-            config
-                .features
-                .enable(Feature::SkipHostSkillDiscovery)
-                .expect("orchestrator skills must not depend on host discovery");
-        });
-    let test = builder.build_with_auto_env(&server).await?;
-    wait_for_mcp_server(&test.codex, CODEX_APPS_MCP_SERVER_NAME).await?;
-
-    test.submit_turn("Use $demo:search.").await?;
-
-    let request = response.single_request();
-    let developer_text = request.message_input_texts("developer").join("\n");
-    assert!(
-        developer_text.contains(&format!("- `o0` = `{SKILL_ROOT}`")),
-        "model request should include the discovered orchestrator root: {developer_text}"
-    );
-    assert!(
-        developer_text.lines().any(|line| {
-            line.starts_with("- demo:search:")
-                && line.ends_with("(orchestrator package: o0/search)")
-        }),
-        "model request should include the aliased orchestrator skill: {developer_text}"
-    );
-    assert!(
-        developer_text.contains("- Root aliases: Pass short package locators directly"),
-        "model request should explain how to read aliased packages: {developer_text}"
-    );
-    let user_text = request.message_input_texts("user").join("\n");
-    assert!(
-        user_text.contains("<skill>\n<name>demo:search</name>") && user_text.contains(SKILL_BODY),
-        "orchestrator instruction reads must remain available without host discovery: {user_text}"
-    );
-
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn production_turn_aliases_executor_skill_roots() -> Result<()> {
     const SKILL_ROOT: &str =
         "skill://integration-executor/workspace/plugins/cache/executor-plugin/1.0.0/skills";
@@ -1532,7 +1043,7 @@ async fn opted_in_executor_provider_skips_host_discovery_but_injects_discovered_
             include_instructions: config.include_skill_instructions,
             max_context_tokens: config.skill_max_context_tokens,
             bundled_skills_enabled: false,
-            orchestrator_skills_enabled: false,
+            cloud_skill_enabled: false,
             shadow_selection_enabled: false,
         },
     );
@@ -1598,6 +1109,9 @@ async fn opted_in_executor_provider_skips_host_discovery_but_injects_discovered_
     let executor_thread = test
         .thread_manager
         .start_thread(StartThreadOptions {
+            // Keep the trace fixture's legacy mode: paginated SQLite workers can close
+            // spans through a different subscriber than this test's scoped collector.
+            history_mode: Some(codex_protocol::protocol::ThreadHistoryMode::Legacy),
             environments: Some(vec![environment.clone()]),
             thread_extension_init,
             ..StartThreadOptions::new(executor_config)
@@ -1713,7 +1227,7 @@ async fn opted_in_executor_provider_skips_host_discovery_but_injects_discovered_
         "startup_prewarm",
         "turn_context.build",
         "capability_roots.snapshot_for_step",
-        "skills.executor.catalog_snapshot",
+        "skills.executor.refresh_executor_catalog",
     ] {
         assert!(
             logs.contains(span),
@@ -1758,7 +1272,7 @@ async fn executor_only_provider_preserves_structured_repo_skill_without_discover
             include_instructions: config.include_skill_instructions,
             max_context_tokens: config.skill_max_context_tokens,
             bundled_skills_enabled: false,
-            orchestrator_skills_enabled: false,
+            cloud_skill_enabled: false,
             shadow_selection_enabled: false,
         },
     );
@@ -1902,7 +1416,7 @@ async fn executor_skill_tool_reads_references_under_current_permissions(
             include_instructions: config.include_skill_instructions,
             max_context_tokens: config.skill_max_context_tokens,
             bundled_skills_enabled: false,
-            orchestrator_skills_enabled: false,
+            cloud_skill_enabled: false,
             shadow_selection_enabled: false,
         },
     );
@@ -2204,7 +1718,7 @@ async fn explicit_executor_skill_prompt_rejects_oversized_resource() -> Result<(
             include_instructions: config.include_skill_instructions,
             max_context_tokens: config.skill_max_context_tokens,
             bundled_skills_enabled: false,
-            orchestrator_skills_enabled: false,
+            cloud_skill_enabled: false,
             shadow_selection_enabled: false,
         },
     );
@@ -2363,10 +1877,10 @@ async fn executor_skill_invocation_is_environment_scoped_and_deduplicated() -> R
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn production_turn_aliases_combined_skill_catalogs_under_shared_budget() -> Result<()> {
+async fn production_turn_aliases_catalogs_with_separate_cloud_budget() -> Result<()> {
     const EXECUTOR_ROOT: &str =
         "skill://integration-executor/workspace/plugins/cache/executor-plugin/1.0.0/skills";
-    const ORCHESTRATOR_ROOT: &str = "skill://plugin_connector_1p_2330815c823c8191941e5dc465bb899f";
+    const CLOUD_ROOT: &str = "skill://plugin_connector_1p_2330815c823c8191941e5dc465bb899f";
 
     let server = responses::start_mock_server().await;
     let response = mount_sse_once(
@@ -2421,12 +1935,12 @@ async fn production_turn_aliases_combined_skill_catalogs_under_shared_budget() -
                     "executor",
                 ),
             }))
-            .with_orchestrator_provider(Arc::new(CatalogSkillProvider {
+            .with_cloud_provider(Arc::new(CatalogSkillProvider {
                 catalog: resource_catalog(
-                    SkillSourceKind::Orchestrator,
-                    "integration-orchestrator",
-                    ORCHESTRATOR_ROOT,
-                    "orchestrator",
+                    SkillSourceKind::Cloud,
+                    "integration-cloud",
+                    CLOUD_ROOT,
+                    "cloud",
                 ),
             }))
             .with_host_provider(Arc::new(HostSkillProvider::new())),
@@ -2434,7 +1948,7 @@ async fn production_turn_aliases_combined_skill_catalogs_under_shared_budget() -
             include_instructions: config.include_skill_instructions,
             max_context_tokens: config.skill_max_context_tokens,
             bundled_skills_enabled: false,
-            orchestrator_skills_enabled: true,
+            cloud_skill_enabled: true,
             shadow_selection_enabled: false,
         },
     );
@@ -2448,7 +1962,7 @@ async fn production_turn_aliases_combined_skill_catalogs_under_shared_budget() -
         })
         .with_config(|config| {
             configure_catalog_test(config);
-            config.orchestrator_skills_enabled = true;
+            config.cloud_skill_enabled = true;
         });
     let test = builder.build_with_auto_env(&server).await?;
 
@@ -2463,7 +1977,7 @@ async fn production_turn_aliases_combined_skill_catalogs_under_shared_budget() -
         .replace('\\', "/");
     for (alias, root) in [
         ("e0", EXECUTOR_ROOT),
-        ("o0", ORCHESTRATOR_ROOT),
+        ("c0", CLOUD_ROOT),
         ("r0", host_root.as_str()),
     ] {
         assert!(
@@ -2473,7 +1987,7 @@ async fn production_turn_aliases_combined_skill_catalogs_under_shared_budget() -
     }
     for (source, alias, prefix, suffix) in [
         ("executor package", "e0", "executor", ""),
-        ("orchestrator package", "o0", "orchestrator", ""),
+        ("cloud package", "c0", "cloud", ""),
         ("file", "r0", "host", "/SKILL.md"),
     ] {
         for name in ["search", "review", "summarize"] {
@@ -2488,113 +2002,267 @@ async fn production_turn_aliases_combined_skill_catalogs_under_shared_budget() -
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial]
 async fn production_turn_scales_extension_catalog_from_resolved_model_window() -> Result<()> {
+    assert_catalog_model_switch(/*max_context_tokens*/ None).await
+}
+
+async fn assert_catalog_model_switch(max_context_tokens: Option<usize>) -> Result<()> {
+    const MODEL_A: &str = "skills-model-a";
+    const MODEL_B: &str = "skills-model-b";
+    let server = responses::start_mock_server().await;
+    let response = responses::mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_response_created("resp-a"),
+                responses::ev_function_call(
+                    "plan",
+                    "update_plan",
+                    &json!({
+                        "plan": [{"step": "Inspect skills", "status": "completed"}]
+                    })
+                    .to_string(),
+                ),
+                ev_completed("resp-a"),
+            ]),
+            sse(vec![ev_response_created("resp-b"), ev_completed("resp-b")]),
+        ],
+    )
+    .await;
+    let codex_home = Arc::new(TempDir::new()?);
+    // Use the normal metrics sink to verify core's model attribution.
+    let telemetry = OtelProvider::try_new(&OtelSettings {
+        http_client_factory: codex_core::test_support::default_http_client_factory(),
+        environment: "test".to_string(),
+        service_name: "skills-model-switch".to_string(),
+        service_version: env!("CARGO_PKG_VERSION").to_string(),
+        codex_home: codex_home.path().to_path_buf(),
+        exporter: OtelExporter::None,
+        trace_exporter: OtelExporter::None,
+        metrics_exporter: OtelExporter::OtlpHttp {
+            endpoint: format!("{}/metrics", server.uri()),
+            headers: Default::default(),
+            protocol: OtelHttpProtocol::Json,
+            tls: None,
+        },
+        runtime_metrics: true,
+        span_attributes: Default::default(),
+        tracestate: Default::default(),
+    })
+    .map_err(|error| anyhow::anyhow!("{error}"))?
+    .expect("metrics provider");
     let skill_count = 800;
-    let mut included_counts = Vec::new();
-    for (context_window, max_context_window, expected_budget) in
-        [(Some(10_000), None, 200), (None, Some(400_000), 8_000)]
-    {
-        let server = responses::start_mock_server().await;
-        let response = mount_sse_once(
-            &server,
-            sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
-        )
-        .await;
-        let source_kind = SkillSourceKind::Custom("test".to_string());
-        let catalog = SkillCatalog {
-            entries: (0..skill_count)
-                .map(|index| {
-                    let name = format!("skill-{index:03}");
-                    SkillCatalogEntry::new(
-                        SkillPackageId(format!("test/{name}")),
-                        SkillAuthority::new(source_kind.clone(), "test"),
-                        name.clone(),
-                        "A description long enough to keep the catalog under sustained budget pressure.",
-                        SkillResourceId::new(format!("{name}/SKILL.md")),
-                    )
-                    .with_display_path(format!("skill://test/{name}/SKILL.md"))
+    let catalog = SkillCatalog {
+        entries: (0..skill_count)
+            .map(|index| {
+                let name = format!("skill-{index:03}");
+                SkillCatalogEntry::new(
+                    SkillPackageId(format!("test/{name}")),
+                    SkillAuthority::new(SkillSourceKind::Host, "test"),
+                    name.clone(),
+                    "A description long enough to keep the catalog under sustained budget pressure.",
+                    SkillResourceId::new(format!("{name}/SKILL.md")),
+                )
+                .with_display_path(format!("skill://test/{name}/SKILL.md"))
+            })
+            .collect(),
+        warnings: Vec::new(),
+    };
+    let (started, mut discovery) = tokio::sync::mpsc::unbounded_channel();
+    let provider = Arc::new(PausedCatalogSkillProvider {
+        inner: CatalogSkillProvider { catalog },
+        first_discovery: AtomicBool::new(/*v*/ true),
+        started,
+        resume: tokio::sync::Semaphore::new(/*permits*/ 0),
+    });
+    let (event_tx, event_rx) = std::sync::mpsc::channel();
+    let mut extensions =
+        ExtensionRegistryBuilder::<Config>::with_event_sink(Arc::new(ChannelEventSink(event_tx)));
+    install_with_providers(
+        &mut extensions,
+        SkillProviders::new().with_host_provider(provider.clone()),
+        |config: &Config| SkillsExtensionConfig {
+            include_instructions: config.include_skill_instructions,
+            max_context_tokens: config.skill_max_context_tokens,
+            bundled_skills_enabled: false,
+            cloud_skill_enabled: false,
+            shadow_selection_enabled: false,
+        },
+    );
+    let mut builder = test_codex()
+        .with_home(codex_home)
+        .with_model(MODEL_A)
+        .with_extensions(Arc::new(extensions.build()))
+        .with_config(move |config| {
+            configure_catalog_test(config);
+            config
+                .features
+                .enable(Feature::StepModelSwitching)
+                .expect("model switching");
+            config.skill_max_context_tokens =
+                max_context_tokens.and_then(std::num::NonZeroUsize::new);
+            let template = bundled_models_response()
+                .expect("bundled models")
+                .models
+                .into_iter()
+                .find(|model| model.slug == "gpt-5.5")
+                .expect("gpt-5.5");
+            config.model_catalog = Some(ModelsResponse {
+                models: [
+                    (MODEL_A, Some(10_000), None, false),
+                    (MODEL_B, None, Some(400_000), true),
+                ]
+                .into_iter()
+                .map(|(slug, window, max_window, usage)| {
+                    let mut model = template.clone();
+                    model.slug = slug.to_string();
+                    model.context_window = window;
+                    model.max_context_window = max_window;
+                    // Distinguish the resolved window from the smaller usable limit.
+                    model.effective_context_window_percent = 50;
+                    model.include_skills_usage_instructions = usage;
+                    model
                 })
                 .collect(),
-            warnings: Vec::new(),
-        };
-        let (event_tx, event_rx) = std::sync::mpsc::channel();
-        let mut extensions = ExtensionRegistryBuilder::<Config>::with_event_sink(Arc::new(
-            ChannelEventSink(event_tx),
-        ));
-        install_with_providers(
-            &mut extensions,
-            SkillProviders::new().with_provider(SkillProviderSource::new(
-                source_kind,
-                "test",
-                Arc::new(StaticSkillProvider {
-                    catalog,
-                    main_prompt_contents: None,
-                }),
-            )),
-            |config: &Config| SkillsExtensionConfig {
-                include_instructions: config.include_skill_instructions,
-                max_context_tokens: config.skill_max_context_tokens,
-                bundled_skills_enabled: false,
-                orchestrator_skills_enabled: false,
-                shadow_selection_enabled: false,
-            },
-        );
-        let mut builder = test_codex()
-            .with_extensions(Arc::new(extensions.build()))
-            .with_model_info_override("gpt-5.5", move |model_info| {
-                model_info.context_window = context_window;
-                model_info.max_context_window = max_context_window;
-            })
-            .with_config(|config| {
-                config.include_skill_instructions = true;
             });
-        let test = builder.build_with_auto_env(&server).await?;
+        });
+    let test = builder.build_with_auto_env(&server).await?;
+    test.codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "Inspect the available skills.".to_string(),
+            text_elements: Vec::new(),
+        }]))
+        .await?;
+    let turn_id = tokio::time::timeout(Duration::from_secs(/*secs*/ 10), discovery.recv())
+        .await?
+        .expect("A catalog discovery started");
+    let (reply, outcome) = tokio::sync::oneshot::channel();
+    test.codex
+        .submit(Op::TurnSettings {
+            turn_id,
+            update: TurnSettingsUpdate {
+                model: Some(MODEL_B.to_string()),
+                ..Default::default()
+            },
+            reply,
+        })
+        .await?;
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(/*secs*/ 10), outcome).await??,
+        TurnSettingsUpdateOutcome::Applied
+    );
+    provider.resume.add_permits(/*n*/ 1);
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
 
-        test.submit_turn("Inspect the available skills.").await?;
-        let request = response.single_request();
+    let requests = response.requests();
+    assert_eq!(requests.len(), 2);
+    let mut included_counts = Vec::new();
+    for (request, (model, default_budget, include_usage)) in requests
+        .iter()
+        .zip([(MODEL_A, 200, false), (MODEL_B, 8_000, true)])
+    {
+        assert_eq!(request.body_json()["model"], model);
         let developer_texts = request.message_input_texts("developer");
+        // B retains A in history and appends its own changed catalog.
         let catalog_text = developer_texts
             .iter()
+            .rev()
             .find(|text| text.contains("skill://test/"))
-            .unwrap_or_else(|| {
-                panic!(
-                    "production request should include the extension skill catalog, got {developer_texts:?}"
-                )
-            });
+            .expect("catalog in provider request");
+        assert_eq!(
+            catalog_text.contains("### How to use skills"),
+            include_usage
+        );
         let metadata_lines = catalog_text
             .lines()
             .skip_while(|line| *line != "### Available skills")
-            .skip(1)
+            .skip(/*n*/ 1)
             .take_while(|line| !line.starts_with("### "))
             .filter(|line| line.starts_with("- "))
             .collect::<Vec<_>>();
-        let metadata_cost = metadata_lines.iter().fold(0usize, |cost, line| {
-            cost.saturating_add(approx_token_count(&format!("{line}\n")))
-        });
+        let metadata_cost = metadata_lines
+            .iter()
+            .map(|line| approx_token_count(&format!("{line}\n")))
+            .sum::<usize>();
+        let budget = max_context_tokens.unwrap_or(default_budget);
+        assert!(
+            metadata_cost <= budget,
+            "catalog cost {metadata_cost} exceeds {budget}"
+        );
+        assert!(
+            metadata_cost > budget / 2,
+            "catalog incorrectly used the usable inference limit"
+        );
         let included_count = metadata_lines
             .iter()
             .filter(|line| line.starts_with("- skill-"))
             .count();
-        let warning = event_rx.try_recv()?.into_warning();
-        let omitted_count = skill_count - included_count;
-
-        assert!(catalog_text.contains("additional skills omitted"));
+        assert!(included_count > 0 && included_count < skill_count);
         assert!(!catalog_text.contains(
             "A description long enough to keep the catalog under sustained budget pressure."
         ));
-        assert!(metadata_cost <= expected_budget);
-        assert_eq!(
-            warning.message,
-            format!(
-                "Exceeded skills context budget. All skill descriptions were removed and {omitted_count} additional skills were not included in the model-visible skills list."
-            )
-        );
         included_counts.push(included_count);
     }
+    if max_context_tokens.is_some() {
+        assert_eq!(included_counts[0], included_counts[1]);
+    } else {
+        assert!(included_counts[0] < included_counts[1]);
+    }
+    let warnings = event_rx
+        .try_iter()
+        .map(|event| event.into_warning().message)
+        .collect::<Vec<_>>();
+    let mut expected_warnings = included_counts
+        .iter()
+        .map(|count| {
+            format!(
+                "Exceeded skills context budget. All skill descriptions were removed and {} additional skills were not included in the model-visible skills list.",
+                skill_count - count,
+            )
+        })
+        .collect::<Vec<_>>();
+    expected_warnings.dedup();
+    assert_eq!(warnings, expected_warnings);
 
-    assert!(included_counts[0] > 0);
-    assert!(included_counts[0] < included_counts[1]);
-
+    let snapshot = telemetry.metrics().expect("metrics client").snapshot()?;
+    let metric = snapshot
+        .scope_metrics()
+        .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics)
+        .find(|metric| metric.name() == THREAD_SKILLS_KEPT_TOTAL_METRIC)
+        .expect("catalog metrics");
+    let AggregatedMetrics::F64(MetricData::Histogram(histogram)) = metric.data() else {
+        panic!("catalog metric should be a histogram");
+    };
+    let mut samples = histogram
+        .data_points()
+        .filter_map(|point| {
+            let attributes = point
+                .attributes()
+                .map(|attribute| (attribute.key.as_str(), attribute.value.as_str().to_string()))
+                .collect::<std::collections::BTreeMap<_, _>>();
+            (attributes.get("catalog_surface").map(String::as_str) == Some("host_world_state")
+                && matches!(
+                    attributes.get("model").map(String::as_str),
+                    Some(MODEL_A | MODEL_B)
+                ))
+            .then(|| (attributes["model"].clone(), point.count(), point.sum()))
+        })
+        .collect::<Vec<_>>();
+    samples.sort_by(|left, right| left.0.cmp(&right.0));
+    assert_eq!(
+        samples,
+        vec![
+            (MODEL_A.to_string(), 1, included_counts[0] as f64),
+            (MODEL_B.to_string(), 1, included_counts[1] as f64),
+        ]
+    );
+    telemetry
+        .shutdown_with_timeout(Duration::from_secs(/*secs*/ 5))
+        .await?;
     Ok(())
 }
 
@@ -2642,6 +2310,7 @@ async fn production_turn_shares_catalog_budget_across_host_and_executor_sections
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial]
 async fn production_turn_uses_configured_skill_catalog_token_budget() -> Result<()> {
     let server = responses::start_mock_server().await;
     let response = mount_sse_once(
@@ -2684,7 +2353,7 @@ async fn production_turn_uses_configured_skill_catalog_token_budget() -> Result<
     assert_full_descriptions(&executor_lines, &EXECUTOR_CATALOG);
     assert!(metadata_cost(&combined_lines) <= 800);
 
-    Ok(())
+    assert_catalog_model_switch(Some(800)).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2855,7 +2524,7 @@ async fn production_turn_uses_provider_host_catalog_and_core_snapshot_injection(
             include_instructions: config.include_skill_instructions,
             max_context_tokens: config.skill_max_context_tokens,
             bundled_skills_enabled: false,
-            orchestrator_skills_enabled: false,
+            cloud_skill_enabled: false,
             shadow_selection_enabled: false,
         },
     );
@@ -2975,7 +2644,7 @@ async fn production_turn_suppresses_only_the_superseded_host_skill_prompt() -> R
             include_instructions: config.include_skill_instructions,
             max_context_tokens: config.skill_max_context_tokens,
             bundled_skills_enabled: false,
-            orchestrator_skills_enabled: false,
+            cloud_skill_enabled: false,
             shadow_selection_enabled: false,
         },
     );
@@ -3197,31 +2866,19 @@ async fn production_turn_keeps_full_executor_only_catalog_when_it_fits() -> Resu
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn production_turn_keeps_orchestrator_world_state_incremental_across_turns() -> Result<()> {
+async fn production_turn_keeps_rebalanced_catalogs_stable_after_compaction_and_resume() -> Result<()>
+{
     let server = responses::start_mock_server().await;
-    let response = responses::mount_sse_sequence(
-        &server,
-        ["resp-1", "resp-2"]
-            .into_iter()
-            .map(|response_id| {
-                sse(vec![
-                    ev_response_created(response_id),
-                    ev_completed(response_id),
-                ])
-            })
-            .collect(),
-    )
-    .await;
-    let skill_name = "orchestrator-search";
-    let skill_description = "Search available company knowledge.";
-    let skill_resource = "skill://codex_apps/orchestrator-search/SKILL.md";
+    let skill_name = "cloud-search";
+    let skill_description = "Search available company knowledge. ".repeat(40);
+    let skill_resource = "skill://codex_apps/cloud-search/SKILL.md";
     let catalog = SkillCatalog {
         entries: vec![
             SkillCatalogEntry::new(
-                SkillPackageId("orchestrator/orchestrator-search".to_string()),
-                SkillAuthority::new(SkillSourceKind::Orchestrator, CODEX_APPS_MCP_SERVER_NAME),
+                SkillPackageId("cloud/cloud-search".to_string()),
+                SkillAuthority::new(SkillSourceKind::Cloud, CODEX_APPS_MCP_SERVER_NAME),
                 skill_name,
-                skill_description,
+                skill_description.as_str(),
                 SkillResourceId::new(skill_resource),
             )
             .with_display_path(skill_resource),
@@ -3232,61 +2889,296 @@ async fn production_turn_keeps_orchestrator_world_state_incremental_across_turns
     install_with_providers(
         &mut extensions,
         SkillProviders::new()
-            .with_orchestrator_provider(Arc::new(CatalogSkillProvider { catalog })),
+            .with_cloud_provider(Arc::new(CatalogSkillProvider { catalog }))
+            .with_executor_provider(Arc::new(CatalogSkillProvider {
+                catalog: executor_catalog(&EXECUTOR_CATALOG),
+            })),
         |config: &Config| SkillsExtensionConfig {
             include_instructions: config.include_skill_instructions,
             max_context_tokens: config.skill_max_context_tokens,
             bundled_skills_enabled: false,
-            orchestrator_skills_enabled: config.orchestrator_skills_enabled,
+            cloud_skill_enabled: config.cloud_skill_enabled,
             shadow_selection_enabled: false,
         },
     );
     let mut builder = test_codex()
+        .with_exec_server_url("none")
         .with_extensions(Arc::new(extensions.build()))
+        .with_model_info_override("gpt-5.5", |model_info| {
+            model_info.context_window = Some(12_000);
+            model_info.max_context_window = None;
+        })
         .with_config(|config| {
             configure_catalog_test(config);
-            config.orchestrator_skills_enabled = true;
+            config.cloud_skill_enabled = true;
+            config.model_provider.name = "Skills compaction test".to_string();
+            config.model_post_turn_compact_threshold_percent = 50;
+            config
+                .features
+                .enable(Feature::DeferredExecutor)
+                .expect("enable deferred executor");
+            config
+                .features
+                .disable(Feature::ExecutorCapabilityDiscovery)
+                .expect("disable executor capability discovery");
         });
-    let test = builder.build_with_auto_env(&server).await?;
-    let orchestrator_thread = test
+    // The executor below runs in this process, so use host-local workspace paths.
+    let test = builder.build(&server).await?;
+    // Use a real remote transport: cloud skills are disabled for local attachments.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let executor_address = listener.local_addr()?;
+    let executor_url = format!("ws://{executor_address}");
+    drop(listener);
+    let runtime_paths = codex_exec_server::ExecServerRuntimeOptions::new(
+        std::env::current_exe()?,
+        /*codex_linux_sandbox_exe*/ None,
+    )?;
+    let http_client_factory = test.config.http_client_factory();
+    let server_url = executor_url.clone();
+    let executor = tokio::spawn(async move {
+        codex_exec_server::run_main(&server_url, runtime_paths, http_client_factory).await
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while tokio::net::TcpStream::connect(executor_address)
+            .await
+            .is_err()
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    test.thread_manager
+        .environment_manager()
+        .upsert_environment(
+            "skills-executor".to_string(),
+            executor_url,
+            /*connect_timeout*/ None,
+        )?;
+    let pending_selection = TurnEnvironmentSelection {
+        environment_id: "skills-executor".to_string(),
+        cwd: PathUri::from_abs_path(&test.config.cwd),
+        workspace_roots: vec![PathUri::from_abs_path(&test.config.cwd)],
+        config: EnvironmentConfigState::Pending,
+    };
+    let mut thread_extension_init = ExtensionDataInit::default();
+    thread_extension_init.insert(WaitForEnvironmentToolConfig {
+        tool_description: "Wait for the selected environment.".to_string(),
+        environment_id_description: "Selected environment ID.".to_string(),
+    });
+    let cloud_thread = test
         .thread_manager
         .start_thread(StartThreadOptions {
-            environments: Some(Vec::new()),
+            environments: Some(vec![pending_selection.clone()]),
+            thread_extension_init: thread_extension_init.clone(),
             ..StartThreadOptions::new(test.config.clone())
         })
         .await?;
+    let response = responses::mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_response_created("resp-1"),
+                responses::ev_function_call(
+                    "wait-for-skills",
+                    "wait_for_environment",
+                    &json!({ "environment_id": pending_selection.environment_id }).to_string(),
+                ),
+                ev_completed("resp-1"),
+            ]),
+            sse(vec![ev_response_created("resp-2"), ev_completed("resp-2")]),
+            // Cross the post-turn threshold only after the allocation has stabilized.
+            sse(vec![
+                ev_response_created("resp-3"),
+                responses::ev_completed_with_tokens("resp-3", /*total_tokens*/ 7_000),
+            ]),
+            sse(vec![
+                ev_response_created("compact"),
+                responses::ev_assistant_message("summary", "The available skills were inspected."),
+                ev_completed("compact"),
+            ]),
+            sse(vec![
+                ev_response_created("resp-4"),
+                responses::ev_function_call(
+                    "wait-for-resumed-skills",
+                    "wait_for_environment",
+                    &json!({ "environment_id": pending_selection.environment_id }).to_string(),
+                ),
+                ev_completed("resp-4"),
+            ]),
+            sse(vec![ev_response_created("resp-5"), ev_completed("resp-5")]),
+        ],
+    )
+    .await;
 
-    for prompt in [
+    let mut ready_config = environment_config_for_selection(&test.config, &pending_selection);
+    ready_config.selected_capability_roots = vec![SelectedCapabilityRoot {
+        id: "skills".to_string(),
+        location: CapabilityRootLocation::Environment {
+            environment_id: pending_selection.environment_id.clone(),
+            path: pending_selection.cwd.clone(),
+        },
+    }];
+    for (turn_index, prompt) in [
         "Inspect the available skills.",
         "Inspect the available skills again.",
-    ] {
-        orchestrator_thread
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        cloud_thread
             .thread
             .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
                 text: prompt.to_string(),
                 text_elements: Vec::new(),
             }]))
             .await?;
-        core_test_support::wait_for_event(&orchestrator_thread.thread, |event| {
+        if turn_index == 0 {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while response.requests().is_empty() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await?;
+            assert!(
+                cloud_thread
+                    .thread
+                    .inspect_selected_capability_roots()
+                    .ready_roots
+                    .is_empty()
+            );
+            cloud_thread
+                .thread
+                .environment_ready(&pending_selection, ready_config.clone())
+                .await?;
+        }
+        core_test_support::wait_for_event(&cloud_thread.thread, |event| {
             matches!(event, EventMsg::TurnComplete(_))
         })
         .await;
     }
 
+    cloud_thread.thread.shutdown_and_wait().await?;
+    let history = test
+        .thread_store
+        .load_latest_model_context(LoadThreadHistoryParams {
+            thread_id: cloud_thread.session_configured.thread_id,
+            include_archived: true,
+        })
+        .await?;
+    let checkpoint = history
+        .items
+        .iter()
+        .rev()
+        .find_map(|item| match item {
+            RolloutItem::WorldState(checkpoint) => Some(checkpoint),
+            _ => None,
+        })
+        .expect("compaction retains an allocation checkpoint");
+    let allocation = checkpoint.state["cloud_skills"]["allocation"]
+        .as_object()
+        .expect("retained allocation");
+    assert_eq!(
+        serde_json::to_value(checkpoint)?,
+        json!({
+            "full": true,
+            "state": { "cloud_skills": { "allocation": allocation } },
+        }),
+        "compaction retains only allocation metadata, not rendered catalogs",
+    );
+    let resumed = test
+        .thread_manager
+        .start_thread(StartThreadOptions {
+            initial_history: InitialHistory::Resumed(ResumedHistory {
+                conversation_id: history.thread_id,
+                history: Arc::new(history.items),
+                rollout_path: cloud_thread.session_configured.rollout_path.clone(),
+            }),
+            environments: Some(vec![pending_selection.clone()]),
+            thread_extension_init,
+            ..StartThreadOptions::new(test.config.clone())
+        })
+        .await?;
+    resumed
+        .thread
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "Inspect the skills after resuming.".to_string(),
+            text_elements: Vec::new(),
+        }]))
+        .await?;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while response.requests().len() < 5 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await?;
+    assert!(
+        resumed
+            .thread
+            .inspect_selected_capability_roots()
+            .ready_roots
+            .is_empty()
+    );
+    resumed
+        .thread
+        .environment_ready(&pending_selection, ready_config)
+        .await?;
+    wait_for_event(&resumed.thread, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+    resumed.thread.shutdown_and_wait().await?;
+    executor.abort();
     let requests = response.requests();
-    assert_eq!(requests.len(), 2);
-    let expected_line = format!(
-        "- {skill_name}: {skill_description} (orchestrator package: orchestrator/orchestrator-search)"
+    assert_eq!(requests.len(), 6);
+    let first_developer_text = requests[0].message_input_texts("developer").join("\n");
+    let expected_line = first_developer_text
+        .lines()
+        .find(|line| line.starts_with("- cloud-search:"))
+        .unwrap_or_else(|| {
+            panic!("pending request should advertise cloud skill: {first_developer_text}")
+        });
+    let ready_developer_text = requests[1].message_input_texts("developer").join("\n");
+    let ready_line = ready_developer_text
+        .lines()
+        .rfind(|line| line.starts_with("- cloud-search:"))
+        .expect("ready cloud catalog");
+    let ready_executor_lines = ready_developer_text
+        .lines()
+        .filter(|line| line.starts_with("- exec-"))
+        .collect::<Vec<_>>();
+    assert_ne!(expected_line, ready_line);
+    assert!(
+        EXECUTOR_CATALOG
+            .iter()
+            .all(|(name, _)| ready_developer_text.contains(&format!("- {name}:")))
     );
     for (index, request) in requests.iter().enumerate() {
         let developer_texts = request.message_input_texts("developer");
-        let occurrences = developer_texts
+        let cloud_lines = developer_texts
             .iter()
-            .map(|text| text.matches(&expected_line).count())
-            .sum::<usize>();
+            .flat_map(|text| text.lines())
+            .filter(|line| line.starts_with("- cloud-search:"))
+            .collect::<Vec<_>>();
         assert_eq!(
-            occurrences, 1,
-            "request {index} should contain the orchestrator catalog exactly once: {developer_texts:?}"
+            cloud_lines,
+            match index {
+                0 => vec![expected_line],
+                1..=3 => vec![expected_line, ready_line],
+                _ => vec![ready_line],
+            },
+            "request {index} should only append cloud text when rebalancing prevents omissions",
+        );
+        assert_eq!(
+            developer_texts
+                .iter()
+                .flat_map(|text| text.lines())
+                .filter(|line| line.starts_with("- exec-"))
+                .collect::<Vec<_>>(),
+            if matches!(index, 0 | 4) {
+                Vec::new()
+            } else {
+                ready_executor_lines.clone()
+            },
         );
         assert!(
             developer_texts
@@ -3294,6 +3186,17 @@ async fn production_turn_keeps_orchestrator_world_state_incremental_across_turns
                 .any(|text| text.contains("Read a skill package directly with `skills.read"))
         );
     }
+
+    insta::assert_snapshot!(
+        "cloud_skills_across_executor_readiness",
+        context_snapshot::format_request_history_snapshot(
+            "Cloud skills rebalance once to retain every executor skill. Post-turn compaction and resume restore the same cloud allocation before the executor reconnects; both catalogs are fully reinjected once into the new history.",
+            &requests,
+            &ContextSnapshotOptions::default()
+                .rewrite_known_segments()
+                .include_request_settings(),
+        )
+    );
 
     Ok(())
 }
@@ -3486,9 +3389,7 @@ async fn production_turn_fairly_shortens_extension_catalog_descriptions() -> Res
             .collect(),
         warnings: Vec::new(),
     };
-    let (event_tx, event_rx) = std::sync::mpsc::channel();
-    let mut extensions =
-        ExtensionRegistryBuilder::<Config>::with_event_sink(Arc::new(ChannelEventSink(event_tx)));
+    let mut extensions = ExtensionRegistryBuilder::<Config>::new();
     install_with_providers(
         &mut extensions,
         SkillProviders::new().with_provider(SkillProviderSource::new(
@@ -3503,7 +3404,7 @@ async fn production_turn_fairly_shortens_extension_catalog_descriptions() -> Res
             include_instructions: config.include_skill_instructions,
             max_context_tokens: config.skill_max_context_tokens,
             bundled_skills_enabled: false,
-            orchestrator_skills_enabled: false,
+            cloud_skill_enabled: false,
             shadow_selection_enabled: false,
         },
     );
@@ -3544,11 +3445,6 @@ async fn production_turn_fairly_shortens_extension_catalog_descriptions() -> Res
             .all(|length| *length > 0 && *length < 1_024)
     );
     assert!(!catalog_text.contains("additional skills omitted"));
-    let warning = event_rx.try_recv()?.into_warning();
-    assert_eq!(
-        warning.message,
-        "Skill descriptions were shortened to fit the skills context budget. Codex can still see every skill, but some descriptions are shorter. Disable unused skills or plugins to leave more room for the rest."
-    );
 
     Ok(())
 }

@@ -1,3 +1,4 @@
+use codex_config::McpServerAuth;
 use codex_config::McpServerConfig;
 use codex_config::McpServerEnvVar;
 use codex_config::McpServerTransportConfig;
@@ -155,6 +156,12 @@ fn normalize_plugin_mcp_server(
 
     let mut config = serde_json::from_value::<McpServerConfig>(JsonValue::Object(object))
         .map_err(|err| err.to_string())?;
+    if matches!(config.auth, McpServerAuth::EmaAuth) {
+        return Err(
+            "plugin MCP declarations cannot select ema_auth; configure enterprise authentication in host policy"
+                .to_string(),
+        );
+    }
     if matches!(source, PluginMcpSource::Environment { .. }) {
         bind_environment_env_vars(&mut config)?;
     }
@@ -271,6 +278,12 @@ fn normalize_plugin_mcp_server_value(
 
         if let Some(client_id) = oauth.remove("clientId") {
             oauth.entry("client_id".to_string()).or_insert(client_id);
+        }
+
+        if let Some(client_secret) = oauth.remove("clientSecret") {
+            oauth
+                .entry("client_secret".to_string())
+                .or_insert(client_secret);
         }
 
         if !oauth.is_empty() {

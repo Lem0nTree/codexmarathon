@@ -2,9 +2,9 @@ use crate::history_cell::CompositeHistoryCell;
 use crate::history_cell::HistoryCell;
 use crate::history_cell::PlainHistoryCell;
 use crate::history_cell::plain_lines;
-use crate::history_cell::with_border_with_inner_width;
 use crate::legacy_core::config::Config;
 use crate::line_truncation::line_width;
+use crate::style::accent_color;
 use crate::token_usage::TokenUsage;
 use crate::token_usage::TokenUsageInfo;
 use crate::version::CODEX_CLI_VERSION;
@@ -22,7 +22,7 @@ use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_READ_ONLY;
 use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_WORKSPACE;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::openai_models::ReasoningEffort;
-use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_path_uri::PathUri;
 use codex_utils_sandbox_summary::summarize_permission_profile;
 use ratatui::prelude::*;
 use ratatui::style::Stylize;
@@ -32,7 +32,6 @@ use std::path::PathBuf;
 use super::account::StatusAccountDisplay;
 use super::format::FieldFormatter;
 use super::format::push_label;
-use super::format::truncate_line_to_width;
 use super::helpers::compose_account_display;
 use super::helpers::compose_model_display;
 use super::helpers::format_directory_display;
@@ -48,7 +47,6 @@ use super::rate_limits::render_status_limit_progress_bar;
 use super::remote_connection::RemoteConnectionStatus;
 use super::thread_usage::StatusThreadUsage;
 use crate::wrapping::RtOptions;
-use crate::wrapping::adaptive_wrap_lines;
 use crate::wrapping::word_wrap_lines;
 use std::sync::Arc;
 use std::sync::RwLock;
@@ -299,6 +297,7 @@ impl StatusHistoryCell {
         let approval_policy = AskForApproval::from(config.permissions.approval_policy.value());
         let permission_profile = config.permissions.effective_permission_profile();
         let workspace_roots = config.effective_workspace_roots();
+        let cwd = PathUri::from_abs_path(&config.cwd);
         let model_provider = model_provider_id
             .filter(|id| !id.trim().is_empty())
             .map(str::to_string);
@@ -311,11 +310,7 @@ impl StatusHistoryCell {
             ),
             (
                 "sandbox",
-                summarize_permission_profile(
-                    &permission_profile,
-                    &config.cwd,
-                    workspace_roots.as_slice(),
-                ),
+                summarize_permission_profile(&permission_profile, &cwd, &workspace_roots),
             ),
         ];
         if let Some(provider_id) = &model_provider {
@@ -327,13 +322,15 @@ impl StatusHistoryCell {
                 .map(|effort| effort.to_string())
                 .unwrap_or_else(|| "none".to_string());
             config_entries.push(("reasoning effort", effort_value));
-            config_entries.push((
-                "reasoning summaries",
-                config
-                    .model_reasoning_summary
-                    .map(|summary| summary.to_string())
-                    .unwrap_or_else(|| "auto".to_string()),
-            ));
+            if remote_connection.is_none() {
+                config_entries.push((
+                    "reasoning summaries",
+                    config
+                        .model_reasoning_summary
+                        .map(|summary| summary.to_string())
+                        .unwrap_or_else(|| "auto".to_string()),
+                ));
+            }
         }
         let (model_name, model_details) = compose_model_display(model_name, &config_entries);
         let approval = config_entries
@@ -342,9 +339,8 @@ impl StatusHistoryCell {
             .map(|(_, v)| v.clone())
             .unwrap_or_else(|| "<unknown>".to_string());
         let active_permission_profile = config.permissions.active_permission_profile();
-        let sandbox =
-            status_permission_summary(&permission_profile, &config.cwd, workspace_roots.as_slice());
-        let workspace_root_suffix = workspace_root_suffix(workspace_roots.as_slice(), &config.cwd);
+        let sandbox = status_permission_summary(&permission_profile, &cwd, &workspace_roots);
+        let workspace_root_suffix = workspace_root_suffix(&workspace_roots, &cwd);
         let approval = status_approval_label(approval_policy, config.approvals_reviewer, &approval);
         let permissions = status_permissions_label(
             active_permission_profile.as_ref(),
@@ -610,8 +606,8 @@ impl StatusHistoryCell {
 
 fn status_permission_summary(
     permission_profile: &PermissionProfile,
-    cwd: &AbsolutePathBuf,
-    workspace_roots: &[AbsolutePathBuf],
+    cwd: &PathUri,
+    workspace_roots: &[PathUri],
 ) -> String {
     let summary = summarize_permission_profile(permission_profile, cwd, workspace_roots);
     if let Some(details) = summary.strip_prefix("read-only") {
@@ -632,14 +628,11 @@ fn status_permission_summary(
     summary
 }
 
-fn workspace_root_suffix(
-    workspace_roots: &[AbsolutePathBuf],
-    cwd: &AbsolutePathBuf,
-) -> Option<String> {
+fn workspace_root_suffix(workspace_roots: &[PathUri], cwd: &PathUri) -> Option<String> {
     let extra_roots = workspace_roots
         .iter()
-        .filter(|root| *root != cwd)
-        .map(|root| root.to_string_lossy().to_string())
+        .filter(|root| root.to_string() != cwd.to_string())
+        .map(PathUri::inferred_native_path_string)
         .collect::<Vec<_>>();
     if extra_roots.is_empty() {
         None
@@ -739,18 +732,11 @@ fn status_approval_label(
 
 impl StatusHistoryCell {
     fn content_lines(&self, width: u16) -> Vec<Line<'static>> {
-        let mut lines: Vec<Line<'static>> = Vec::new();
-        lines.push(Line::from(vec![
-            Span::from(format!("{}>_ ", FieldFormatter::INDENT)).dim(),
-            Span::from("OpenAI Codex").bold(),
-            Span::from(" ").dim(),
-            Span::from(format!("(v{CODEX_CLI_VERSION})")).dim(),
-        ]));
-
-        let available_inner_width = usize::from(width.saturating_sub(4));
-        if available_inner_width == 0 {
+        let available_width = usize::from(width);
+        if available_width == 0 {
             return Vec::new();
         }
+        let mut lines = Vec::new();
 
         let account_value = self.account.as_ref().map(|account| match account {
             StatusAccountDisplay::ChatGpt { email, plan } => match (email, plan) {
@@ -808,40 +794,23 @@ impl StatusHistoryCell {
         self.thread_usage.push_labels(&mut labels, &mut seen);
 
         let formatter = FieldFormatter::from_labels(labels.iter().map(String::as_str));
-        let value_width = formatter.value_width(available_inner_width);
+        let value_width = formatter.value_width(available_width);
 
-        let note_first_line = Line::from(vec![
-            Span::from("Visit ").cyan(),
-            CHATGPT_USAGE_URL.cyan().underlined(),
-            Span::from(" for up-to-date").cyan(),
-        ]);
-        let note_second_line = Line::from(vec![
-            Span::from("information on rate limits and credits").cyan(),
-        ]);
-        let note_lines = adaptive_wrap_lines(
-            [note_first_line, note_second_line],
-            RtOptions::new(available_inner_width),
-        );
-        lines.push(Line::from(Vec::<Span<'static>>::new()));
-        // The ChatGPT usage page only applies to providers backed by OpenAI auth;
-        // providers like Bedrock manage limits and billing elsewhere.
-        if self.show_chatgpt_usage_link {
-            lines.extend(note_lines);
-            lines.push(Line::from(Vec::<Span<'static>>::new()));
-        }
         if let Some(remote_connection) = self.remote_connection.as_ref() {
-            let wrapped_remote = word_wrap_lines(
-                [Line::from(vec![
+            let value = if remote_connection.is_local_daemon {
+                Line::from("Local background server")
+            } else {
+                Line::from(vec![
                     Span::from(remote_connection.address.clone()),
                     Span::from(" (").dim(),
                     Span::from(remote_connection.version.clone()).dim(),
                     Span::from(")").dim(),
-                ])],
-                RtOptions::new(value_width.max(1)),
-            );
+                ])
+            };
+            let wrapped_remote = word_wrap_lines([value], RtOptions::new(value_width.max(1)));
             let mut wrapped_remote = wrapped_remote.into_iter();
             if let Some(first) = wrapped_remote.next() {
-                lines.push(formatter.line("Remote", first.spans));
+                lines.push(formatter.line("Server", first.spans));
                 lines.extend(wrapped_remote.map(|line| formatter.continuation(line.spans)));
             }
             lines.push(Line::from(Vec::<Span<'static>>::new()));
@@ -854,7 +823,7 @@ impl StatusHistoryCell {
             model_spans.push(Span::from(")").dim());
         }
 
-        let directory_value = format_directory_display(&self.directory, Some(value_width));
+        let directory_value = format_directory_display(&self.directory, /*max_width*/ None);
 
         lines.push(formatter.line("Model", model_spans));
         if let Some(model_provider) = self.model_provider.as_ref() {
@@ -893,32 +862,81 @@ impl StatusHistoryCell {
             lines.push(formatter.line("Context window", spans));
         }
 
-        lines.extend(self.rate_limit_lines(&rate_limit_state, available_inner_width, &formatter));
+        lines.extend(self.rate_limit_lines(&rate_limit_state, available_width, &formatter));
         let thread_usage_lines = self.thread_usage.lines(&formatter, value_width);
         if !thread_usage_lines.is_empty() {
             lines.push(Line::from(Vec::<Span<'static>>::new()));
             lines.extend(thread_usage_lines);
         }
 
-        lines
+        // Leave room for the two-column title mark even in a tiny terminal.
+        let indent = if available_width >= FieldFormatter::INDENT.len() + 2 {
+            FieldFormatter::INDENT
+        } else {
+            ""
+        };
+        let mut title = vec![indent.into()];
+        title.extend(crate::history_cell::codex_title(CODEX_CLI_VERSION));
+        let mut rendered = word_wrap_lines(
+            [Line::from(title)],
+            RtOptions::new(available_width).subsequent_indent(indent.into()),
+        );
+        rendered.push(Line::default());
+        // Providers such as Bedrock manage limits and billing elsewhere.
+        if self.show_chatgpt_usage_link {
+            rendered.extend(word_wrap_lines(
+                [
+                    Line::from(vec![
+                        "Visit ".fg(accent_color()),
+                        CHATGPT_USAGE_URL.fg(accent_color()).underlined(),
+                        " for up-to-date".fg(accent_color()),
+                    ]),
+                    "information on rate limits and credits"
+                        .fg(accent_color())
+                        .into(),
+                ],
+                RtOptions::new(available_width)
+                    .initial_indent(indent.into())
+                    .subsequent_indent(indent.into())
+                    .word_separator(textwrap::WordSeparator::AsciiSpace)
+                    .word_splitter(textwrap::WordSplitter::NoHyphenation),
+            ));
+            rendered.push(Line::default());
+        }
+        // Keep every value, including long paths and IDs, aligned beneath its first line.
+        // At widths too small for the label column, use the outer indent instead.
+        let continuation = if value_width > 0 {
+            formatter.continuation(Vec::new())
+        } else {
+            indent.into()
+        };
+        let options = RtOptions::new(available_width)
+            .subsequent_indent(continuation)
+            .word_splitter(textwrap::WordSplitter::NoHyphenation);
+        rendered.extend(lines.into_iter().flat_map(|line| {
+            let wrapped = word_wrap_lines([line.clone()], options.clone());
+            if wrapped
+                .iter()
+                .any(|line| line_width(line) > available_width)
+            {
+                // A wide grapheme may not fit after the continuation indent.
+                word_wrap_lines(
+                    [line],
+                    RtOptions::new(available_width)
+                        .word_splitter(textwrap::WordSplitter::NoHyphenation),
+                )
+            } else {
+                wrapped
+            }
+        }));
+
+        rendered
     }
 }
 
 impl HistoryCell for Arc<StatusHistoryCell> {
     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
-        let available_inner_width = usize::from(width.saturating_sub(4));
-        if available_inner_width == 0 {
-            return Vec::new();
-        }
-        let lines = self.content_lines(width);
-        let content_width = lines.iter().map(line_width).max().unwrap_or(0);
-        let inner_width = content_width.min(available_inner_width);
-        let truncated_lines: Vec<Line<'static>> = lines
-            .into_iter()
-            .map(|line| truncate_line_to_width(line, inner_width))
-            .collect();
-
-        with_border_with_inner_width(truncated_lines, inner_width)
+        self.content_lines(width)
     }
 
     fn raw_lines(&self) -> Vec<Line<'static>> {

@@ -1,7 +1,13 @@
 use anyhow::Context;
 use anyhow::Result;
 use codex_core::TurnInputRequest;
+use codex_core::config::Config;
 use codex_core::config::Constrained;
+use codex_extension_api::ExtensionFuture;
+use codex_extension_api::ExtensionRegistryBuilder;
+use codex_extension_api::McpServerContribution;
+use codex_extension_api::McpServerContributionContext;
+use codex_extension_api::McpServerContributor;
 use codex_protocol::config_types::ApprovalsReviewer;
 use codex_protocol::items::McpToolCallStatus;
 use codex_protocol::items::TurnItem;
@@ -13,6 +19,7 @@ use codex_protocol::protocol::GuardianAssessmentStatus;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::user_input::UserInput;
+use core_test_support::apps_test_server::apps_enabled_builder;
 use core_test_support::responses;
 use core_test_support::skip_if_no_network;
 use core_test_support::skip_if_wine_exec;
@@ -41,6 +48,8 @@ pending_call = None
 approval_meta = json.loads(sys.argv[1]) if len(sys.argv) > 1 else {}
 multiple = isinstance(approval_meta, list)
 approval_metas = approval_meta if multiple else [approval_meta]
+browser = len(sys.argv) > 2 and sys.argv[2] == "browser"
+connector_id = sys.argv[4] if len(sys.argv) > 4 else "connector_openai_browser"
 pending_elicitations = []
 approval_results = {}
 for line in sys.stdin:
@@ -51,9 +60,12 @@ for line in sys.stdin:
                   "capabilities": {"tools": {}},
                   "serverInfo": {"name": "guardian-elicitation-test", "version": "1"}}
     elif method == "tools/list":
-        result = {"tools": [{"name": "js" if multiple else "request_approval",
+        result = {"tools": [{"name": "browser_js" if browser else "js" if multiple else "request_approval",
                   "inputSchema": {"type": "object", "properties": {}},
-                  "annotations": {"readOnlyHint": True}}]}
+                  "annotations": {"readOnlyHint": True},
+                  "_meta": {"connector_id": connector_id, "connector_name": "Browser",
+                            "_codex_apps": {"resource_uri": f"/{connector_id}/browser-link/js",
+                                            "contains_mcp_source": True}} if browser else {}}]}
     elif method == "tools/call":
         if request["params"].get("arguments", {}).get("seed"):
             send({"id": request["id"], "result": {"content": [{"type": "text", "text": "seeded"}]}})
@@ -62,8 +74,9 @@ for line in sys.stdin:
         approval_results = {}
         for index, meta in enumerate(approval_metas):
             invocation_meta = {}
-            if len(sys.argv) > 2 and sys.argv[2] == "forward":
-                invocation_meta["callId"] = request["params"]["_meta"]["callId"]
+            if len(sys.argv) > 2 and sys.argv[2] in ("forward", "browser"):
+                key = "_codex_apps" if browser else "callId"
+                invocation_meta[key] = request["params"]["_meta"][key]
             pending_elicitations.append({
                 "id": f"server-approval-{index}" if multiple else "server-approval",
                 "method": "elicitation/create", "params": {
@@ -370,6 +383,26 @@ async fn server_initiated_mcp_elicitation_can_require_synchronous_auto_review(
     Ok(())
 }
 
+struct BrowserMcpServer(codex_config::McpServerConfig);
+
+impl McpServerContributor<Config> for BrowserMcpServer {
+    fn id(&self) -> &'static str {
+        "browser_approval_test"
+    }
+
+    fn contribute<'a>(
+        &'a self,
+        _context: McpServerContributionContext<'a, Config>,
+    ) -> ExtensionFuture<'a, Vec<McpServerContribution>> {
+        Box::pin(async move {
+            vec![McpServerContribution::HostedApps {
+                config: Box::new(self.0.clone()),
+                protocol_mode: None,
+            }]
+        })
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CallIdSource {
     Host,
@@ -380,6 +413,8 @@ enum CallIdSource {
     PreviousTurn,
 }
 
+#[test_case("codex_apps", false, CallIdSource::Host; "browser_connector")]
+#[test_case("codex_apps", true, CallIdSource::Host; "strict_browser_connector")]
 #[test_case("node_repl", false, CallIdSource::Host; "ordinary_node_repl")]
 #[test_case("node_repl", true, CallIdSource::Host; "strict_node_repl")]
 #[test_case("cua_repl", false, CallIdSource::Host; "ordinary_cua_repl")]
@@ -400,12 +435,23 @@ async fn node_elicitations_attribute_independent_reviews_without_changing_action
     skip_if_no_network!(Ok(()));
     skip_if_wine_exec!(Ok(()), "the MCP fixture requires a host Python interpreter");
 
+    let browser = server_name == "codex_apps";
     let actions = [
         (
-            "access_browser_origin",
-            json!({"origin": "https://example.com"}),
+            if browser && strict_auto_review {
+                "automated_safety_precheck.review_browser_auth_safety"
+            } else {
+                "access_browser_origin"
+            },
+            json!({
+                "origin": "https://example.com",
+                "description": "payload ".repeat(/*n*/ 256) + "required argument suffix",
+            }),
         ),
-        ("webmcp:write_record", json!({"record": {"value": 42}})),
+        (
+            "webmcp:example.com:write_record",
+            json!({"record": {"value": 42}}),
+        ),
     ];
     let meta = actions.map(|(tool_name, arguments)| {
         let mut meta = json!({
@@ -433,15 +479,30 @@ async fn node_elicitations_attribute_independent_reviews_without_changing_action
     let fixture_config = json!({
         "command": if cfg!(windows) { "python" } else { "python3" },
         "args": ["-u", "-c", ELICITATION_SERVER, serde_json::to_string(&meta)?,
-                 if call_id_source == CallIdSource::Host { "forward" } else { "omit" }],
+                 if browser { "browser" } else if call_id_source == CallIdSource::Host { "forward" } else { "omit" }],
         "default_tools_approval_mode": "approve",
     });
     let mut mcp_servers = json!({(server_name): fixture_config.clone()});
     if call_id_source == CallIdSource::WrongServer {
-        mcp_servers["cua_repl"] = fixture_config;
+        mcp_servers["cua_repl"] = fixture_config.clone();
     }
     let mcp_servers = serde_json::from_value(mcp_servers)?;
-    let mut builder = test_codex().with_config(move |config| {
+    let builder = if browser {
+        let mut extensions = ExtensionRegistryBuilder::<Config>::new();
+        extensions.mcp_server_contributor(Arc::new(BrowserMcpServer(serde_json::from_value(
+            fixture_config,
+        )?)));
+        apps_enabled_builder(server.uri())
+            .with_extensions(Arc::new(extensions.build()))
+            .with_model_info_override("gpt-5.5", |model| {
+                model.supports_search_tool = false;
+                model.node_repl_auto_review_required = true;
+                model.auto_review_model_override = Some("gpt-5.6-luna".to_string());
+            })
+    } else {
+        test_codex()
+    };
+    let mut builder = builder.with_config(move |config| {
         config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
         config.approvals_reviewer = if strict_auto_review {
             ApprovalsReviewer::User
@@ -493,8 +554,11 @@ async fn node_elicitations_attribute_independent_reviews_without_changing_action
         responses::sse(vec![
             responses::ev_function_call_with_namespace(
                 "eliciting-tool",
-                &format!("mcp__{server_name}"),
-                "js",
+                &format!(
+                    "mcp__{server_name}{}",
+                    if browser { "__browser" } else { "" }
+                ),
+                if browser { "_js" } else { "js" },
                 &parent_arguments.to_string(),
             ),
             responses::ev_completed("parent-tool"),
@@ -506,7 +570,7 @@ async fn node_elicitations_attribute_independent_reviews_without_changing_action
         guardian.push(
             responses::mount_sse_once_match(
                 &server,
-                body_partial_json(json!({"client_metadata": {"x-openai-subagent": "guardian"}})),
+                wiremock::matchers::header("x-openai-subagent", "guardian"),
                 responses::sse(vec![
                     responses::ev_assistant_message(
                         "review-result",
@@ -575,7 +639,8 @@ async fn node_elicitations_attribute_independent_reviews_without_changing_action
         };
         assert_eq!(
             (&assessment.target_item_id, &assessment.status),
-            (&Some(target), &status)
+            (&Some(target), &status),
+            "{assessment:?}"
         );
         assert_eq!(
             assessment.action,
@@ -591,6 +656,11 @@ async fn node_elicitations_attribute_independent_reviews_without_changing_action
             }
         );
         let request = guardian[index].single_request();
+        if browser {
+            assert!(request.message_input_texts("developer").iter().any(|text| {
+                text.contains("Browser connector (`connector_openai_browser` on `codex_apps`)")
+            }));
+        }
         let prompt = request.message_input_texts("user").join("\n");
         let action_text = prompt
             .rsplit_once("Planned action JSON:\n")
@@ -605,11 +675,11 @@ async fn node_elicitations_attribute_independent_reviews_without_changing_action
                 "tool": "mcp_tool_call", "server": server_name,
                 "tool_name": meta[index]["tool_name"], "arguments": meta[index]["tool_params"],
                 "connector_id": "inner-connector", "connector_name": "Inner Connector",
-                "connector_description": "Connector for the reviewed inner action",
                 "tool_title": "Inner action",
-                "tool_description": "Review this action independently from JavaScript".repeat(220),
             })
         );
+        assert!(prompt.contains("<guardian_tool_descriptions>"));
+        assert!(prompt.contains("Connector for the reviewed inner action"));
     }
     let [tool_item] = tool_items.as_slice() else {
         panic!("expected one completed enclosing tool item: {tool_items:?}");
@@ -623,7 +693,7 @@ async fn node_elicitations_attribute_independent_reviews_without_changing_action
         ),
         (
             server_name,
-            "js",
+            if browser { "browser_js" } else { "js" },
             &parent_arguments,
             McpToolCallStatus::Completed
         )
@@ -658,6 +728,99 @@ async fn node_elicitations_attribute_independent_reviews_without_changing_action
     Ok(())
 }
 
+#[test_case("connector_openai_browser", None; "missing_correlation")]
+#[test_case("connector_openai_browser", Some("unknown-invocation"); "unknown_correlation")]
+#[test_case("connector_other", Some("eliciting-tool"); "non_browser_registration")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn strict_browser_nested_review_requires_live_browser_identity(
+    registered_connector_id: &str,
+    call_id: Option<&str>,
+) -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    skip_if_wine_exec!(Ok(()), "the MCP fixture requires a host Python interpreter");
+
+    let server = responses::start_mock_server().await;
+    let mut meta = json!({
+        "codex_request_type": "approval_request",
+        "codex_approval_kind": "mcp_tool_call",
+        "codex_strict_auto_review": true,
+        "codex_sensitive_action": true,
+        "connector_id": "connector_openai_browser",
+        "tool_name": "webmcp:example.com:write_record",
+        "tool_params": {"record": {"value": 42}},
+    });
+    if let Some(call_id) = call_id {
+        meta["_codex_apps"] = json!({"call_id": call_id});
+    }
+    let fixture_config = serde_json::from_value(json!({
+        "command": if cfg!(windows) { "python" } else { "python3" },
+        "args": ["-u", "-c", ELICITATION_SERVER, "{}", "browser",
+                 json!({"_meta": meta}).to_string(), registered_connector_id],
+        "default_tools_approval_mode": "approve",
+    }))?;
+    let mut extensions = ExtensionRegistryBuilder::<Config>::new();
+    extensions.mcp_server_contributor(Arc::new(BrowserMcpServer(fixture_config)));
+    let mut builder = apps_enabled_builder(server.uri())
+        .with_extensions(Arc::new(extensions.build()))
+        .with_model_info_override("gpt-5.5", |model| model.supports_search_tool = false)
+        .with_config(|config| {
+            config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
+            config.approvals_reviewer = ApprovalsReviewer::User;
+        });
+    let test = builder.build_with_auto_env(&server).await?;
+    wait_for_mcp_server(&test.codex, "codex_apps").await?;
+    responses::mount_sse_once(
+        &server,
+        responses::sse(vec![
+            responses::ev_function_call_with_namespace(
+                "eliciting-tool",
+                "mcp__codex_apps__browser",
+                "_js",
+                r#"{"code":"write_record()"}"#,
+            ),
+            responses::ev_completed("parent-tool"),
+        ]),
+    )
+    .await;
+    let parent = responses::mount_sse_once(
+        &server,
+        responses::sse(vec![responses::ev_completed("parent-complete")]),
+    )
+    .await;
+    test.codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "Run the JavaScript invocation.".into(),
+            text_elements: Vec::new(),
+        }]))
+        .await?;
+    loop {
+        let event =
+            tokio::time::timeout(Duration::from_secs(30), test.codex.next_event()).await??;
+        match event.msg {
+            EventMsg::GuardianAssessment(_) => panic!("invalid identity must not reach Guardian"),
+            EventMsg::ElicitationRequest(_) => panic!("strict review must not prompt the user"),
+            EventMsg::TurnComplete(_) => break,
+            _ => {}
+        }
+    }
+    let output = parent
+        .single_request()
+        .function_call_output("eliciting-tool");
+    let reply: Value = serde_json::from_str(
+        output["output"][1]["text"]
+            .as_str()
+            .context("MCP fixture response")?,
+    )?;
+    assert_eq!(reply["action"], "decline");
+    assert!(
+        reply["_meta"]["message"]
+            .as_str()
+            .context("strict rejection reason")?
+            .contains("Automated review of this operation failed")
+    );
+    test.codex.shutdown_and_wait().await?;
+    Ok(())
+}
 #[test_case("form"; "nonempty_form")]
 #[test_case("url"; "url")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -768,5 +931,155 @@ async fn user_review_preserves_unsupported_guardian_elicitations(mode: &str) -> 
             .contains("decline")
     );
     test.codex.shutdown_and_wait().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn yielded_code_mode_elicitation_keeps_live_invocation_metadata() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    skip_if_wine_exec!(Ok(()), "the MCP fixture requires a host Python interpreter");
+
+    let server = responses::start_mock_server().await;
+    let meta = json!([{
+        "codex_strict_auto_review": true,
+        "codex_sensitive_action": true,
+        "tool_name": "write_record",
+        "tool_params": {"value": 42},
+        "connector_id": "inner-connector",
+    }]);
+    let mcp_servers = serde_json::from_value(json!({
+        "node_repl": {
+            "command": if cfg!(windows) { "python" } else { "python3" },
+            "args": ["-u", "-c", ELICITATION_SERVER, meta.to_string(), "forward"],
+            "default_tools_approval_mode": "approve",
+        }
+    }))?;
+    let mut builder = test_codex()
+        .with_model_info_override("gpt-5.4", |model| {
+            model.tool_mode = Some(codex_protocol::openai_models::ToolMode::CodeMode);
+            model.experimental_supported_tools = vec!["test_sync_tool".to_string()];
+        })
+        .with_config(move |config| {
+            config
+                .features
+                .enable(codex_features::Feature::CodeMode)
+                .unwrap();
+            config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
+            config.approvals_reviewer = ApprovalsReviewer::User;
+            config.mcp_servers.set(mcp_servers).unwrap();
+        });
+    let test = builder.build_with_auto_env(&server).await?;
+    wait_for_mcp_server(&test.codex, "node_repl").await?;
+    let barrier = r#"await tools.test_sync_tool({barrier: {
+        id: "elicitation-origin", participants: 2, timeout_ms: 60000
+    }});"#;
+    responses::mount_sse_once(&server, responses::sse(vec![
+        responses::ev_response_created("origin-a"),
+        responses::ev_custom_tool_call("cell-a", "exec", &format!(
+            "// @exec: {{\"yield_time_ms\": 1}}\n{barrier}\ntext(await tools.mcp__node_repl__js({{code: 'write_record()'}}));"
+        )),
+        responses::ev_completed("origin-a"),
+    ])).await;
+    let yielded = responses::mount_sse_once(
+        &server,
+        responses::sse(vec![responses::ev_completed("a-finished")]),
+    )
+    .await;
+    test.submit_text_turn("Start A and leave its cell running.")
+        .await?;
+    let output = yielded.single_request().custom_tool_call_output("cell-a");
+    let text = output["output"]
+        .as_str()
+        .or_else(|| output["output"][0]["text"].as_str())
+        .context("A should return text")?;
+    let cell_id = text
+        .strip_prefix("Script running with cell ID ")
+        .and_then(|text| text.lines().next())
+        .context("A should yield a running cell")?
+        .to_string();
+
+    responses::mount_sse_once(
+        &server,
+        responses::sse(vec![
+            responses::ev_custom_tool_call("cell-b", "exec", barrier),
+            responses::ev_completed("b-started"),
+        ]),
+    )
+    .await;
+    let guardian = responses::mount_sse_once_match(
+        &server,
+        body_partial_json(json!({"client_metadata": {"x-openai-subagent": "guardian"}})),
+        responses::sse(vec![
+            responses::ev_assistant_message(
+                "review-result",
+                &json!({
+                    "risk_level": "low", "user_authorization": "high", "outcome": "allow",
+                    "rationale": "The user requested the action.",
+                })
+                .to_string(),
+            ),
+            responses::ev_completed("review-done"),
+        ]),
+    )
+    .await;
+    responses::mount_sse_once(
+        &server,
+        responses::sse(vec![
+            responses::ev_function_call(
+                "wait-a",
+                "wait",
+                &json!({
+                    "cell_id": cell_id, "yield_time_ms": 60000,
+                })
+                .to_string(),
+            ),
+            responses::ev_completed("b-wait"),
+        ]),
+    )
+    .await;
+    responses::mount_sse_once(
+        &server,
+        responses::sse(vec![responses::ev_completed("b-finished")]),
+    )
+    .await;
+    test.codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "Run B and wait for A.".into(),
+            text_elements: Vec::new(),
+        }]))
+        .await?;
+    let mut invocation_id = None;
+    let mut assessment_target = None;
+    loop {
+        let event =
+            tokio::time::timeout(Duration::from_secs(60), test.codex.next_event()).await??;
+        match event.msg {
+            EventMsg::ItemCompleted(event) => {
+                if let TurnItem::McpToolCall(item) = event.item {
+                    invocation_id = Some(item.id);
+                }
+            }
+            EventMsg::GuardianAssessment(assessment)
+                if assessment.status == GuardianAssessmentStatus::Approved =>
+            {
+                assessment_target = assessment.target_item_id;
+            }
+            EventMsg::ElicitationRequest(_) => panic!("strict review must not prompt the user"),
+            EventMsg::TurnComplete(_) => break,
+            _ => {}
+        }
+    }
+    assert!(invocation_id.is_some(), "A's tool must complete during B");
+    assert_eq!(assessment_target, invocation_id);
+    assert_eq!(
+        guardian
+            .requests()
+            .iter()
+            .filter(
+                |request| request.body_json()["client_metadata"]["x-openai-subagent"] == "guardian"
+            )
+            .count(),
+        1
+    );
     Ok(())
 }

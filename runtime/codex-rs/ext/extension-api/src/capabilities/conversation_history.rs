@@ -1,3 +1,4 @@
+use codex_history::CompactionCheckpoint;
 use codex_history::RetainedContext;
 
 use codex_protocol::models::ResponseItem;
@@ -14,25 +15,54 @@ pub trait ConversationHistorySnapshot: Send + Sync {
     /// history resets, but stays unchanged for compaction and internal context.
     fn user_message_revision(&self) -> u64;
 
+    /// Changes when host-confirmed assistant evidence can change how Guardian interprets input.
+    /// Hosts without out-of-band assistant evidence may retain the default.
+    fn guardian_review_context_revision(&self) -> u64 {
+        0
+    }
+
     /// Returns the snapshot's response items in conversation order.
     fn items(&self) -> Box<dyn Iterator<Item = &ResponseItem> + Send + '_>;
 
     /// Host-owned retained facts captured atomically with the parent model window.
-    /// Legacy hosts can withhold these facts to preserve their existing reviewer policy.
+    /// These facts may be available while review still uses a legacy transcript.
     fn retained_context(&self) -> Option<&RetainedContext> {
         None
     }
 
-    /// Producer compatibility recorded on the latest opaque checkpoint. Missing provenance
-    /// must not be inferred from the currently selected model, including after resume.
-    fn latest_compaction_model_hash(&self) -> Option<&str> {
-        None
+    /// Whether review uses the parent checkpoint and model window instead of a legacy transcript.
+    /// Checkpoint compatibility is independent of access to retained user evidence.
+    fn uses_parent_context_for_review(&self) -> bool {
+        self.retained_context().is_some()
+    }
+
+    /// Whether the host retains a bounded review transcript independently of parent compaction.
+    /// Such snapshots must never seed reviewers with the parent's opaque checkpoint.
+    fn uses_independent_review_history(&self) -> bool {
+        false
+    }
+
+    /// Latest opaque checkpoint, including unusable items, with its recorded producer.
+    /// Hosts without provenance leave the producer unknown rather than using the live model.
+    fn latest_compaction(&self) -> Option<CompactionCheckpoint<'_>> {
+        self.items()
+            .filter_map(|item| CompactionCheckpoint::from_item(item, /*model_hash*/ None))
+            .last()
     }
 
     /// Original review evidence retained across parent compaction, in conversation order.
     /// Hosts without separate retention provide their current history.
     fn review_items(&self) -> Box<dyn Iterator<Item = &ResponseItem> + Send + '_> {
         self.items()
+    }
+
+    /// Original source metadata stays attached to the exact unshortened history item.
+    /// Legacy providers cannot establish completeness from a message ID alone.
+    fn review_items_with_sources(
+        &self,
+    ) -> Box<dyn Iterator<Item = (&ResponseItem, Option<&codex_history::RetainedSource>)> + Send + '_>
+    {
+        Box::new(self.review_items().map(|item| (item, None)))
     }
 
     /// Changes whenever offsets into the retained review evidence become invalid.

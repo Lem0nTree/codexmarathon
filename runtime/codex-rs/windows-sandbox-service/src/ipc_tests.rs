@@ -1,25 +1,35 @@
+use super::MAX_RESPONSE_MESSAGE_BYTES;
 use super::OwnedHandle;
 use super::PipeConnection;
-use super::ProvisioningRequest;
+use super::ServiceRequest;
 use super::accept_pipe_connection;
+use super::home::prepare_codex_home;
 use super::is_config_parse_error;
 use super::pin_existing_ancestors;
 use super::pipe_security_descriptor;
+use super::policy_rejection_diagnostic;
+use super::refresh_session;
+use super::request::ProvisioningRequest;
+use super::response_error_message;
 use super::validate_request;
 use super::wake;
+use codex_windows_sandbox::DirectoryOpenDisposition;
 use codex_windows_sandbox::FramedProvisioningMessage;
 use codex_windows_sandbox::PROVISIONING_PROTOCOL_VERSION;
 use codex_windows_sandbox::ProvisioningMessage;
 use codex_windows_sandbox::SandboxProvisioningRequest;
 use codex_windows_sandbox::SandboxProvisioningResponse;
+use codex_windows_sandbox::SetupRuntime;
 use codex_windows_sandbox::WindowsSandboxProvisioningSettings;
 use codex_windows_sandbox::WindowsSandboxProxyListeners;
 use codex_windows_sandbox::read_provisioning_frame;
 use codex_windows_sandbox::to_wide;
 use codex_windows_sandbox::write_provisioning_frame;
+use pretty_assertions::assert_eq;
 use std::path::Path;
 use std::path::PathBuf;
 use std::ptr;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
@@ -29,6 +39,157 @@ use windows_sys::Win32::Foundation as foundation;
 use windows_sys::Win32::Storage::FileSystem as filesystem;
 use windows_sys::Win32::Storage::Packaging::Appx;
 use windows_sys::Win32::System::Pipes as pipes;
+
+#[test]
+fn provisioning_error_response_preserves_causes_within_message_limits() {
+    let error = anyhow::anyhow!("Windows error\t5\n")
+        .context("load profile")
+        .context("registered sandbox provisioning failed");
+    assert_eq!(
+        response_error_message(&error),
+        "registered sandbox provisioning failed: load profile: Windows error 5 "
+    );
+
+    let error = anyhow::anyhow!("é".repeat(MAX_RESPONSE_MESSAGE_BYTES)).context("setup");
+    let message = response_error_message(&error);
+    assert!(message.starts_with("setup: é"));
+    assert_eq!(message.len(), MAX_RESPONSE_MESSAGE_BYTES - 1);
+}
+
+#[test]
+fn session_refresh_observes_cleanup_completion_before_dispatch() {
+    let shutdown = AtomicBool::new(false);
+    assert!(
+        !refresh_session(&shutdown, || {
+            shutdown.store(true, Ordering::Release);
+            Ok(())
+        })
+        .unwrap()
+    );
+}
+
+#[test]
+fn session_refresh_preserves_authoritative_stop() {
+    let shutdown = AtomicBool::new(true);
+    assert!(!refresh_session(&shutdown, || panic!("stopped listener must not refresh")).unwrap());
+    assert!(shutdown.load(Ordering::Acquire));
+}
+
+#[test]
+fn session_refresh_keeps_admission_open_without_cleanup() {
+    let shutdown = AtomicBool::new(false);
+    assert!(refresh_session(&shutdown, || Ok(())).unwrap());
+    assert!(!shutdown.load(Ordering::Acquire));
+}
+
+#[test]
+fn session_refresh_propagates_cleanup_failure() {
+    let shutdown = AtomicBool::new(false);
+    let error = refresh_session(&shutdown, || anyhow::bail!("cleanup failed")).unwrap_err();
+    assert!(error.to_string().contains("cleanup failed"));
+}
+
+#[test]
+fn provisioning_request_rejects_malformed_registered_flag() {
+    for registered_core in [
+        serde_json::json!("true"),
+        serde_json::json!(1),
+        serde_json::json!(null),
+    ] {
+        let bytes = serde_json::to_vec(&serde_json::json!({
+            "version": PROVISIONING_PROTOCOL_VERSION,
+            "type": "provision_sandbox_request",
+            "payload": {
+                "codex_home": "C:\\Users\\owner\\.codex",
+                "registered_core": registered_core,
+                "settings": WindowsSandboxProvisioningSettings::default(),
+                "listeners": WindowsSandboxProxyListeners::default(),
+            },
+        }))
+        .unwrap();
+        let mut frame = (bytes.len() as u32).to_le_bytes().to_vec();
+        frame.extend(bytes);
+        assert!(validate_request(&frame).is_err());
+    }
+}
+
+#[test]
+fn runtime_registration_is_an_explicit_wire_opt_in() {
+    let request = SandboxProvisioningRequest {
+        codex_home: r"C:\Users\owner\.codex".to_string(),
+        registered_core: false,
+        refresh_only: false,
+        settings: WindowsSandboxProvisioningSettings::default(),
+        listeners: WindowsSandboxProxyListeners::default(),
+    };
+    let serialized = serde_json::to_value(&request).unwrap();
+    assert_eq!(
+        serialized,
+        serde_json::json!({
+            "codex_home": request.codex_home,
+            "settings": request.settings,
+            "listeners": request.listeners,
+        }),
+    );
+    let legacy: SandboxProvisioningRequest = serde_json::from_value(serialized).unwrap();
+    assert!(matches!(
+        validate_request(&framed_request(legacy)).unwrap(),
+        ServiceRequest::ProvisionSandbox(ProvisioningRequest {
+            registered_core: false,
+            refresh_only: false,
+            ..
+        })
+    ));
+    let registered = SandboxProvisioningRequest {
+        registered_core: true,
+        refresh_only: false,
+        ..request
+    };
+    assert!(matches!(
+        validate_request(&framed_request(registered)).unwrap(),
+        ServiceRequest::ProvisionSandbox(ProvisioningRequest {
+            registered_core: true,
+            refresh_only: false,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn registration_refresh_is_explicit_and_requires_registered_core() {
+    let mut request = SandboxProvisioningRequest {
+        codex_home: r"C:\Users\owner\.codex".to_string(),
+        registered_core: false,
+        refresh_only: true,
+        settings: WindowsSandboxProvisioningSettings::default(),
+        listeners: WindowsSandboxProxyListeners::default(),
+    };
+    assert!(validate_request(&framed_request(request.clone())).is_err());
+    request.registered_core = true;
+    assert!(matches!(
+        validate_request(&framed_request(request)).unwrap(),
+        ServiceRequest::ProvisionSandbox(ProvisioningRequest {
+            registered_core: true,
+            refresh_only: true,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn runtime_registration_has_no_unpackaged_or_foreground_identity_exemption() {
+    let service = Some("OpenAI.Codex_testpublisher");
+    assert!(crate::package_identity::require_runtime_package_family(service, service).is_ok());
+    for (client, service) in [
+        (None, service),
+        (service, None),
+        (None, None),
+        (Some("OpenAI.CodexBeta_testpublisher"), service),
+        (Some("OpenAI.Codex_otherpublisher"), service),
+    ] {
+        assert!(crate::package_identity::require_runtime_package_family(client, service).is_err());
+    }
+}
 
 fn framed_request(request: SandboxProvisioningRequest) -> Vec<u8> {
     let mut frame = Vec::new();
@@ -105,19 +266,81 @@ fn config_parse_errors_are_distinguished_from_policy_and_io_failures() {
 }
 
 #[test]
+fn policy_event_excludes_real_parser_values_but_retains_safe_codes() {
+    let contents = "Authorization = \"Bearer synthetic-secret";
+    let requirements =
+        codex_config::compose_requirements([codex_config::RequirementsLayerEntry::from_toml(
+            codex_config::RequirementSource::Unknown,
+            contents,
+        )])
+        .unwrap_err();
+    let fragment = codex_config::cloud_config_layers_from_fragments(
+        [codex_config::CloudConfigFragment {
+            id: "synthetic-id".into(),
+            name: "private-name".into(),
+            contents: contents.into(),
+        }],
+        &Path::new(r"C:\CodexTest").try_into().unwrap(),
+    )
+    .unwrap_err();
+    for error in [
+        std::io::Error::from(requirements),
+        std::io::Error::from(fragment),
+    ] {
+        let error = anyhow::Error::new(error).context("load managed configuration");
+        assert!(format!("{error:#}").contains("synthetic-secret"));
+        assert!(!is_config_parse_error(&error));
+        assert_eq!(
+            policy_rejection_diagnostic(&error),
+            "Codex sandbox provisioning was rejected by administrator policy: stage=managed io=InvalidData win32=None"
+        );
+    }
+
+    for (error, expected) in [
+        (
+            anyhow::Error::new(std::io::Error::from_raw_os_error(5))
+                .context("load bootstrap configuration"),
+            "stage=bootstrap io=PermissionDenied win32=Some(5)",
+        ),
+        (
+            anyhow::Error::new(codex_config::CloudConfigBundleLoadError::new(
+                codex_config::CloudConfigBundleLoadErrorCode::RequestFailed,
+                Some(503),
+                contents,
+            ))
+            .context("load managed configuration"),
+            "stage=managed cloud=RequestFailed http=Some(503)",
+        ),
+        (
+            anyhow::anyhow!("{contents}"),
+            "stage=unknown cause=unavailable",
+        ),
+    ] {
+        assert_eq!(
+            policy_rejection_diagnostic(&error),
+            format!("Codex sandbox provisioning was rejected by administrator policy: {expected}")
+        );
+    }
+}
+
+#[test]
 fn provisioning_request_preserves_home_spaces_and_unicode() {
     let request = framed_request(SandboxProvisioningRequest {
         codex_home: "D:\\Codex Homes\\Jos\u{00e9}\\.codex".to_string(),
+        registered_core: false,
+        refresh_only: false,
         settings: WindowsSandboxProvisioningSettings::default(),
         listeners: WindowsSandboxProxyListeners::default(),
     });
     assert_eq!(
         validate_request(&request).unwrap(),
-        ProvisioningRequest {
+        ServiceRequest::ProvisionSandbox(ProvisioningRequest {
             codex_home: PathBuf::from("D:\\Codex Homes\\Jos\u{00e9}\\.codex"),
+            registered_core: false,
+            refresh_only: false,
             listeners: WindowsSandboxProxyListeners::default(),
             settings: WindowsSandboxProvisioningSettings::default(),
-        }
+        })
     );
 }
 
@@ -128,6 +351,8 @@ fn structured_provisioning_request_carries_normalized_proxy_settings() {
     {
         let request = framed_request(SandboxProvisioningRequest {
             codex_home: "D:\\Codex Homes\\Jos\u{00e9}\\.codex".to_string(),
+            registered_core: false,
+            refresh_only: false,
             settings: WindowsSandboxProvisioningSettings {
                 proxy_ports: vec![http_port, socks_port, http_port],
                 allow_local_binding: true,
@@ -139,8 +364,10 @@ fn structured_provisioning_request_carries_normalized_proxy_settings() {
         });
         assert_eq!(
             validate_request(&request).unwrap(),
-            ProvisioningRequest {
+            ServiceRequest::ProvisionSandbox(ProvisioningRequest {
                 codex_home: PathBuf::from("D:\\Codex Homes\\Jos\u{00e9}\\.codex"),
+                registered_core: false,
+                refresh_only: false,
                 listeners: WindowsSandboxProxyListeners {
                     http_ports: vec![http_port],
                     socks_ports: vec![socks_port],
@@ -149,7 +376,7 @@ fn structured_provisioning_request_carries_normalized_proxy_settings() {
                     proxy_ports,
                     allow_local_binding: true,
                 },
-            },
+            }),
         );
     }
 }
@@ -171,16 +398,20 @@ fn structured_provisioning_request_accepts_independent_and_additional_proxy_port
         };
         let request = framed_request(SandboxProvisioningRequest {
             codex_home: r"C:\Users\alice\.codex".to_string(),
+            registered_core: false,
+            refresh_only: false,
             settings: settings.clone(),
             listeners: listeners.clone(),
         });
         assert_eq!(
             validate_request(&request).unwrap(),
-            ProvisioningRequest {
+            ServiceRequest::ProvisionSandbox(ProvisioningRequest {
                 codex_home: PathBuf::from(r"C:\Users\alice\.codex"),
+                registered_core: false,
+                refresh_only: false,
                 settings,
                 listeners,
-            }
+            })
         );
     }
 }
@@ -189,16 +420,20 @@ fn structured_provisioning_request_accepts_independent_and_additional_proxy_port
 fn structured_provisioning_request_accepts_disabled_listeners() {
     let request = framed_request(SandboxProvisioningRequest {
         codex_home: r"C:\Users\alice\.codex".to_string(),
+        registered_core: false,
+        refresh_only: false,
         settings: WindowsSandboxProvisioningSettings::default(),
         listeners: WindowsSandboxProxyListeners::default(),
     });
     assert_eq!(
         validate_request(&request).unwrap(),
-        ProvisioningRequest {
+        ServiceRequest::ProvisionSandbox(ProvisioningRequest {
             codex_home: PathBuf::from(r"C:\Users\alice\.codex"),
+            registered_core: false,
+            refresh_only: false,
             listeners: WindowsSandboxProxyListeners::default(),
             settings: WindowsSandboxProvisioningSettings::default(),
-        }
+        })
     );
 }
 
@@ -206,6 +441,8 @@ fn structured_provisioning_request_accepts_disabled_listeners() {
 fn structured_provisioning_request_requires_exact_version_fields_and_framing() {
     let valid = SandboxProvisioningRequest {
         codex_home: r"C:\Users\alice\.codex".to_string(),
+        registered_core: false,
+        refresh_only: false,
         settings: WindowsSandboxProvisioningSettings::default(),
         listeners: WindowsSandboxProxyListeners::default(),
     };
@@ -252,6 +489,8 @@ fn structured_provisioning_request_rejects_invalid_or_inconsistent_ports() {
     ] {
         let request = framed_request(SandboxProvisioningRequest {
             codex_home: r"C:\Users\alice\.codex".to_string(),
+            registered_core: false,
+            refresh_only: false,
             settings: WindowsSandboxProvisioningSettings {
                 proxy_ports,
                 allow_local_binding: false,
@@ -270,6 +509,8 @@ fn provisioning_request_rejects_empty_control_characters_and_invalid_utf8() {
     for home in ["", "C:\\safe\0evil", "C:\\safe\rmore", "C:\\safe\nmore"] {
         let request = framed_request(SandboxProvisioningRequest {
             codex_home: home.to_string(),
+            registered_core: false,
+            refresh_only: false,
             settings: WindowsSandboxProvisioningSettings::default(),
             listeners: WindowsSandboxProxyListeners::default(),
         });
@@ -278,6 +519,8 @@ fn provisioning_request_rejects_empty_control_characters_and_invalid_utf8() {
 
     let mut invalid_utf8 = framed_request(SandboxProvisioningRequest {
         codex_home: r"C:\Users\alice\.codex".to_string(),
+        registered_core: false,
+        refresh_only: false,
         settings: WindowsSandboxProvisioningSettings::default(),
         listeners: WindowsSandboxProxyListeners::default(),
     });
@@ -495,4 +738,90 @@ fn pipe_descriptor_denies_sandbox_group_before_interactive_users() {
     let deny = descriptor.find("(D;;GA;;;S-1-5-21-11-12-13-14)").unwrap();
     let interactive = descriptor.find("(A;;0x0012019b;;;IU)").unwrap();
     assert!(deny < interactive);
+}
+
+#[test]
+fn registered_home_preparation_does_not_touch_the_legacy_bin() -> anyhow::Result<()> {
+    let root = std::env::temp_dir().join(format!(
+        "codex-service-home-{:?}",
+        windows::core::GUID::new()?
+    ));
+    std::fs::create_dir(&root)?;
+    let result = (|| -> anyhow::Result<()> {
+        let home = root.join(".codex");
+        std::fs::create_dir(&home)?;
+        let bin = home.join(".sandbox-bin");
+        let marker = b"legacy bin is deliberately not a directory";
+        std::fs::write(&bin, marker)?;
+
+        assert!(
+            prepare_codex_home(
+                &home,
+                SetupRuntime::Registered,
+                DirectoryOpenDisposition::OpenExisting,
+            )
+            .is_err()
+        );
+        assert!(!home.join(".sandbox").exists());
+        assert!(!home.join(".sandbox-secrets").exists());
+        let (_, handles) = prepare_codex_home(
+            &home,
+            SetupRuntime::Registered,
+            DirectoryOpenDisposition::OpenOrCreate,
+        )?;
+        assert!(home.join(".sandbox").is_dir());
+        assert!(home.join(".sandbox-secrets").is_dir());
+        assert_eq!(std::fs::read(&bin)?.as_slice(), marker.as_slice());
+        drop(handles);
+
+        // Legacy still validates and pins the copied-bin path.
+        let (_, handles) = prepare_codex_home(
+            &home,
+            SetupRuntime::Registered,
+            DirectoryOpenDisposition::OpenExisting,
+        )?;
+        drop(handles);
+        assert!(
+            prepare_codex_home(
+                &home,
+                SetupRuntime::Legacy,
+                DirectoryOpenDisposition::OpenOrCreate,
+            )
+            .is_err()
+        );
+        assert_eq!(std::fs::read(&bin)?.as_slice(), marker.as_slice());
+        std::fs::remove_file(&bin)?;
+        let (_, handles) = prepare_codex_home(
+            &home,
+            SetupRuntime::Legacy,
+            DirectoryOpenDisposition::OpenOrCreate,
+        )?;
+        assert!(bin.is_dir());
+        drop(handles);
+
+        Ok(())
+    })();
+    std::fs::remove_dir_all(&root)?;
+    result
+}
+
+#[test]
+fn installation_registration_requires_no_sandbox_settings() {
+    let mut frame = Vec::new();
+    write_provisioning_frame(
+        &mut frame,
+        &FramedProvisioningMessage {
+            version: PROVISIONING_PROTOCOL_VERSION,
+            message: ProvisioningMessage::RegisterInstallationRequest {
+                codex_home: r"C:\Users\alice\.codex".to_string(),
+            },
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        validate_request(&frame).unwrap(),
+        ServiceRequest::RegisterInstallation {
+            codex_home: PathBuf::from(r"C:\Users\alice\.codex")
+        },
+    );
 }

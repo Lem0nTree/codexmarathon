@@ -27,6 +27,7 @@ fn projects_turn_lifecycle_without_prior_builder_state() {
     let started = project(RolloutItem::EventMsg(EventMsg::TurnStarted(
         TurnStartedEvent {
             turn_id: "turn-1".to_string(),
+            root_turn_id: Some("root-turn".into()),
             trace_id: None,
             started_at: Some(10),
             model_context_window: None,
@@ -50,10 +51,15 @@ fn projects_turn_lifecycle_without_prior_builder_state() {
     assert_eq!(started.changed_turns[0].status, TurnStatus::InProgress);
     assert_eq!(started.changed_turns[0].started_at, Some(10));
     assert_eq!(
+        started.changed_turns[0].root_turn_id.as_deref(),
+        Some("root-turn")
+    );
+    assert_eq!(
         completed,
         ThreadHistoryChangeSet {
-            changed_turns: vec![ThreadHistoryTurnChange {
+            changed_turns: vec![ThreadHistoryTurnMetadata {
                 turn_id: "turn-1".to_string(),
+                root_turn_id: None,
                 status: TurnStatus::Completed,
                 error: None,
                 started_at: Some(10),
@@ -88,8 +94,9 @@ fn projects_failed_turn_completion_as_snapshot() {
     assert_eq!(
         changes,
         ThreadHistoryChangeSet {
-            changed_turns: vec![ThreadHistoryTurnChange {
+            changed_turns: vec![ThreadHistoryTurnMetadata {
                 turn_id: "turn-1".to_string(),
+                root_turn_id: None,
                 status: TurnStatus::Failed,
                 error: Some(TurnError {
                     misalignment: None,
@@ -193,6 +200,7 @@ fn ignores_legacy_abort_without_turn_id_and_context_only_records() {
         TurnAbortedEvent {
             turn_id: None,
             reason: TurnAbortReason::Interrupted,
+            error: None,
             started_at: None,
             completed_at: None,
             duration_ms: None,
@@ -210,6 +218,7 @@ fn ignores_legacy_abort_without_turn_id_and_context_only_records() {
         window_id: None,
         compaction_response_id: None,
         latest_token_usage_record: None,
+        resume_metadata: None,
     }));
     let security_risk = project(RolloutItem::SecurityRiskScore(SecurityRiskScore {
         scores: BTreeMap::from([("action_risk".to_string(), 0.92)]),
@@ -229,6 +238,7 @@ fn projects_identified_turn_aborts() {
         TurnAbortedEvent {
             turn_id: Some("turn-1".to_string()),
             reason: TurnAbortReason::Interrupted,
+            error: None,
             started_at: Some(10),
             completed_at: Some(20),
             duration_ms: Some(10_000),
@@ -238,8 +248,9 @@ fn projects_identified_turn_aborts() {
     assert_eq!(
         changes,
         ThreadHistoryChangeSet {
-            changed_turns: vec![ThreadHistoryTurnChange {
+            changed_turns: vec![ThreadHistoryTurnMetadata {
                 turn_id: "turn-1".to_string(),
+                root_turn_id: None,
                 status: TurnStatus::Interrupted,
                 error: None,
                 started_at: Some(10),

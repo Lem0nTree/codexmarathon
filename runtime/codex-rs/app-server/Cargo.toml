@@ -25,6 +25,7 @@ doctest = false
 workspace = true
 
 [dependencies]
+codex-utils-process = { workspace = true }
 anyhow = { workspace = true }
 base64 = { workspace = true }
 axum = { workspace = true, default-features = false, features = [
@@ -40,6 +41,7 @@ codex-aws-auth = { workspace = true }
 codex-cloud-config = { workspace = true }
 codex-code-mode = { workspace = true }
 codex-config = { workspace = true }
+codex-network-proxy = { workspace = true }
 codex-connectors = { workspace = true }
 codex-core = { workspace = true }
 codex-core-plugins = { workspace = true }
@@ -63,6 +65,7 @@ codex-shell-command = { workspace = true }
 codex-skills = { workspace = true }
 codex-skills-extension = { workspace = true }
 codex-utils-cli = { workspace = true }
+codex-user-verification = { workspace = true }
 codex-utils-pty = { workspace = true }
 codex-backend-client = { workspace = true }
 codex-file-search = { workspace = true }
@@ -73,11 +76,14 @@ codexmarathon-runtime-adapter = { workspace = true }
 codex-image-generation-extension = { workspace = true }
 codex-memories-extension = { workspace = true }
 codex-web-search-extension = { workspace = true }
+codex-websocket-auth = { workspace = true }
 codex-memories-write = { workspace = true }
 codex-mcp = { workspace = true }
 codex-mcp-extension = { workspace = true }
 codex-model-provider = { workspace = true }
+codex-model-provider-info = { workspace = true }
 codex-models-manager = { workspace = true }
+codex-prompts = { workspace = true }
 codex-protocol = { workspace = true }
 codex-queue-extension = { workspace = true }
 codex-app-server-protocol = { workspace = true }
@@ -123,6 +129,7 @@ tikv-jemallocator = { workspace = true }
 codex-windows-sandbox = { workspace = true }
 
 [dev-dependencies]
+codex-uds = { workspace = true }
 app_test_support = { workspace = true }
 axum = { workspace = true, default-features = false, features = [
     "http1",
@@ -130,7 +137,6 @@ axum = { workspace = true, default-features = false, features = [
     "tokio",
 ] }
 base64 = { workspace = true }
-codex-model-provider-info = { workspace = true }
 codex-utils-cargo-bin = { workspace = true }
 core_test_support = { workspace = true }
 flate2 = { workspace = true }
@@ -139,6 +145,7 @@ http = { workspace = true }
 opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true }
 pretty_assertions = { workspace = true }
+rcgen = { workspace = true }
 rmcp = { workspace = true, default-features = false, features = [
     "elicitation",
     "server",
@@ -146,8 +153,10 @@ rmcp = { workspace = true, default-features = false, features = [
 ] }
 serial_test = { workspace = true }
 shlex = { workspace = true }
+sqlx = { workspace = true }
 tar = { workspace = true }
 test-case = "3.3.1"
+tokio-rustls = { workspace = true }
 tokio-tungstenite = { workspace = true }
 tracing-opentelemetry = { workspace = true }
 wiremock = { workspace = true }

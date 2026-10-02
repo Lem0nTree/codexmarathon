@@ -10,12 +10,14 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use codex_protocol::config_types::ToolExposureSurface;
 use codex_utils_path_uri::LegacyAppPathString;
+use codex_utils_redacted_string::RedactedString;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::Deserializer;
 use serde::Serialize;
 use serde::de::Error as SerdeError;
 
+use crate::McpEmaRegistration;
 use crate::RequirementSource;
 
 /// Effective MCP environment id when config omits `environment_id`.
@@ -59,6 +61,8 @@ pub enum McpServerDisabledReason {
     Unknown,
     /// The server was disabled by config requirements from the given source.
     Requirements { source: RequirementSource },
+    /// Enterprise authorization was rejected for this registration, not its name.
+    EmaRegistration,
 }
 
 impl fmt::Display for McpServerDisabledReason {
@@ -67,6 +71,9 @@ impl fmt::Display for McpServerDisabledReason {
             McpServerDisabledReason::Unknown => write!(f, "unknown"),
             McpServerDisabledReason::Requirements { source } => {
                 write!(f, "requirements ({source})")
+            }
+            McpServerDisabledReason::EmaRegistration => {
+                write!(f, "invalid enterprise registration")
             }
         }
     }
@@ -150,13 +157,17 @@ impl AsRef<str> for McpServerEnvVar {
     }
 }
 
-/// OAuth client settings used when Codex launches an MCP OAuth flow.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
+/// Client settings for MCP OAuth login or enterprise token exchange.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct McpServerOAuthConfig {
     /// Explicit OAuth client identifier to present during authorization and token exchange.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_id: Option<String>,
+
+    /// OAuth client secret used for token exchange with a pre-registered client.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_secret: Option<RedactedString>,
 
     /// Registered callback URL associated with this OAuth client.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -165,13 +176,24 @@ pub struct McpServerOAuthConfig {
     /// Fixed callback port that takes precedence over Codex's global OAuth callback port.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub callback_port: Option<u16>,
+
+    /// Expected resource authorization server issuer for EMA token exchange.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorization_server_issuer: Option<String>,
+
+    /// Host-resolved authorization; never accepted from a server or plugin declaration.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub ema_registration: Option<McpEmaRegistration>,
+
+    /// Host-policy rejection retained until catalog finalization; never deserialized.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub ema_registration_error: Option<&'static str>,
 }
 
-/// Authentication flow Codex attempts after resolving an HTTP MCP server's
-/// configured bearer token and authorization headers, which always take
-/// precedence. ChatGPT authentication falls back to stored OAuth credentials
-/// when its session provider is unavailable; both modes ultimately fall back
-/// to an unauthenticated connection.
+/// Authentication flow for an HTTP MCP server. Explicit credentials take
+/// precedence for OAuth and ChatGPT; EMA rejects alternate credentials and fallback.
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum McpServerAuth {
@@ -185,12 +207,26 @@ pub enum McpServerAuth {
     /// still fall back to stored OAuth credentials.
     #[serde(rename = "chatgpt")]
     ChatGpt,
+    /// Exchange an enterprise IdP refresh token for resource-specific authorization.
+    /// Alternate credentials and ordinary OAuth fallback are not permitted.
+    #[serde(rename = "ema_auth")]
+    EmaAuth,
 }
 
-impl McpServerAuth {
-    fn is_default(&self) -> bool {
-        self == &Self::default()
-    }
+/// Readiness needed before startup can expose this server's tools to the model.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum McpStartupReadiness {
+    /// Use the live connection to determine startup readiness.
+    #[default]
+    Connection,
+    /// Allow a valid cached tool catalog while the live connection starts.
+    /// Tool execution still requires the current connection.
+    Catalog,
+}
+
+fn is_default<T: Default + PartialEq>(value: &T) -> bool {
+    value == &T::default()
 }
 
 #[derive(Serialize, Debug, Clone, PartialEq)]
@@ -198,8 +234,8 @@ pub struct McpServerConfig {
     #[serde(flatten)]
     pub transport: McpServerTransportConfig,
 
-    /// Authentication flow to use when no configured authorization resolves.
-    #[serde(default, skip_serializing_if = "McpServerAuth::is_default")]
+    /// Authentication flow, including an explicit no-fallback EMA mode.
+    #[serde(default, skip_serializing_if = "is_default")]
     pub auth: McpServerAuth,
 
     /// Effective environment id for where Codex should start this MCP server.
@@ -210,12 +246,23 @@ pub struct McpServerConfig {
     pub enabled: bool,
 
     /// When `true`, `codex exec` exits with an error if this MCP server fails to initialize.
+    /// With `startup_readiness = "catalog"`, a valid cached catalog can satisfy startup;
+    /// connection failures are then reported when a tool is invoked.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub required: bool,
+
+    /// Whether startup requires a live connection or can use a valid cached tool catalog.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub startup_readiness: McpStartupReadiness,
 
     /// When `true`, every tool from this server is advertised as safe for parallel tool calls.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub supports_parallel_tool_calls: bool,
+
+    /// UTF-8 byte threshold for compacting each ordinary MCP tool input schema. Defaults to 5,000 bytes.
+    /// Code Mode also uses an explicitly configured limit when rendering each tool's input type.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_input_schema_max_bytes: Option<NonZeroUsize>,
 
     /// Model-facing surfaces from which this server's tools must be omitted.
     /// `None` leaves lower-priority configuration unchanged; an empty list clears it.
@@ -250,15 +297,15 @@ pub struct McpServerConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disabled_tools: Option<Vec<String>>,
 
-    /// Optional OAuth scopes to request during MCP login.
+    /// Optional scopes requested during MCP login or EMA token exchange.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scopes: Option<Vec<String>>,
 
-    /// Optional OAuth client settings for MCP login.
+    /// Optional client settings for MCP login or EMA token exchange.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oauth: Option<McpServerOAuthConfig>,
 
-    /// Optional OAuth resource parameter to include during MCP login (RFC 8707).
+    /// Optional resource parameter for MCP login or EMA token exchange (RFC 8707).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oauth_resource: Option<String>,
 
@@ -294,6 +341,13 @@ impl McpServerConfig {
         self.oauth
             .as_ref()
             .and_then(|oauth| oauth.client_id.as_deref())
+    }
+
+    pub fn oauth_client_secret(&self) -> Option<&str> {
+        self.oauth
+            .as_ref()
+            .and_then(|oauth| oauth.client_secret.as_ref())
+            .map(|secret| secret.as_str())
     }
 
     pub fn oauth_callback_port(&self, global_callback_port: Option<u16>) -> Option<u16> {
@@ -358,8 +412,17 @@ pub struct RawMcpServerConfig {
     pub enabled: Option<bool>,
     #[serde(default)]
     pub required: Option<bool>,
+    /// Whether startup requires a live connection or can use a valid cached tool catalog.
+    #[serde(default)]
+    pub startup_readiness: Option<McpStartupReadiness>,
     #[serde(default)]
     pub supports_parallel_tool_calls: Option<bool>,
+    /// UTF-8 byte threshold for compacting each ordinary MCP tool input schema. Defaults to 5,000 bytes.
+    /// Code Mode also uses an explicitly configured limit when rendering each tool's input type.
+    /// Larger limits preserve more parameter descriptions.
+    #[serde(default)]
+    #[schemars(range(min = 1))]
+    pub tool_input_schema_max_bytes: Option<NonZeroUsize>,
     #[serde(default)]
     pub omit_tools_from: Option<Vec<ToolExposureSurface>>,
     #[serde(default)]
@@ -404,7 +467,9 @@ impl TryFrom<RawMcpServerConfig> for McpServerConfig {
             tool_timeout_sec,
             enabled,
             required,
+            startup_readiness,
             supports_parallel_tool_calls,
+            tool_input_schema_max_bytes,
             omit_tools_from,
             default_tools_approval_mode,
             enabled_tools,
@@ -490,16 +555,42 @@ impl TryFrom<RawMcpServerConfig> for McpServerConfig {
 
         let environment_id =
             environment_id.unwrap_or_else(|| DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string());
+        let auth = auth.unwrap_or_default();
+        if let Some(oauth) = &oauth
+            && let Some(client_secret) = &oauth.client_secret
+        {
+            if client_secret.trim().is_empty() {
+                return Err("oauth.client_secret must not be empty".to_string());
+            }
+            if oauth
+                .client_id
+                .as_deref()
+                .is_none_or(|client_id| client_id.trim().is_empty())
+            {
+                return Err("oauth.client_secret requires oauth.client_id".to_string());
+            }
+        }
+        if !matches!(auth, McpServerAuth::EmaAuth)
+            && oauth
+                .as_ref()
+                .is_some_and(|oauth| oauth.authorization_server_issuer.is_some())
+        {
+            return Err(
+                "oauth.authorization_server_issuer requires auth = \"ema_auth\"".to_string(),
+            );
+        }
 
         Ok(Self {
             transport,
-            auth: auth.unwrap_or_default(),
+            auth,
             environment_id,
             startup_timeout_sec,
             tool_timeout_sec,
             enabled: enabled.unwrap_or_else(default_enabled),
             required: required.unwrap_or_default(),
+            startup_readiness: startup_readiness.unwrap_or_default(),
             supports_parallel_tool_calls: supports_parallel_tool_calls.unwrap_or_default(),
+            tool_input_schema_max_bytes,
             omit_tools_from,
             disabled_reason: None,
             default_tools_approval_mode,

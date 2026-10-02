@@ -17,8 +17,8 @@ expression: rendered_cases
         },
         HyperlinkLine {
             line: Line::from_iter([
-                Span::from("- "),
-                Span::from("Quarterly Report.xlsx").cyan(),
+                Span::from("• "),
+                Span::from("Quarterly Report.xlsx").fg(Color::Rgb(166, 227, 161)),
             ]),
             hyperlinks: [],
         },
@@ -45,8 +45,8 @@ expression: rendered_cases
         },
         HyperlinkLine {
             line: Line::from_iter([
-                Span::from("- "),
-                Span::from("Résumé *final* ✨.xlsx").cyan(),
+                Span::from("• "),
+                Span::from("Résumé *final* ✨.xlsx").fg(Color::Rgb(166, 227, 161)),
             ]),
             hyperlinks: [],
         },

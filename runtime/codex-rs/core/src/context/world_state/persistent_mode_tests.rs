@@ -1,39 +1,29 @@
-//! Covers effort selection, catalog overrides, and persistent-context transitions.
+//! Covers persistent-context transitions independently of effort selection.
 
 use super::*;
 use crate::context::world_state::WorldState;
 use pretty_assertions::assert_eq;
 
 #[test]
-fn persistent_instructions_follow_effort_and_catalog_updates_without_duplicates() {
+fn persistent_instructions_follow_mode_and_catalog_updates_without_duplicates() {
     let mut history = Vec::new();
     let mut previous = None;
-    let persistent = Some(ReasoningEffort::Persistent);
-    let medium = Some(ReasoningEffort::Medium);
     let replacement = format!("{REPLACEMENT_NOTICE}\n\nupdated instructions");
 
-    for (effort, instructions, expected) in [
-        (None, None, None),
-        (
-            persistent.clone(),
-            Some("instructions"),
-            Some("instructions"),
-        ),
-        (persistent.clone(), Some("instructions"), None),
-        (
-            persistent.clone(),
-            Some("updated instructions"),
-            Some(replacement.as_str()),
-        ),
-        (persistent.clone(), Some(""), Some(REMOVAL_NOTICE)),
-        (persistent.clone(), Some(""), None),
-        (persistent, Some("instructions"), Some("instructions")),
-        (medium.clone(), None, Some(REMOVAL_NOTICE)),
-        (medium, None, None),
+    for (enabled, instructions, expected) in [
+        (false, "", None),
+        (true, "instructions", Some("instructions")),
+        (true, "instructions", None),
+        (true, "updated instructions", Some(replacement.as_str())),
+        (true, "", Some(REMOVAL_NOTICE)),
+        (true, "", None),
+        (true, "instructions", Some("instructions")),
+        (false, "", Some(REMOVAL_NOTICE)),
+        (false, "", None),
     ] {
         let mut world_state = WorldState::default();
         world_state.add_section(PersistentModeState::new(
-            effort.as_ref(),
+            enabled,
             instructions,
             /*send_user_message_async_available*/ false,
         ));
@@ -63,17 +53,17 @@ fn retained_persistent_instructions_are_replaced_or_retired_without_a_snapshot()
     let retained = ContextualUserFragment::into(PersistentModeState {
         instructions: "previous instructions".to_string(),
     });
-    for (effort, expected) in [
+    for (enabled, expected) in [
         (
-            ReasoningEffort::Persistent,
+            true,
             format!("{REPLACEMENT_NOTICE}\n\ncurrent instructions"),
         ),
-        (ReasoningEffort::Medium, REMOVAL_NOTICE.to_string()),
+        (false, REMOVAL_NOTICE.to_string()),
     ] {
         let mut world_state = WorldState::default();
         world_state.add_section(PersistentModeState::new(
-            Some(&effort),
-            Some("current instructions"),
+            enabled,
+            "current instructions",
             /*send_user_message_async_available*/ false,
         ));
         assert_eq!(

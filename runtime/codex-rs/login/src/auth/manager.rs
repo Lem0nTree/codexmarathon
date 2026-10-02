@@ -1,7 +1,8 @@
+mod workspace_routing;
+
 use chrono::Utc;
 use http::StatusCode;
 use serde::Deserialize;
-use serde::Serialize;
 #[cfg(test)]
 use serial_test::serial;
 use std::env;
@@ -13,7 +14,9 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::OnceLock;
 use std::sync::RwLock;
+use std::sync::Weak;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -55,11 +58,18 @@ pub use crate::auth::storage::AuthDotJson;
 pub use crate::auth::storage::AuthKeyringBackendKind;
 use crate::auth::storage::AuthStorageBackend;
 use crate::auth::storage::create_auth_storage;
-use crate::auth::util::try_parse_error_message;
 use crate::default_client::create_client;
 use crate::default_client::create_default_auth_client;
+use crate::oauth::ErrorBodyLimit;
+use crate::oauth::OAuthClient;
+use crate::oauth::OAuthError;
+use crate::oauth::RefreshTokenGrant;
+use crate::oauth::TokenEncoding;
+use crate::oauth::TokenEndpoint;
+use crate::oauth::TokenErrorDetail;
 use crate::outbound_proxy::AuthRouteConfig;
 use crate::token_data::TokenData;
+use crate::token_data::parse_chatgpt_account_user_id;
 use crate::token_data::parse_chatgpt_jwt_claims;
 use crate::token_data::parse_jwt_expiration;
 use codex_config::ManagedAuthPolicy;
@@ -72,8 +82,11 @@ use codex_protocol::auth::PlanType as InternalPlanType;
 use codex_protocol::auth::RefreshTokenFailedError;
 use codex_protocol::auth::RefreshTokenFailedReason;
 use codex_protocol::protocol::SessionSource;
-use serde_json::Value;
 use thiserror::Error;
+pub use workspace_routing::WorkspaceRouting;
+pub use workspace_routing::WorkspaceRoutingRequest;
+pub use workspace_routing::WorkspaceRoutingResolver;
+pub use workspace_routing::WorkspaceRoutingSession;
 
 /// Authentication mechanism used by the current user.
 #[derive(Debug, Clone)]
@@ -210,6 +223,9 @@ pub enum RefreshTokenError {
     Permanent(#[from] RefreshTokenFailedError),
     #[error(transparent)]
     Transient(#[from] std::io::Error),
+    /// Denied by application policy; neither retry nor cache as a credential failure.
+    #[error(transparent)]
+    Policy(#[from] codex_http_client::NetworkPolicyDenied),
 }
 
 /// Error returned when constructing an [`AuthManager`] from resolved configuration.
@@ -283,7 +299,16 @@ impl RefreshTokenError {
     pub fn failed_reason(&self) -> Option<RefreshTokenFailedReason> {
         match self {
             Self::Permanent(error) => Some(error.reason),
-            Self::Transient(_) => None,
+            Self::Transient(_) | Self::Policy(_) => None,
+        }
+    }
+}
+
+impl From<codex_http_client::HttpError> for RefreshTokenError {
+    fn from(error: codex_http_client::HttpError) -> Self {
+        match error {
+            codex_http_client::HttpError::Policy(denied) => Self::Policy(denied),
+            error => Self::Transient(std::io::Error::other(error)),
         }
     }
 }
@@ -293,6 +318,9 @@ impl From<RefreshTokenError> for std::io::Error {
         match err {
             RefreshTokenError::Permanent(failed) => std::io::Error::other(failed),
             RefreshTokenError::Transient(inner) => inner,
+            RefreshTokenError::Policy(error) => {
+                std::io::Error::new(std::io::ErrorKind::PermissionDenied, error)
+            }
         }
     }
 }
@@ -630,6 +658,19 @@ impl CodexAuth {
                 .get_current_token_data()
                 .and_then(|t| t.id_token.chatgpt_user_id),
         }
+    }
+
+    /// Returns the access token's opaque account-user identity only when its workspace
+    /// matches the selected account. Missing claims never fall back to a user id.
+    /// Unlike `get_chatgpt_user_id`, this identifies one workspace membership, so keys
+    /// are not shared across a person's workspaces. Workload-identity exchange claims
+    /// describe an agent identity and cannot select a human verification credential.
+    /// This is local identity selection, not access-token or proof validation.
+    pub fn get_chatgpt_account_user_id(&self) -> Option<String> {
+        let tokens = self.get_current_token_data()?;
+        parse_chatgpt_account_user_id(&tokens.access_token, tokens.account_id.as_deref()?)
+            .ok()
+            .flatten()
     }
 
     /// Account-facing plan classification derived from the current auth.
@@ -1587,58 +1628,58 @@ async fn request_chatgpt_token_refresh(
     refresh_token: String,
     client: &HttpClient,
 ) -> Result<RefreshResponse, RefreshTokenError> {
-    let refresh_request = RefreshRequest {
-        client_id: oauth_client_id(),
-        grant_type: "refresh_token",
-        refresh_token,
-    };
+    let client_id = oauth_client_id();
     let endpoint = refresh_token_endpoint();
-
-    // Use shared client factory to include standard headers
-    let response = client
-        .post(endpoint.as_str())
-        .header("Content-Type", "application/json")
-        .json(&refresh_request)
-        .send()
+    let oauth = OAuthClient::new(
+        client,
+        TokenEndpoint {
+            url: &endpoint,
+            client_id: &client_id,
+            encoding: TokenEncoding::Json,
+            timeout: None,
+            error_body_limit: ErrorBodyLimit::Unlimited,
+        },
+    );
+    match oauth
+        .refresh(RefreshTokenGrant {
+            refresh_token: &refresh_token,
+            resource: None,
+        })
         .await
-        .map_err(|err| RefreshTokenError::Transient(std::io::Error::other(err)))?;
-
-    let status = response.status();
-    if status.is_success() {
-        let refresh_response = response
-            .json::<RefreshResponse>()
-            .await
-            .map_err(|err| RefreshTokenError::Transient(std::io::Error::other(err)))?;
-        Ok(refresh_response)
-    } else {
-        let body = response.text().await.unwrap_or_default();
-        tracing::error!("Failed to refresh token: {status}: {body}");
-        let code = extract_refresh_token_error_code(&body);
-        // RFC 6749 reports an unusable refresh token as invalid_grant without preserving
-        // the legacy expired/reused/revoked subtype. Keep it terminal with the generic reason.
-        let is_invalid_grant_bad_request = status == StatusCode::BAD_REQUEST
-            && code
-                .as_deref()
-                .is_some_and(|code| code.eq_ignore_ascii_case("invalid_grant"));
-        let failed =
-            classify_refresh_token_failure(code.as_deref(), &body, is_invalid_grant_bad_request);
-        if status == StatusCode::UNAUTHORIZED
-            || failed.reason != RefreshTokenFailedReason::Other
-            || is_invalid_grant_bad_request
-        {
-            Err(RefreshTokenError::Permanent(failed))
-        } else {
-            let message = try_parse_error_message(&body);
-            Err(RefreshTokenError::Transient(std::io::Error::other(
-                format!("Failed to refresh token: {status}: {message}"),
-            )))
+    {
+        Ok(response) => Ok(response),
+        Err(OAuthError::Rejected(rejection)) => {
+            if let Some(codex_http_client::HttpError::Policy(denied)) = rejection.body_read_error {
+                return Err(denied.into());
+            }
+            let status = rejection.status;
+            let detail = &rejection.detail;
+            tracing::error!(%status, ?detail, "Failed to refresh token");
+            let code = detail.error_code();
+            let is_invalid_grant_bad_request = status == StatusCode::BAD_REQUEST
+                && code.is_some_and(|code| code.eq_ignore_ascii_case("invalid_grant"));
+            let failed = classify_refresh_token_failure(code, detail, is_invalid_grant_bad_request);
+            if status == StatusCode::UNAUTHORIZED
+                || failed.reason != RefreshTokenFailedReason::Other
+                || is_invalid_grant_bad_request
+            {
+                Err(RefreshTokenError::Permanent(failed))
+            } else {
+                Err(RefreshTokenError::Transient(std::io::Error::other(
+                    format!("Failed to refresh token: {status}: {detail}"),
+                )))
+            }
+        }
+        Err(OAuthError::Transport(error)) => Err(error.into()),
+        Err(error @ OAuthError::InvalidResponse) => {
+            Err(RefreshTokenError::Transient(std::io::Error::other(error)))
         }
     }
 }
 
 fn classify_refresh_token_failure(
     code: Option<&str>,
-    body: &str,
+    detail: &TokenErrorDetail,
     is_invalid_grant_bad_request: bool,
 ) -> RefreshTokenFailedError {
     let normalized_code = code.map(str::to_ascii_lowercase);
@@ -1651,8 +1692,7 @@ fn classify_refresh_token_failure(
 
     if reason == RefreshTokenFailedReason::Other && !is_invalid_grant_bad_request {
         tracing::warn!(
-            backend_code = normalized_code.as_deref(),
-            backend_body = body,
+            backend_detail = ?detail,
             "Encountered unknown response while refreshing token"
         );
     }
@@ -1665,39 +1705,6 @@ fn classify_refresh_token_failure(
     };
 
     RefreshTokenFailedError::new(reason, message)
-}
-
-fn extract_refresh_token_error_code(body: &str) -> Option<String> {
-    if body.trim().is_empty() {
-        return None;
-    }
-
-    let Value::Object(map) = serde_json::from_str::<Value>(body).ok()? else {
-        return None;
-    };
-
-    if let Some(error_value) = map.get("error") {
-        match error_value {
-            Value::Object(obj) => {
-                if let Some(code) = obj.get("code").and_then(Value::as_str) {
-                    return Some(code.to_string());
-                }
-            }
-            Value::String(code) => {
-                return Some(code.to_string());
-            }
-            _ => {}
-        }
-    }
-
-    map.get("code").and_then(Value::as_str).map(str::to_string)
-}
-
-#[derive(Serialize)]
-struct RefreshRequest {
-    client_id: String,
-    grant_type: &'static str,
-    refresh_token: String,
 }
 
 #[derive(Deserialize, Clone)]
@@ -2157,6 +2164,7 @@ pub struct AuthManager {
     inner: RwLock<CachedAuth>,
     auth_change_tx: watch::Sender<u64>,
     auth_change_state_tx: watch::Sender<AuthChangeState>,
+    workspace_routing_resolver: OnceLock<Weak<dyn WorkspaceRoutingResolver>>,
     enable_codex_api_key_env: bool,
     auth_credentials_store_mode: AuthCredentialsStoreMode,
     keyring_backend_kind: AuthKeyringBackendKind,
@@ -2205,6 +2213,13 @@ pub trait AuthManagerConfig {
     fn auth_route_config(&self) -> AuthRouteConfig;
 }
 
+/// Runtime storage and network policy shared by independent credential managers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthRuntimeConfig {
+    pub codex_home: PathBuf,
+    pub auth_route_config: AuthRouteConfig,
+}
+
 impl Debug for AuthManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AuthManager")
@@ -2238,6 +2253,21 @@ fn default_agent_identity_authapi_base_url() -> Option<String> {
 }
 
 impl AuthManager {
+    /// Returns the application policy associated with this account owner.
+    pub fn application_network_policy(&self) -> codex_http_client::NetworkPolicy {
+        self.auth_route_config
+            .http_client_factory()
+            .network_policy()
+            .clone()
+    }
+
+    /// Creates content clients bound to the account currently owned by this manager.
+    pub fn http_client_factory(&self) -> HttpClientFactory {
+        self.auth_route_config
+            .http_client_factory()
+            .clone()
+            .with_network_policy(self.application_network_policy().for_current_account())
+    }
     /// Create a new manager loading the initial auth using the provided
     /// preferred auth method. Errors loading auth are swallowed; `auth()` will
     /// simply return `None` in that case so callers can treat it as an
@@ -2294,6 +2324,7 @@ impl AuthManager {
             }),
             auth_change_tx,
             auth_change_state_tx: watch::channel(AuthChangeState::default()).0,
+            workspace_routing_resolver: OnceLock::new(),
             enable_codex_api_key_env,
             auth_credentials_store_mode,
             keyring_backend_kind,
@@ -2329,6 +2360,7 @@ impl AuthManager {
             inner: RwLock::new(cached),
             auth_change_tx,
             auth_change_state_tx: watch::channel(AuthChangeState::default()).0,
+            workspace_routing_resolver: OnceLock::new(),
             enable_codex_api_key_env: false,
             auth_credentials_store_mode: AuthCredentialsStoreMode::File,
             keyring_backend_kind: AuthKeyringBackendKind::default(),
@@ -2358,6 +2390,7 @@ impl AuthManager {
             inner: RwLock::new(cached),
             auth_change_tx,
             auth_change_state_tx: watch::channel(AuthChangeState::default()).0,
+            workspace_routing_resolver: OnceLock::new(),
             enable_codex_api_key_env: false,
             auth_credentials_store_mode: AuthCredentialsStoreMode::File,
             keyring_backend_kind: AuthKeyringBackendKind::default(),
@@ -2391,6 +2424,7 @@ impl AuthManager {
             inner: RwLock::new(cached),
             auth_change_tx,
             auth_change_state_tx: watch::channel(AuthChangeState::default()).0,
+            workspace_routing_resolver: OnceLock::new(),
             enable_codex_api_key_env: false,
             auth_credentials_store_mode: AuthCredentialsStoreMode::File,
             keyring_backend_kind: AuthKeyringBackendKind::default(),
@@ -2422,6 +2456,7 @@ impl AuthManager {
             }),
             auth_change_tx,
             auth_change_state_tx: watch::channel(AuthChangeState::default()).0,
+            workspace_routing_resolver: OnceLock::new(),
             enable_codex_api_key_env: false,
             auth_credentials_store_mode: AuthCredentialsStoreMode::File,
             keyring_backend_kind: AuthKeyringBackendKind::default(),
@@ -2707,6 +2742,14 @@ impl AuthManager {
         self.auth_cached()
     }
 
+    /// Refreshes auth, then captures credentials and their account-bound factory together.
+    /// The auth read lock prevents an identity change between the two snapshots.
+    pub async fn auth_with_http_client_factory(&self) -> Option<(CodexAuth, HttpClientFactory)> {
+        self.auth().await;
+        let cached = self.inner.read().ok()?;
+        Some((cached.auth.clone()?, self.http_client_factory()))
+    }
+
     pub async fn agent_identity_auth(
         &self,
         policy: AgentIdentityAuthPolicy,
@@ -2911,6 +2954,7 @@ impl AuthManager {
                             cached_auth
                         }
                         RefreshTokenError::Transient(_) => None,
+                        RefreshTokenError::Policy(_) => cached_auth,
                     }
                 }
             };
@@ -2955,6 +2999,12 @@ impl AuthManager {
             let changed = auth_changed_for_refresh;
             let owner_changed =
                 auth_changed_for_refresh && !same_owner(previous, new_auth.as_ref());
+            if owner_changed {
+                self.auth_route_config
+                    .http_client_factory()
+                    .network_policy()
+                    .invalidate();
+            }
             if auth_changed_for_refresh {
                 guard.permanent_refresh_failure = None;
             }
@@ -3059,7 +3109,8 @@ impl AuthManager {
         )
     }
 
-    fn allowed_login_methods(&self) -> Vec<ForcedLoginMethod> {
+    /// Returns the login methods permitted by the current effective authentication policy.
+    pub fn allowed_login_methods(&self) -> Vec<ForcedLoginMethod> {
         self.managed_auth_policy.allowed_login_methods(
             self.forced_login_method,
             self.forced_chatgpt_workspace_id().as_deref(),
@@ -3082,6 +3133,14 @@ impl AuthManager {
 
     pub fn codex_api_key_env_enabled(&self) -> bool {
         self.enable_codex_api_key_env
+    }
+
+    /// Returns policy only; independent credential managers own their own state and lifecycle.
+    pub fn runtime_config(&self) -> AuthRuntimeConfig {
+        AuthRuntimeConfig {
+            codex_home: self.codex_home.clone(),
+            auth_route_config: self.auth_route_config.clone(),
+        }
     }
 
     /// Convenience constructor returning an `Arc` wrapper.
@@ -3452,3 +3511,7 @@ mod tests;
 #[cfg(test)]
 #[path = "change_state_tests.rs"]
 mod change_state_tests;
+
+#[cfg(test)]
+#[path = "account_user_id_tests.rs"]
+mod account_user_id_tests;

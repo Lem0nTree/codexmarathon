@@ -1,46 +1,50 @@
 //! Handles persistent thread-settings updates and serializes their persistence
-//! with compaction checkpoints.
+//! with checkpoints written directly to storage.
 
 use super::session::Session;
 use super::session::SessionSettingsUpdate;
 use super::step_settings::StepSettingsUpdate;
 use crate::config::ConstraintResult;
-use codex_protocol::protocol::CodexErrorInfo;
-use codex_protocol::protocol::ErrorEvent;
+use codex_history::RolloutItem;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ThreadSettingsAppliedEvent;
 use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::protocol::ThreadSettingsSnapshot;
-use std::sync::Arc;
+use codex_thread_store::ThreadStoreResult;
 use tokio::sync::SemaphorePermit;
 
-/// Applies standalone thread settings and reports invalid overrides through the
-/// normal event stream.
-pub(super) async fn update(
-    session: &Arc<Session>,
-    submission_id: String,
-    overrides: ThreadSettingsOverrides,
-) {
-    let updates = prepare_update(overrides);
-    if let Err(error) = apply_update(session, submission_id.clone(), updates).await {
-        session
-            .send_event_raw(Event {
-                id: submission_id,
-                msg: EventMsg::Error(ErrorEvent {
-                    misalignment: None,
-                    message: format!("invalid thread settings override: {error}"),
-                    codex_error_info: Some(CodexErrorInfo::BadRequest),
-                }),
-            })
-            .await;
+impl Session {
+    /// Captures and flushes current settings under the shared persistence permit.
+    pub(crate) async fn checkpoint_thread_settings(&self) -> ThreadStoreResult<()> {
+        let _settings_guard = acquire_persistence_lock(self).await;
+        if let Some(live_thread) = self.live_thread() {
+            live_thread
+                .append_items(&[RolloutItem::EventMsg(applied_event(self).await)])
+                .await?;
+            live_thread.flush().await?;
+        }
+        Ok(())
     }
+}
+
+/// Applies standalone thread settings. The caller holds the persistence permit through notification.
+pub(super) async fn update(
+    session: &Session,
+    overrides: ThreadSettingsOverrides,
+) -> ConstraintResult<ThreadSettingsSnapshot> {
+    let updates = prepare_update(overrides);
+    let commit = session.update_settings(updates).await?;
+    // Standalone settings changes supersede a pending automatic continuation.
+    session.state.lock().await.last_started_turn_id = None;
+    Ok(commit.snapshot)
 }
 
 /// Converts protocol overrides into the internal settings update shape.
 pub(super) fn prepare_update(overrides: ThreadSettingsOverrides) -> SessionSettingsUpdate {
     let ThreadSettingsOverrides {
         environments,
+        runtime_workspace_roots,
         profile_workspace_roots,
         approval_policy,
         approvals_reviewer,
@@ -54,6 +58,7 @@ pub(super) fn prepare_update(overrides: ThreadSettingsOverrides) -> SessionSetti
         service_tier,
         collaboration_mode,
         personality,
+        disabled_plugin_ids,
     } = overrides;
     SessionSettingsUpdate {
         step_settings: StepSettingsUpdate {
@@ -67,11 +72,13 @@ pub(super) fn prepare_update(overrides: ThreadSettingsOverrides) -> SessionSetti
             approvals_reviewer,
         },
         environments,
+        runtime_workspace_roots,
         profile_workspace_roots,
         sandbox_policy,
         permission_profile,
         active_permission_profile,
         windows_sandbox_level,
+        disabled_plugin_ids,
         ..Default::default()
     }
 }
@@ -115,7 +122,7 @@ pub(super) async fn emit_applied(
         .await;
 }
 
-/// Builds a current thread-owned snapshot for fork and compaction persistence.
+/// Builds a current thread-owned snapshot for storage checkpoints.
 pub(super) async fn applied_event(session: &Session) -> EventMsg {
     EventMsg::ThreadSettingsApplied(ThreadSettingsAppliedEvent {
         thread_id: Some(session.thread_id()),

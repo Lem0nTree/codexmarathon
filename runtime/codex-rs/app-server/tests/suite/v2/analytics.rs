@@ -14,11 +14,15 @@ use codex_app_server_protocol::ClientRequest;
 use codex_app_server_protocol::JSONRPCResponse;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::SandboxPolicy;
+use codex_app_server_protocol::ServerRequest;
 use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::ThreadReadParams;
 use codex_app_server_protocol::ThreadReadResponse;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
+use codex_app_server_protocol::TurnSettingsUpdateParams;
+use codex_app_server_protocol::TurnSettingsUpdateResponse;
+use codex_app_server_protocol::TurnSettingsUpdateStatus;
 use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::TurnStartResponse;
 use codex_app_server_protocol::UserInput;
@@ -29,7 +33,10 @@ use codex_core::config::ConfigBuilder;
 use codex_core_plugins::loader::curated_plugin_cache_version;
 use codex_core_plugins::store::PluginStore;
 use codex_features::Feature;
+use codex_models_manager::bundled_models_response;
 use codex_plugin::PluginId;
+use codex_protocol::openai_models::ModelsResponse;
+use codex_protocol::openai_models::ReasoningEffort;
 use core_test_support::responses;
 use core_test_support::skip_if_no_network;
 use core_test_support::skip_if_remote;
@@ -51,6 +58,71 @@ use wiremock::matchers::path;
 use wiremock::matchers::path_regex;
 
 const SERVICE_VERSION: &str = "0.0.0-test";
+
+#[tokio::test]
+async fn usage_limit_window_reaches_turn_analytics() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = responses::start_mock_server().await;
+    Mock::given(method("POST"))
+        .and(path_regex(".*/responses$"))
+        .respond_with(ResponseTemplate::new(429).set_body_json(json!({
+            "error": {
+                "type": "usage_limit_reached",
+                "message": "usage limit reached",
+                "plan_type": "pro",
+                "limit_window_minutes": 300
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let codex_home = TempDir::new()?;
+    MockResponsesConfig::new(&server.uri())
+        .with_root_config(&format!("chatgpt_base_url = \"{}\"", server.uri()))
+        .with_provider_config("supports_websockets = false")
+        .write(codex_home.path())?;
+    mount_analytics_capture(&server, codex_home.path()).await?;
+
+    let mut app_server = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_managed_config()
+        .build_initialized()
+        .await?;
+    let thread = app_server
+        .start_thread(ThreadStartParams::default())
+        .await?
+        .thread;
+    let completed = app_server
+        .start_turn_and_wait_for_completion(TurnStartParams {
+            thread_id: thread.id,
+            input: vec![UserInput::Text {
+                text: "Hello".to_string(),
+                text_elements: Vec::new(),
+            }],
+            ..Default::default()
+        })
+        .await?;
+
+    let event = wait_for_matching_analytics_event(&server, Duration::from_secs(30), |event| {
+        event["event_type"] == "codex_turn_event"
+            && event["event_params"]["turn_id"] == completed.turn.id
+    })
+    .await?;
+    let params = &event["event_params"];
+    assert_eq!(
+        json!([
+            params["status"],
+            params["turn_error"],
+            params["codex_error_kind"],
+            params["usage_limit_window_minutes"],
+        ]),
+        json!(["failed", "usageLimitExceeded", "usage_limit_reached", 300])
+    );
+
+    Ok(())
+}
 
 #[tokio::test]
 async fn guardian_review_turns_and_tools_reach_analytics() -> Result<()> {
@@ -135,6 +207,7 @@ async fn guardian_review_turns_and_tools_reach_analytics() -> Result<()> {
                 text: "Review three commands".to_string(),
                 text_elements: Vec::new(),
             }],
+            effort: Some(ReasoningEffort::High),
             ..Default::default()
         })
         .await?;
@@ -166,6 +239,19 @@ async fn guardian_review_turns_and_tools_reach_analytics() -> Result<()> {
     timeout(READ_TIMEOUT, app_server.shutdown_gracefully()).await??;
     let events = captured_analytics_events(&server).await;
     assert!(!serde_json::to_string(&events)?.contains(PRIVATE));
+    let parent_command = events
+        .iter()
+        .find(|event| {
+            event["event_type"] == "codex_command_execution_event"
+                && event["event_params"]["thread_id"] == thread.id
+                && event["event_params"]["item_id"] == "parent-first"
+        })
+        .expect("denied parent command analytics");
+    let params = &parent_command["event_params"];
+    assert_eq!(
+        json!([params["model_slug"], params["reasoning_effort"]]),
+        json!(["mock-model", "high"])
+    );
     let children = events
         .iter()
         .filter(|event| event["event_params"]["subagent_source"] == "guardian")
@@ -506,6 +592,7 @@ pub(crate) async fn mount_analytics_capture(server: &MockServer, codex_home: &Pa
         AuthCredentialsStoreMode::File,
     )?;
 
+    app_test_support::mount_workspace_routing(server).await;
     Ok(())
 }
 
@@ -586,7 +673,10 @@ pub(crate) async fn wait_for_matching_analytics_event(
             };
             for request in &requests {
                 if request.method != "POST"
-                    || request.url.path() != "/codex/analytics-events/events"
+                    || !request
+                        .url
+                        .path()
+                        .ends_with("/codex/analytics-events/events")
                 {
                     continue;
                 }
@@ -692,6 +782,7 @@ operations:
         &script_path,
         r#"test -n "$CODEX_PLUGIN_METRICS_OUTPUT"
 sleep "${1:-0.3}"
+while [ -n "${2:-}" ] && [ ! -f "$2" ]; do sleep 0.01; done
 printf '%s' '{"version":1,"measurements":[{"name":"findings","value":3,"dimensions":{"severity":"high"}},{"name":"files_scanned","value":17}]}' > "$CODEX_PLUGIN_METRICS_OUTPUT"
 "#,
     )?;
@@ -724,12 +815,14 @@ async fn assert_plugin_measurement_analytics(remote: bool, background: bool) -> 
 
     let codex_home = TempDir::new()?;
     let script_path = write_curated_metrics_plugin(codex_home.path())?.canonicalize()?;
+    let release_path = codex_home.path().join("release-command");
     let mut command = vec![
         "/bin/sh".to_string(),
         script_path.to_string_lossy().into_owned(),
     ];
     if background {
         command.push("1.0".to_string());
+        command.push(release_path.to_string_lossy().into_owned());
     }
     let call_id = "curated-plugin-metrics";
     let arguments = serde_json::to_string(&json!({
@@ -742,8 +835,32 @@ async fn assert_plugin_measurement_analytics(remote: bool, background: bool) -> 
         responses::ev_completed("resp-1"),
     ]);
     let final_response = create_final_assistant_message_sse_response("done")?;
-    let server =
-        create_mock_responses_server_sequence(vec![command_response, final_response]).await;
+    let pause_response = |id: &str| {
+        responses::sse(vec![
+            responses::ev_response_created(id),
+            responses::ev_function_call(
+                id,
+                "request_user_input",
+                &json!({
+                    "questions": [{
+                        "id": "continue", "header": "Continue", "question": "Continue?",
+                        "options": [
+                            {"label": "Yes", "description": "Continue the turn."},
+                            {"label": "No", "description": "Stop the turn."}
+                        ]
+                    }]
+                })
+                .to_string(),
+            ),
+            responses::ev_completed(id),
+        ])
+    };
+    let mut response_sequence = vec![pause_response("before-command"), command_response];
+    if background {
+        response_sequence.push(pause_response("after-launch"));
+    }
+    response_sequence.push(final_response);
+    let server = create_mock_responses_server_sequence(response_sequence).await;
 
     let analytics_server = responses::start_mock_server().await;
     write_mock_responses_config_toml_with_chatgpt_base_url(
@@ -753,11 +870,40 @@ async fn assert_plugin_measurement_analytics(remote: bool, background: bool) -> 
     )?;
     let config_path = codex_home.path().join("config.toml");
     let config = std::fs::read_to_string(&config_path)?;
+    let model = bundled_models_response()?
+        .models
+        .into_iter()
+        .find(|model| model.slug == "gpt-5.5")
+        .expect("bundled gpt-5.5 model");
+    let models = [
+        ("initial-model", ReasoningEffort::Low),
+        ("invoking-model", ReasoningEffort::High),
+    ]
+    .into_iter()
+    .map(|(slug, effort)| {
+        let mut model = model.clone();
+        model.slug = slug.to_string();
+        model.default_reasoning_level = Some(effort);
+        model
+    })
+    .collect();
+    let catalog_path = codex_home.path().join("measurement-models.json");
+    std::fs::write(
+        &catalog_path,
+        serde_json::to_vec(&ModelsResponse { models })?,
+    )?;
+    let catalog_config = format!(
+        "model_catalog_json = {}",
+        serde_json::to_string(&catalog_path)?
+    );
     std::fs::write(
         config_path,
         format!(
-            r#"{config}
+            r#"{catalog_config}
+{config}
 [features]
+step_model_switching = true
+default_mode_request_user_input = true
 plugins = true
 remote_plugin = false
 unified_exec = true
@@ -787,7 +933,7 @@ enabled = true
     timeout(Duration::from_secs(10), mcp.initialize()).await??;
     let thread_request = mcp
         .send_thread_start_request_with_auto_env(ThreadStartParams {
-            model: Some("mock-model".to_string()),
+            model: Some("initial-model".to_string()),
             service_name: Some("codex_work_desktop".to_string()),
             ..Default::default()
         })
@@ -813,11 +959,43 @@ enabled = true
             ..Default::default()
         })
         .await?;
-    timeout(
+    let turn_response = timeout(
         Duration::from_secs(10),
         mcp.read_stream_until_response_message(RequestId::Integer(turn_request)),
     )
     .await??;
+    let turn_response: TurnStartResponse = to_response(turn_response)?;
+    for model in if background {
+        vec!["invoking-model", "initial-model"]
+    } else {
+        vec!["invoking-model"]
+    } {
+        let request = timeout(
+            Duration::from_secs(10),
+            mcp.read_stream_until_request_message(),
+        )
+        .await??;
+        let ServerRequest::ToolRequestUserInput { request_id, .. } = request else {
+            anyhow::bail!("expected request_user_input, received {request:?}");
+        };
+        let response: TurnSettingsUpdateResponse = mcp
+            .request(|request_id| ClientRequest::TurnSettingsUpdate {
+                request_id,
+                params: TurnSettingsUpdateParams {
+                    thread_id: thread_id.clone(),
+                    turn_id: turn_response.turn.id.clone(),
+                    model: Some(model.to_string()),
+                    ..Default::default()
+                },
+            })
+            .await?;
+        assert_eq!(response.status, TurnSettingsUpdateStatus::Applied);
+        mcp.send_response(
+            request_id,
+            json!({"answers": {"continue": {"answers": ["Yes"]}}}),
+        )
+        .await?;
+    }
     let completed_turn = timeout(
         Duration::from_secs(10),
         mcp.read_stream_until_notification_message("turn/completed"),
@@ -830,17 +1008,7 @@ enabled = true
         .expect("completed turn id");
 
     if background {
-        let model_request_bodies = server
-            .received_requests()
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|request| request.url.path().ends_with("/responses"))
-            .map(|request| serde_json::from_slice::<Value>(&request.body))
-            .collect::<Result<Vec<_>, _>>()?;
-        let request_text = serde_json::to_string(&model_request_bodies)?;
-        assert!(request_text.contains("Process running with session ID "));
-        assert!(!request_text.contains("Process exited with code 0"));
+        std::fs::write(release_path, "release")?;
     }
 
     for measurement_name in ["findings", "files_scanned"] {
@@ -859,12 +1027,18 @@ enabled = true
         .await?;
     assert_eq!(
         json!({
+            "model_slug": command_event["event_params"]["model_slug"],
+            "sandbox_backend": command_event["event_params"]["sandbox_backend"],
+            "reasoning_effort": command_event["event_params"]["reasoning_effort"],
             "plugin_id": command_event["event_params"]["plugin_id"],
             "script_path": command_event["event_params"]["script_path"],
             "item_id": command_event["event_params"]["item_id"],
             "exit_code": command_event["event_params"]["exit_code"],
         }),
         json!({
+            "model_slug": "invoking-model",
+            "sandbox_backend": if cfg!(target_os = "macos") { "seatbelt" } else { "seccomp" },
+            "reasoning_effort": "high",
             "plugin_id": METRICS_PLUGIN_ID,
             "script_path": "scripts/run.sh",
             "item_id": call_id,
@@ -952,10 +1126,12 @@ enabled = true
                 "execution_id",
                 "item_id",
                 "measurement_name",
+                "model_slug",
                 "number_value",
                 "operation",
                 "originator",
                 "plugin_id",
+                "reasoning_effort",
                 "thread_id",
                 "turn_id",
             ]
@@ -963,6 +1139,8 @@ enabled = true
         assert_eq!(event_params["thread_id"], thread_id);
         assert_eq!(event_params["turn_id"], turn_id);
         assert_eq!(event_params["originator"], "codex_work_desktop");
+        assert_eq!(event_params["model_slug"], "invoking-model");
+        assert_eq!(event_params["reasoning_effort"], "high");
     }
 
     Ok(())

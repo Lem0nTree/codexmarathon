@@ -64,6 +64,7 @@ pub(crate) fn without_notification_media(notification: ServerNotification) -> Se
         | ServerNotification::ThreadReverted(_)
         | ServerNotification::SkillsChanged(_)
         | ServerNotification::ThreadNameUpdated(_)
+        | ServerNotification::ThreadAttachmentUpdated(_)
         | ServerNotification::ThreadGoalUpdated(_)
         | ServerNotification::ThreadGoalCleared(_)
         | ServerNotification::ThreadQueueChanged(_)
@@ -134,7 +135,8 @@ pub(crate) fn without_notification_media(notification: ServerNotification) -> Se
         | ServerNotification::ThreadRealtimeClosed(_)
         | ServerNotification::WindowsWorldWritableWarning(_)
         | ServerNotification::WindowsSandboxSetupCompleted(_)
-        | ServerNotification::AccountLoginCompleted(_) => notification,
+        | ServerNotification::AccountLoginCompleted(_)
+        | ServerNotification::GatewayOAuthChanged(_) => notification,
     }
 }
 

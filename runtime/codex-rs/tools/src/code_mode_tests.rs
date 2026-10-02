@@ -1,4 +1,4 @@
-use super::augment_tool_spec_for_code_mode;
+use super::augment_tool_spec_for_code_mode as augment_tool_spec_with_budget;
 use super::code_mode_name_for_tool_name;
 use super::tool_spec_to_code_mode_tool_definition;
 use crate::AdditionalProperties;
@@ -13,6 +13,58 @@ use crate::ToolSpec;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 use std::collections::BTreeMap;
+
+fn augment_tool_spec_for_code_mode(spec: ToolSpec) -> ToolSpec {
+    augment_tool_spec_with_budget(spec, /*code_mode_input_schema_max_bytes*/ None)
+}
+
+#[test]
+fn code_mode_input_schema_uses_the_larger_budget() {
+    let default_code_mode = codex_code_mode::DEFAULT_INPUT_SCHEMA_MAX_BYTES;
+    for (mcp, code_mode, expected) in [
+        (None, None, default_code_mode),
+        (Some(5_000), Some(1_000), default_code_mode),
+        (None, Some(1_000), default_code_mode),
+        (Some(30_000), Some(20_000), 30_000),
+        (Some(20_000), Some(30_000), 30_000),
+    ] {
+        assert_eq!(
+            super::effective_input_schema_max_bytes(mcp, code_mode),
+            expected
+        );
+    }
+}
+
+#[test]
+fn code_mode_materializes_mcp_output_schemas() {
+    let output = json!({"type": "object", "properties": {"ok": {"type": "boolean"}}});
+    let mut tool = rmcp::model::Tool::new(
+        "lookup_order",
+        "Look up an order",
+        std::sync::Arc::new(rmcp::model::object(json!({"type": "object"}))),
+    );
+    tool.output_schema = Some(std::sync::Arc::new(rmcp::model::object(output.clone())));
+    let parsed = crate::mcp_tool_to_responses_api_tool(
+        &ToolName::plain("lookup_order"),
+        &tool,
+        /*schema_max_bytes*/ None,
+    )
+    .unwrap();
+    let eager = ResponsesApiTool {
+        output_schema: Some(crate::mcp_call_tool_result_output_schema(output).into()),
+        ..parsed.clone()
+    };
+    assert_eq!(
+        super::collect_code_mode_tool_definitions(
+            [&ToolSpec::Function(parsed)],
+            /*code_mode_input_schema_max_bytes*/ None,
+        ),
+        super::collect_code_mode_tool_definitions(
+            [&ToolSpec::Function(eager)],
+            /*code_mode_input_schema_max_bytes*/ None,
+        ),
+    );
+}
 
 #[test]
 fn code_mode_tool_names_do_not_prefix_the_default_namespace() {
@@ -45,13 +97,16 @@ fn augment_tool_spec_for_code_mode_augments_function_tools() {
                 Some(vec!["order_id".to_string()]),
                 Some(AdditionalProperties::Boolean(false))
             ),
-            output_schema: Some(json!({
-                "type": "object",
-                "properties": {
-                    "ok": {"type": "boolean"}
-                },
-                "required": ["ok"],
-            })),
+            output_schema: Some(
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "ok": {"type": "boolean"}
+                    },
+                    "required": ["ok"],
+                })
+                .into()
+            ),
         })),
         ToolSpec::Function(ResponsesApiTool {
             name: "lookup_order".to_string(),
@@ -72,13 +127,16 @@ declare const tools: { lookup_order(args: { order_id: string; }): Promise<{ ok: 
                 Some(vec!["order_id".to_string()]),
                 Some(AdditionalProperties::Boolean(false))
             ),
-            output_schema: Some(json!({
-                "type": "object",
-                "properties": {
-                    "ok": {"type": "boolean"}
-                },
-                "required": ["ok"],
-            })),
+            output_schema: Some(
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "ok": {"type": "boolean"}
+                    },
+                    "required": ["ok"],
+                })
+                .into()
+            ),
         })
     );
 }
@@ -136,6 +194,7 @@ declare const tools: { apply_patch(input: string): Promise<unknown>; };
                 .to_string(),
             kind: codex_code_mode::CodeModeToolKind::Freeform,
             input_schema: None,
+            input_schema_max_bytes: None,
             output_schema: None,
         })
     );
@@ -172,6 +231,7 @@ declare const tools: { editor__apply_patch(input: string): Promise<unknown>; };
                 .to_string(),
             kind: codex_code_mode::CodeModeToolKind::Freeform,
             input_schema: None,
+            input_schema_max_bytes: None,
             output_schema: None,
         })
     );

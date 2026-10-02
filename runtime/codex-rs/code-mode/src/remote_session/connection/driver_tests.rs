@@ -87,17 +87,13 @@ impl DriverHarness {
         }
     }
 
-    async fn open(
-        &mut self,
-        session: RemoteSession,
-        delegate: Arc<dyn CodeModeSessionDelegate>,
-    ) -> SessionCleanup {
+    async fn open(&mut self, session: RemoteSession) -> SessionCleanup {
         let cleanup = SessionCleanup::new();
         let (response_tx, response_rx) = oneshot::channel();
         self.command_tx
             .send(DriverCommand::OpenSession {
                 session: session.clone(),
-                delegate,
+
                 limits: Default::default(),
                 cleanup: cleanup.clone(),
                 caller_cancellation: CancellationToken::new(),
@@ -129,11 +125,13 @@ impl DriverHarness {
         session: RemoteSession,
         request_id: i64,
         cell_id: &str,
+        delegate: Arc<dyn CodeModeSessionDelegate>,
     ) -> codex_code_mode_protocol::StartedCell {
         let (response_tx, response_rx) = oneshot::channel();
         self.command_tx
             .send(DriverCommand::Execute {
                 session,
+                delegate,
                 request: ExecuteRequest {
                     tool_call_id: format!("call-{request_id}"),
                     enabled_tools: Vec::new(),
@@ -142,6 +140,7 @@ impl DriverHarness {
                     max_output_tokens: None,
                 },
                 caller_cancellation: CancellationToken::new(),
+                yield_signal: None,
                 response_tx,
             })
             .await
@@ -194,6 +193,85 @@ impl Drop for DriverHarness {
     }
 }
 
+#[tokio::test(start_paused = true)]
+async fn old_host_does_not_receive_yield_frames() {
+    let mut harness = DriverHarness::start();
+    let session = remote_session();
+    let _cleanup = harness.open(session.clone()).await;
+    let _started = harness
+        .start_cell(
+            session.clone(),
+            /*request_id*/ 2,
+            "1",
+            Arc::new(RecordingDelegate::default()),
+        )
+        .await;
+    harness
+        .event_tx
+        .send(DriverEvent::HostMessage(HostToClient::InitialResponse {
+            id: RequestId::new(/*value*/ 2),
+            result: WireResult::Ok {
+                value: WireRuntimeResponse::Yielded {
+                    cell_id: CellId::new("1".to_string()).into(),
+                    content_items: Vec::new(),
+                    code_mode_host_duration_ns: 1,
+                },
+            },
+        }))
+        .await
+        .unwrap();
+    let connection = Connection {
+        command_tx: harness.command_tx.clone(),
+        execute_claim_tx: harness.execute_claim_tx.clone(),
+        alive: Arc::clone(&harness.alive),
+        failure: Arc::clone(&harness.failure),
+        cancellation: harness.cancellation.clone(),
+        capabilities: CapabilitySet::empty(),
+    };
+    let signal = CancellationToken::new();
+    signal.cancel();
+    let wait = tokio::spawn(async move {
+        connection
+            .wait(
+                session,
+                WaitRequest {
+                    cell_id: CellId::new("1".to_string()),
+                    yield_time_ms: 60_000,
+                },
+                Some(signal),
+            )
+            .await
+    });
+    let frame = harness.outgoing_rx.recv().await.unwrap();
+    assert!(
+        matches!(EncodedFrame::decode_framed::<ClientToHost>(&frame.into_framed_bytes()).unwrap(), ClientToHost::Request { id, request: HostRequest::Wait { .. } } if id == RequestId::new(/*value*/ 3))
+    );
+    // Let any yield watcher run while the wait is still active. A response would
+    // drop the watcher and could otherwise hide an incorrectly sent yield frame.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(1), harness.outgoing_rx.recv())
+            .await
+            .is_err()
+    );
+    harness
+        .event_tx
+        .send(DriverEvent::HostMessage(HostToClient::Response {
+            id: RequestId::new(/*value*/ 3),
+            result: WireResult::Ok {
+                value: HostResponse::WaitCompleted {
+                    outcome: WireWaitOutcome::LiveCell(WireRuntimeResponse::Yielded {
+                        cell_id: CellId::new("1".to_string()).into(),
+                        content_items: Vec::new(),
+                        code_mode_host_duration_ns: 1,
+                    }),
+                },
+            },
+        }))
+        .await
+        .unwrap();
+    wait.await.unwrap().unwrap();
+}
+
 #[tokio::test]
 async fn open_session_includes_nondefault_cell_execution_limits() {
     let mut harness = DriverHarness::start();
@@ -208,7 +286,7 @@ async fn open_session_includes_nondefault_cell_execution_limits() {
         .command_tx
         .send(DriverCommand::OpenSession {
             session: session.clone(),
-            delegate: Arc::new(RecordingDelegate::default()),
+
             limits,
             cleanup: SessionCleanup::new(),
             caller_cancellation: CancellationToken::new(),
@@ -388,18 +466,20 @@ async fn next_held_delegate_event(
 async fn deferred_delegates_follow_cell_readiness_and_cancellation() {
     let mut harness = DriverHarness::start();
     let session = remote_session();
-    let delegate = Arc::new(RecordingDelegate::default());
-    harness.open(session.clone(), delegate.clone()).await;
+    let first_delegate = Arc::new(RecordingDelegate::default());
+    let second_delegate = Arc::new(RecordingDelegate::default());
+    harness.open(session.clone()).await;
 
     let (first_response_tx, first_response_rx) = oneshot::channel();
     let (second_response_tx, second_response_rx) = oneshot::channel();
-    for (tool_call_id, response_tx) in [
-        ("first-cell", first_response_tx),
-        ("second-cell", second_response_tx),
+    for (tool_call_id, response_tx, delegate) in [
+        ("first-cell", first_response_tx, first_delegate.clone()),
+        ("second-cell", second_response_tx, second_delegate.clone()),
     ] {
         harness
             .command_tx
             .send(DriverCommand::Execute {
+                delegate: delegate.clone(),
                 session: session.clone(),
                 request: ExecuteRequest {
                     tool_call_id: tool_call_id.to_string(),
@@ -409,6 +489,7 @@ async fn deferred_delegates_follow_cell_readiness_and_cancellation() {
                     max_output_tokens: None,
                 },
                 caller_cancellation: CancellationToken::new(),
+                yield_signal: None,
                 response_tx,
             })
             .await
@@ -481,7 +562,13 @@ async fn deferred_delegates_follow_cell_readiness_and_cancellation() {
             },
         }
     );
-    assert_eq!(delegate.notifications.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        (
+            first_delegate.notifications.load(Ordering::Relaxed),
+            second_delegate.notifications.load(Ordering::Relaxed)
+        ),
+        (0, 1)
+    );
 
     harness
         .event_tx
@@ -513,7 +600,13 @@ async fn deferred_delegates_follow_cell_readiness_and_cancellation() {
             },
         }
     );
-    assert_eq!(delegate.notifications.load(Ordering::Relaxed), 2);
+    assert_eq!(
+        (
+            first_delegate.notifications.load(Ordering::Relaxed),
+            second_delegate.notifications.load(Ordering::Relaxed)
+        ),
+        (1, 1)
+    );
     assert!(matches!(
         harness.outgoing_rx.try_recv(),
         Err(mpsc::error::TryRecvError::Empty)
@@ -531,7 +624,7 @@ async fn dropped_open_waiter_shuts_down_committed_session() {
         .command_tx
         .send(DriverCommand::OpenSession {
             session: session.clone(),
-            delegate: Arc::new(RecordingDelegate::default()),
+
             limits: Default::default(),
             cleanup,
             caller_cancellation: CancellationToken::new(),
@@ -575,6 +668,7 @@ async fn dropped_open_waiter_shuts_down_committed_session() {
     harness
         .command_tx
         .send(DriverCommand::Execute {
+            delegate: Arc::new(RecordingDelegate::default()),
             session: session.clone(),
             request: ExecuteRequest {
                 tool_call_id: "call-1".to_string(),
@@ -584,6 +678,7 @@ async fn dropped_open_waiter_shuts_down_committed_session() {
                 max_output_tokens: None,
             },
             caller_cancellation: CancellationToken::new(),
+            yield_signal: None,
             response_tx: execute_tx,
         })
         .await
@@ -603,9 +698,14 @@ async fn delegate_cancel_is_best_effort_and_sends_no_late_response() {
     let mut harness = DriverHarness::start();
     let session = remote_session();
     let delegate = Arc::new(RecordingDelegate::default());
-    harness.open(session.clone(), delegate.clone()).await;
+    harness.open(session.clone()).await;
     let _started = harness
-        .start_cell(session.clone(), /*request_id*/ 2, "1")
+        .start_cell(
+            session.clone(),
+            /*request_id*/ 2,
+            "1",
+            delegate.clone(),
+        )
         .await;
     let request_id = DelegateRequestId::new(/*value*/ 7);
     harness
@@ -662,9 +762,14 @@ async fn delegate_limit_returns_an_error_without_disconnecting() {
     let mut harness = DriverHarness::start();
     let session = remote_session();
     let delegate = Arc::new(RecordingDelegate::default());
-    harness.open(session.clone(), delegate.clone()).await;
+    harness.open(session.clone()).await;
     let _started = harness
-        .start_cell(session.clone(), /*request_id*/ 2, "1")
+        .start_cell(
+            session.clone(),
+            /*request_id*/ 2,
+            "1",
+            delegate.clone(),
+        )
         .await;
 
     for value in 1..=MAX_PENDING_DELEGATE_CALLS {
@@ -729,9 +834,14 @@ async fn terminate_closes_cell_without_waiting_for_delegate_cleanup() {
     let mut harness = DriverHarness::start();
     let session = remote_session();
     let (delegate, mut events_rx, release) = HeldDelegate::new();
-    harness.open(session.clone(), delegate).await;
+    harness.open(session.clone()).await;
     let _started = harness
-        .start_cell(session.clone(), /*request_id*/ 2, "1")
+        .start_cell(
+            session.clone(),
+            /*request_id*/ 2,
+            "1",
+            delegate.clone(),
+        )
         .await;
     let delegate_id = DelegateRequestId::new(/*value*/ 7);
     harness.start_tool_delegate(&session, delegate_id).await;
@@ -825,9 +935,14 @@ async fn shutdown_closes_cell_without_waiting_for_delegate_cleanup() {
     let mut harness = DriverHarness::start();
     let session = remote_session();
     let (delegate, mut events_rx, release) = HeldDelegate::new();
-    harness.open(session.clone(), delegate).await;
+    harness.open(session.clone()).await;
     let _started = harness
-        .start_cell(session.clone(), /*request_id*/ 2, "1")
+        .start_cell(
+            session.clone(),
+            /*request_id*/ 2,
+            "1",
+            delegate.clone(),
+        )
         .await;
     let delegate_id = DelegateRequestId::new(/*value*/ 7);
     harness.start_tool_delegate(&session, delegate_id).await;
@@ -907,9 +1022,14 @@ async fn completed_delegate_request_id_cannot_be_reused() {
     let mut harness = DriverHarness::start();
     let session = remote_session();
     let delegate = Arc::new(RecordingDelegate::default());
-    harness.open(session.clone(), delegate.clone()).await;
+    harness.open(session.clone()).await;
     let _started = harness
-        .start_cell(session.clone(), /*request_id*/ 2, "1")
+        .start_cell(
+            session.clone(),
+            /*request_id*/ 2,
+            "1",
+            delegate.clone(),
+        )
         .await;
     let request_id = DelegateRequestId::new(/*value*/ 7);
     let request = || DelegateRequest::Notify {
@@ -950,11 +1070,14 @@ async fn completed_delegate_request_id_cannot_be_reused() {
 async fn delegate_task_panic_becomes_tool_error_without_killing_connection() {
     let mut harness = DriverHarness::start();
     let session = remote_session();
-    harness
-        .open(session.clone(), Arc::new(PanickingDelegate))
-        .await;
+    harness.open(session.clone()).await;
     let _started = harness
-        .start_cell(session.clone(), /*request_id*/ 2, "1")
+        .start_cell(
+            session.clone(),
+            /*request_id*/ 2,
+            "1",
+            Arc::new(PanickingDelegate),
+        )
         .await;
     harness
         .event_tx
@@ -994,7 +1117,15 @@ async fn delegate_for_unknown_cell_returns_error_without_invocation() {
     let mut harness = DriverHarness::start();
     let session = remote_session();
     let delegate = Arc::new(RecordingDelegate::default());
-    harness.open(session.clone(), delegate.clone()).await;
+    harness.open(session.clone()).await;
+    let _started = harness
+        .start_cell(
+            session.clone(),
+            /*request_id*/ 2,
+            "known",
+            delegate.clone(),
+        )
+        .await;
 
     let id = DelegateRequestId::new(/*value*/ 7);
     harness
@@ -1039,9 +1170,14 @@ async fn delegate_after_cell_close_returns_error_without_invocation() {
     let mut harness = DriverHarness::start();
     let session = remote_session();
     let delegate = Arc::new(RecordingDelegate::default());
-    harness.open(session.clone(), delegate.clone()).await;
+    harness.open(session.clone()).await;
     let _started = harness
-        .start_cell(session.clone(), /*request_id*/ 2, "1")
+        .start_cell(
+            session.clone(),
+            /*request_id*/ 2,
+            "1",
+            delegate.clone(),
+        )
         .await;
     harness
         .event_tx
@@ -1090,8 +1226,10 @@ async fn mismatched_initial_response_fails_connection_and_closes_cell_once() {
     let mut harness = DriverHarness::start();
     let session = remote_session();
     let delegate = Arc::new(RecordingDelegate::default());
-    harness.open(session.clone(), delegate.clone()).await;
-    let started = harness.start_cell(session, /*request_id*/ 2, "1").await;
+    harness.open(session.clone()).await;
+    let started = harness
+        .start_cell(session, /*request_id*/ 2, "1", delegate.clone())
+        .await;
     harness
         .event_tx
         .send(DriverEvent::HostMessage(HostToClient::InitialResponse {
@@ -1120,9 +1258,14 @@ async fn mismatched_wait_response_fails_connection() {
     let mut harness = DriverHarness::start();
     let session = remote_session();
     let delegate = Arc::new(RecordingDelegate::default());
-    harness.open(session.clone(), delegate.clone()).await;
+    harness.open(session.clone()).await;
     let _started = harness
-        .start_cell(session.clone(), /*request_id*/ 2, "1")
+        .start_cell(
+            session.clone(),
+            /*request_id*/ 2,
+            "1",
+            delegate.clone(),
+        )
         .await;
     let (response_tx, response_rx) = oneshot::channel();
     harness
@@ -1134,6 +1277,7 @@ async fn mismatched_wait_response_fails_connection() {
                 yield_time_ms: 1,
             },
             caller_cancellation: CancellationToken::new(),
+            yield_signal: None,
             response_tx,
         })
         .await
@@ -1169,9 +1313,14 @@ async fn mismatched_terminate_response_fails_connection() {
     let mut harness = DriverHarness::start();
     let session = remote_session();
     let delegate = Arc::new(RecordingDelegate::default());
-    harness.open(session.clone(), delegate.clone()).await;
+    harness.open(session.clone()).await;
     let _started = harness
-        .start_cell(session.clone(), /*request_id*/ 2, "1")
+        .start_cell(
+            session.clone(),
+            /*request_id*/ 2,
+            "1",
+            delegate.clone(),
+        )
         .await;
     let (response_tx, response_rx) = oneshot::channel();
     harness
@@ -1213,11 +1362,14 @@ async fn mismatched_terminate_response_fails_connection() {
 async fn remote_wait_accepts_durations_longer_than_five_minutes() {
     let mut harness = DriverHarness::start();
     let session = remote_session();
-    harness
-        .open(session.clone(), Arc::new(RecordingDelegate::default()))
-        .await;
+    harness.open(session.clone()).await;
     let _started = harness
-        .start_cell(session.clone(), /*request_id*/ 2, "1")
+        .start_cell(
+            session.clone(),
+            /*request_id*/ 2,
+            "1",
+            Arc::new(RecordingDelegate::default()),
+        )
         .await;
     let (response_tx, response_rx) = oneshot::channel();
     harness
@@ -1229,6 +1381,7 @@ async fn remote_wait_accepts_durations_longer_than_five_minutes() {
                 yield_time_ms: 300_001,
             },
             caller_cancellation: CancellationToken::new(),
+            yield_signal: None,
             response_tx,
         })
         .await
@@ -1271,11 +1424,14 @@ async fn remote_wait_accepts_durations_longer_than_five_minutes() {
 async fn queued_remote_wait_times_out_and_invalidates_the_connection() {
     let mut harness = DriverHarness::start();
     let session = remote_session();
-    harness
-        .open(session.clone(), Arc::new(RecordingDelegate::default()))
-        .await;
+    harness.open(session.clone()).await;
     let _started = harness
-        .start_cell(session.clone(), /*request_id*/ 2, "1")
+        .start_cell(
+            session.clone(),
+            /*request_id*/ 2,
+            "1",
+            Arc::new(RecordingDelegate::default()),
+        )
         .await;
     let connection = Connection {
         command_tx: harness.command_tx.clone(),
@@ -1293,6 +1449,7 @@ async fn queued_remote_wait_times_out_and_invalidates_the_connection() {
                     cell_id: CellId::new("1".to_string()),
                     yield_time_ms: 1,
                 },
+                /*yield_signal*/ None,
             )
             .await;
         (connection, result)
@@ -1317,11 +1474,14 @@ async fn queued_remote_wait_times_out_and_invalidates_the_connection() {
 async fn queued_remote_termination_times_out_and_invalidates_the_connection() {
     let mut harness = DriverHarness::start();
     let session = remote_session();
-    harness
-        .open(session.clone(), Arc::new(RecordingDelegate::default()))
-        .await;
+    harness.open(session.clone()).await;
     let _started = harness
-        .start_cell(session.clone(), /*request_id*/ 2, "1")
+        .start_cell(
+            session.clone(),
+            /*request_id*/ 2,
+            "1",
+            Arc::new(RecordingDelegate::default()),
+        )
         .await;
     let connection = Connection {
         command_tx: harness.command_tx.clone(),
@@ -1356,11 +1516,14 @@ async fn queued_remote_termination_times_out_and_invalidates_the_connection() {
 async fn cancelled_wait_is_retired_before_next_wait_is_sent() {
     let mut harness = DriverHarness::start();
     let session = remote_session();
-    harness
-        .open(session.clone(), Arc::new(RecordingDelegate::default()))
-        .await;
+    harness.open(session.clone()).await;
     let _started = harness
-        .start_cell(session.clone(), /*request_id*/ 2, "1")
+        .start_cell(
+            session.clone(),
+            /*request_id*/ 2,
+            "1",
+            Arc::new(RecordingDelegate::default()),
+        )
         .await;
     let first_cancellation = CancellationToken::new();
     let (first_tx, first_rx) = oneshot::channel();
@@ -1373,6 +1536,7 @@ async fn cancelled_wait_is_retired_before_next_wait_is_sent() {
                 yield_time_ms: 60_000,
             },
             caller_cancellation: first_cancellation.clone(),
+            yield_signal: None,
             response_tx: first_tx,
         })
         .await
@@ -1391,6 +1555,7 @@ async fn cancelled_wait_is_retired_before_next_wait_is_sent() {
                 yield_time_ms: 1,
             },
             caller_cancellation: CancellationToken::new(),
+            yield_signal: None,
             response_tx: second_tx,
         })
         .await
@@ -1450,12 +1615,13 @@ async fn abandoned_execute_is_tracked_and_terminated_after_admission() {
     let mut harness = DriverHarness::start();
     let session = remote_session();
     let delegate = Arc::new(RecordingDelegate::default());
-    harness.open(session.clone(), delegate.clone()).await;
+    harness.open(session.clone()).await;
     let cancellation = CancellationToken::new();
     let (execute_tx, execute_rx) = oneshot::channel();
     harness
         .command_tx
         .send(DriverCommand::Execute {
+            delegate: delegate.clone(),
             session: session.clone(),
             request: ExecuteRequest {
                 tool_call_id: "call-1".to_string(),
@@ -1465,6 +1631,7 @@ async fn abandoned_execute_is_tracked_and_terminated_after_admission() {
                 max_output_tokens: None,
             },
             caller_cancellation: cancellation.clone(),
+            yield_signal: None,
             response_tx: execute_tx,
         })
         .await
@@ -1547,12 +1714,13 @@ async fn delivered_but_unclaimed_execute_is_terminated_when_the_caller_is_cancel
     let mut harness = DriverHarness::start();
     let session = remote_session();
     let delegate = Arc::new(RecordingDelegate::default());
-    harness.open(session.clone(), delegate.clone()).await;
+    harness.open(session.clone()).await;
     let cancellation = CancellationToken::new();
     let (execute_tx, execute_rx) = oneshot::channel();
     harness
         .command_tx
         .send(DriverCommand::Execute {
+            delegate: delegate.clone(),
             session: session.clone(),
             request: ExecuteRequest {
                 tool_call_id: "call-1".to_string(),
@@ -1562,6 +1730,7 @@ async fn delivered_but_unclaimed_execute_is_terminated_when_the_caller_is_cancel
                 max_output_tokens: None,
             },
             caller_cancellation: cancellation.clone(),
+            yield_signal: None,
             response_tx: execute_tx,
         })
         .await
@@ -1635,7 +1804,13 @@ async fn delivered_but_unclaimed_execute_is_terminated_when_the_caller_is_cancel
         }))
         .await
         .expect("cell close");
-    tokio::task::yield_now().await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while Arc::strong_count(&delegate) > 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("abandoned execution should release its delegate");
 
     assert!(harness.alive.load(Ordering::Acquire));
     assert_eq!(
@@ -1651,13 +1826,13 @@ async fn session_accepts_more_than_4096_cells_without_growing_a_tombstone_set() 
     let mut harness = DriverHarness::start();
     let session = remote_session();
     let delegate = Arc::new(RecordingDelegate::default());
-    harness.open(session.clone(), delegate.clone()).await;
+    harness.open(session.clone()).await;
 
     for sequence in 1..=CELL_COUNT {
         let request_id = i64::try_from(sequence).expect("cell sequence fits in i64") + 1;
         let cell_id = sequence.to_string();
         let started = harness
-            .start_cell(session.clone(), request_id, &cell_id)
+            .start_cell(session.clone(), request_id, &cell_id, delegate.clone())
             .await;
         harness
             .event_tx
@@ -1705,11 +1880,12 @@ async fn connection_failure_closes_every_live_cell_once() {
     let mut harness = DriverHarness::start();
     let session = remote_session();
     let delegate = Arc::new(RecordingDelegate::default());
-    let cleanup = harness.open(session.clone(), delegate.clone()).await;
+    let cleanup = harness.open(session.clone()).await;
     let (execute_tx, execute_rx) = oneshot::channel();
     harness
         .command_tx
         .send(DriverCommand::Execute {
+            delegate: delegate.clone(),
             session,
             request: ExecuteRequest {
                 tool_call_id: "call-1".to_string(),
@@ -1719,6 +1895,7 @@ async fn connection_failure_closes_every_live_cell_once() {
                 max_output_tokens: None,
             },
             caller_cancellation: CancellationToken::new(),
+            yield_signal: None,
             response_tx: execute_tx,
         })
         .await
@@ -1759,9 +1936,14 @@ async fn session_cleanup_does_not_wait_for_delegate_completion() {
     let mut harness = DriverHarness::start();
     let session = remote_session();
     let (delegate, mut events_rx, release) = HeldDelegate::new();
-    let cleanup = harness.open(session.clone(), delegate).await;
+    let cleanup = harness.open(session.clone()).await;
     let _started = harness
-        .start_cell(session.clone(), /*request_id*/ 2, "1")
+        .start_cell(
+            session.clone(),
+            /*request_id*/ 2,
+            "1",
+            delegate.clone(),
+        )
         .await;
     harness
         .start_tool_delegate(&session, DelegateRequestId::new(/*value*/ 7))
@@ -1806,9 +1988,14 @@ async fn aborting_driver_marks_connection_dead_and_closes_cells() {
     let mut harness = DriverHarness::start();
     let session = remote_session();
     let delegate = Arc::new(RecordingDelegate::default());
-    harness.open(session.clone(), delegate.clone()).await;
+    harness.open(session.clone()).await;
     let _started = harness
-        .start_cell(session.clone(), /*request_id*/ 2, "1")
+        .start_cell(
+            session.clone(),
+            /*request_id*/ 2,
+            "1",
+            delegate.clone(),
+        )
         .await;
     let (wait_tx, wait_rx) = oneshot::channel();
     harness
@@ -1820,6 +2007,7 @@ async fn aborting_driver_marks_connection_dead_and_closes_cells() {
                 yield_time_ms: 60_000,
             },
             caller_cancellation: CancellationToken::new(),
+            yield_signal: None,
             response_tx: wait_tx,
         })
         .await
@@ -1847,9 +2035,7 @@ async fn aborting_driver_marks_connection_dead_and_closes_cells() {
 async fn dropped_shutdown_waiter_does_not_abort_remote_cleanup() {
     let mut harness = DriverHarness::start();
     let session = remote_session();
-    harness
-        .open(session.clone(), Arc::new(RecordingDelegate::default()))
-        .await;
+    harness.open(session.clone()).await;
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     harness
         .command_tx
@@ -1878,6 +2064,7 @@ async fn dropped_shutdown_waiter_does_not_abort_remote_cleanup() {
     harness
         .command_tx
         .send(DriverCommand::Execute {
+            delegate: Arc::new(RecordingDelegate::default()),
             session,
             request: ExecuteRequest {
                 tool_call_id: "call-2".to_string(),
@@ -1887,6 +2074,7 @@ async fn dropped_shutdown_waiter_does_not_abort_remote_cleanup() {
                 max_output_tokens: None,
             },
             caller_cancellation: CancellationToken::new(),
+            yield_signal: None,
             response_tx: execute_tx,
         })
         .await

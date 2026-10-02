@@ -304,6 +304,7 @@ async fn start_client_with_prepared(
         loader_overrides,
         strict_config,
         cloud_config_bundle,
+        embedded_network_policy: Default::default(),
         feedback: CodexFeedback::new(),
         log_db: None,
         state_db: None,

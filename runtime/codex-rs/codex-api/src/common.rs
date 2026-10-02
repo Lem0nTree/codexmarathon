@@ -21,6 +21,7 @@ use std::sync::Arc;
 use std::task::Context;
 use std::task::Poll;
 use tokio::sync::mpsc;
+use tokio::sync::oneshot;
 
 pub const WS_REQUEST_HEADER_TRACEPARENT_CLIENT_METADATA_KEY: &str = "ws_request_header_traceparent";
 pub const WS_REQUEST_HEADER_TRACESTATE_CLIENT_METADATA_KEY: &str = "ws_request_header_tracestate";
@@ -41,28 +42,6 @@ impl From<CyberAccessProgram> for AccessPrograms {
             },
         }
     }
-}
-
-/// Canonical input payload for the compaction endpoint.
-#[derive(Debug, Clone, Serialize)]
-pub struct CompactionInput<'a> {
-    pub model: &'a str,
-    pub input: &'a [ResponseItem],
-    #[serde(skip_serializing_if = "str::is_empty")]
-    pub instructions: &'a str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tools: Option<ResponsesApiTools>,
-    pub parallel_tool_calls: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reasoning: Option<Reasoning>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub service_tier: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub prompt_cache_key: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub text: Option<TextControls>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub access_programs: Option<AccessPrograms>,
 }
 
 /// Canonical input payload for the memory summarize endpoint.
@@ -94,7 +73,7 @@ pub struct MemorySummarizeOutput {
     pub memory_summary: String,
 }
 
-/// The server response currently being handled, shared with tool-review extensions.
+/// The latest server response ID received in this turn, shared with tool-review extensions.
 #[derive(Clone, Debug)]
 pub struct ResponseId(pub String);
 
@@ -177,12 +156,30 @@ pub enum ReasoningContext {
 
 #[derive(Debug, Serialize, Clone, PartialEq)]
 pub struct Reasoning {
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_reasoning_effort"
+    )]
     pub effort: Option<ReasoningEffortConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub summary: Option<ReasoningSummaryConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context: Option<ReasoningContext>,
+}
+
+fn serialize_reasoning_effort<S>(
+    effort: &Option<ReasoningEffortConfig>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    if let Some(ReasoningEffortConfig::Custom(value)) = effort
+        && let Ok(value) = value.parse::<u64>()
+    {
+        return serializer.serialize_u64(value);
+    }
+    effort.serialize(serializer)
 }
 
 #[derive(Debug, Serialize, Clone, PartialEq)]
@@ -417,6 +414,8 @@ pub struct ResponseStream {
     pub rx_event: mpsc::Receiver<Result<ResponseEvent, ApiError>>,
     /// Server-assigned `x-request-id` response header, when present.
     pub upstream_request_id: Option<String>,
+    /// Requests a graceful interrupt. Keep consuming events through completion.
+    pub interrupt: Option<oneshot::Sender<()>>,
 }
 
 impl Stream for ResponseStream {

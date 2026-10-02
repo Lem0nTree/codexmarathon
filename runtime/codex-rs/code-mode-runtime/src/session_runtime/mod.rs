@@ -19,6 +19,7 @@ pub(crate) use self::types::CreateCellRequest;
 pub(crate) use self::types::Error;
 pub(crate) use self::types::ImageDetail;
 pub(crate) use self::types::NestedToolCall;
+pub(crate) use self::types::Observation;
 pub(crate) use self::types::ObserveMode;
 pub(crate) use self::types::OutputItem;
 pub(crate) use self::types::SessionRuntimeDelegate;
@@ -38,27 +39,27 @@ use crate::cell_actor::CompletionCommit;
 type RuntimeEventFuture = Pin<Box<dyn Future<Output = Result<CellEvent, Error>> + Send + 'static>>;
 
 /// Owns all cells and shared state for one transport-neutral code-mode session.
-pub(crate) struct SessionRuntime<D: SessionRuntimeDelegate> {
-    inner: Arc<Inner<D>>,
+pub(crate) struct SessionRuntime {
+    inner: Arc<Inner>,
 }
 
-struct Inner<D: SessionRuntimeDelegate> {
-    stored_values: Mutex<HashMap<String, JsonValue>>,
+struct Inner {
+    // Cells snapshot the keys while sharing immutable payloads, so later commits cannot
+    // change an existing cell's view and unused values do not need to be copied.
+    stored_values: Mutex<HashMap<String, Arc<JsonValue>>>,
     cells: Mutex<HashMap<CellId, CellHandle>>,
     cell_tasks: TaskTracker,
     shutdown_token: CancellationToken,
-    delegate: Arc<D>,
     task_failure_handler: Option<TaskFailureHandler>,
     next_cell_id: AtomicU64,
 }
 
-impl<D: SessionRuntimeDelegate> SessionRuntime<D> {
-    pub(crate) fn new(delegate: Arc<D>) -> Self {
-        Self::new_with_task_failure_handler(delegate, /*task_failure_handler*/ None)
+impl SessionRuntime {
+    pub(crate) fn new() -> Self {
+        Self::new_with_task_failure_handler(/*task_failure_handler*/ None)
     }
 
     pub(crate) fn new_with_task_failure_handler(
-        delegate: Arc<D>,
         task_failure_handler: Option<TaskFailureHandler>,
     ) -> Self {
         Self {
@@ -67,24 +68,29 @@ impl<D: SessionRuntimeDelegate> SessionRuntime<D> {
                 cells: Mutex::new(HashMap::new()),
                 cell_tasks: TaskTracker::new(),
                 shutdown_token: CancellationToken::new(),
-                delegate,
                 task_failure_handler,
                 next_cell_id: AtomicU64::new(1),
             }),
         }
     }
 
-    pub(crate) async fn execute(
+    pub(crate) async fn execute<D: SessionRuntimeDelegate>(
         &self,
         request: CreateCellRequest,
-        initial_observe_mode: ObserveMode,
+        initial_observation: impl Into<Observation> + Send,
+        delegate: Arc<D>,
     ) -> Result<StartedCell, Error> {
         if self.inner.shutdown_token.is_cancelled() {
             return Err(Error::ShuttingDown);
         }
         let cell_id = self.allocate_cell_id()?;
         let initial_event = self
-            .start_cell(cell_id.clone(), request, initial_observe_mode)
+            .start_cell(
+                cell_id.clone(),
+                request,
+                initial_observation.into(),
+                delegate,
+            )
             .await?;
         Ok(StartedCell {
             cell_id,
@@ -103,7 +109,7 @@ impl<D: SessionRuntimeDelegate> SessionRuntime<D> {
     pub(crate) async fn begin_observe(
         &self,
         cell_id: &CellId,
-        mode: ObserveMode,
+        observation: impl Into<Observation> + Send,
     ) -> Result<PendingEvent, Error> {
         let handle = self
             .inner
@@ -114,7 +120,7 @@ impl<D: SessionRuntimeDelegate> SessionRuntime<D> {
             .cloned()
             .ok_or_else(|| Error::MissingCell(cell_id.clone()))?;
         Ok(PendingEvent {
-            event: map_actor_event(cell_id.clone(), handle.observe(mode)),
+            event: map_actor_event(cell_id.clone(), handle.observe(observation)),
         })
     }
 
@@ -154,14 +160,16 @@ impl<D: SessionRuntimeDelegate> SessionRuntime<D> {
             .map_err(|_| Error::CellIdSpaceExhausted)
     }
 
-    async fn start_cell(
+    async fn start_cell<D: SessionRuntimeDelegate>(
         &self,
         cell_id: CellId,
         request: CreateCellRequest,
-        initial_observe_mode: ObserveMode,
+        initial_observation: Observation,
+        delegate: Arc<D>,
     ) -> Result<RuntimeEventFuture, Error> {
         let stored_values = self.inner.stored_values.lock().await.clone();
         let host = Arc::new(RuntimeCellHost {
+            delegate,
             cell_id: cell_id.clone(),
             inner: Arc::clone(&self.inner),
             execution_context: opentelemetry::Context::current(),
@@ -178,7 +186,7 @@ impl<D: SessionRuntimeDelegate> SessionRuntime<D> {
             request,
             stored_values,
             host,
-            initial_observe_mode,
+            initial_observation,
             cell_state,
             self.inner.task_failure_handler.clone(),
         )
@@ -205,7 +213,7 @@ impl<D: SessionRuntimeDelegate> SessionRuntime<D> {
     }
 }
 
-impl<D: SessionRuntimeDelegate> Drop for SessionRuntime<D> {
+impl Drop for SessionRuntime {
     fn drop(&mut self) {
         self.begin_shutdown();
     }
@@ -235,8 +243,9 @@ impl PendingEvent {
 }
 
 struct RuntimeCellHost<D: SessionRuntimeDelegate> {
+    delegate: Arc<D>,
     cell_id: CellId,
-    inner: Arc<Inner<D>>,
+    inner: Arc<Inner>,
     // Callbacks outlive the initial request and run in separate tasks. Preserve
     // their trace parent without retaining the request's tracing span.
     execution_context: opentelemetry::Context,
@@ -248,8 +257,7 @@ impl<D: SessionRuntimeDelegate> CellHost for RuntimeCellHost<D> {
         invocation: CellToolCall,
         cancellation_token: CancellationToken,
     ) -> Result<JsonValue, String> {
-        self.inner
-            .delegate
+        self.delegate
             .invoke_tool(
                 NestedToolCall {
                     cell_id: self.cell_id.clone(),
@@ -270,15 +278,14 @@ impl<D: SessionRuntimeDelegate> CellHost for RuntimeCellHost<D> {
         text: String,
         cancellation_token: CancellationToken,
     ) -> Result<(), String> {
-        self.inner
-            .delegate
+        self.delegate
             .notify(call_id, self.cell_id.clone(), text, cancellation_token)
             .await
     }
 
     async fn commit_completion(
         &self,
-        stored_value_writes: HashMap<String, JsonValue>,
+        stored_value_writes: HashMap<String, Arc<JsonValue>>,
         event: CellEvent,
         pending_initial_yield_items: Option<Vec<OutputItem>>,
         cell_state: Arc<CellState>,
@@ -298,7 +305,7 @@ impl<D: SessionRuntimeDelegate> CellHost for RuntimeCellHost<D> {
 
     async fn closed(&self) {
         self.inner.cells.lock().await.remove(&self.cell_id);
-        self.inner.delegate.cell_closed(&self.cell_id);
+        self.delegate.cell_closed(&self.cell_id);
     }
 }
 

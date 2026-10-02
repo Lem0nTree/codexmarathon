@@ -58,6 +58,8 @@ impl Arg0PathEntryGuard {
 }
 
 pub fn arg0_dispatch() -> Option<Arg0PathEntryGuard> {
+    #[cfg(target_os = "linux")]
+    codex_utils_pty::init_spawn_helper(std::env::args_os());
     // Determine if we were invoked via the special alias.
     let mut args = std::env::args_os();
     let argv0 = args.next().unwrap_or_default();
@@ -100,6 +102,9 @@ pub fn arg0_dispatch() -> Option<Arg0PathEntryGuard> {
     }
 
     let argv1 = args.next().unwrap_or_default();
+    if argv1 == codex_sandboxing::CODEX_WINDOWS_MXC_ARG1 {
+        codex_sandboxing::run_windows_mxc_main();
+    }
     #[cfg(unix)]
     if argv1 == CODEX_ARG0_EXEC_HELPER_ARG1 {
         codex_exec_server::run_arg0_exec_helper_main();

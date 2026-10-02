@@ -5,6 +5,8 @@ use anyhow::Result;
 use codex_config::types::ToolSuggestDisabledTool;
 use codex_config::types::ToolSuggestDiscoverable;
 use codex_config::types::ToolSuggestDiscoverableType;
+use codex_core::NewThread;
+use codex_core::StartThreadOptions;
 use codex_core::TurnInputRequest;
 use codex_core::config::Config;
 use codex_core_plugins::startup_sync::curated_plugins_repo_path;
@@ -26,10 +28,14 @@ use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
+use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::user_input::UserInput;
 use codex_utils_path_uri::PathUri;
 use core_test_support::apps_test_server::AppsTestServer;
+use core_test_support::context_snapshot;
+use core_test_support::context_snapshot::ContextSnapshotOptions;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_function_call;
@@ -137,10 +143,10 @@ fn configure_apps_without_search_tool(config: &mut Config, apps_base_url: &str) 
     let model = model_catalog
         .models
         .iter_mut()
-        .find(|model| model.slug == "gpt-5.4")
-        .expect("gpt-5.4 exists in bundled models.json");
+        .find(|model| model.slug == "gpt-5.5")
+        .expect("gpt-5.5 exists in bundled models.json");
     config.chatgpt_base_url = apps_base_url.to_string();
-    config.model = Some("gpt-5.4".to_string());
+    config.model = Some("gpt-5.5".to_string());
     config.tool_suggest.discoverables = vec![ToolSuggestDiscoverable {
         kind: ToolSuggestDiscoverableType::Connector,
         id: DISCOVERABLE_GMAIL_ID.to_string(),
@@ -453,7 +459,7 @@ async fn mount_remote_calendar_installed_plugins(server: &wiremock::MockServer) 
 #[test_case(Feature::RecommendedPlugins, Some(Feature::RemotePlugin); "remote plugins disabled")]
 #[test_case(Feature::RecommendedPlugins, Some(Feature::RecommendedPlugins); "recommendations disabled")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn startup_recommendations(
+async fn startup_recommendations_use_developer_message(
     feature: Feature,
     disabled_feature: Option<Feature>,
 ) -> Result<()> {
@@ -542,16 +548,53 @@ async fn startup_recommendations(
 
     test.submit_turn("suggest a plugin").await?;
 
+    if feature == Feature::RecommendedPlugins && disabled_feature.is_none() {
+        insta::assert_snapshot!(
+            "startup_recommendations_developer_context",
+            context_snapshot::format_request_history_snapshot(
+                "Startup recommendations share the developer message with other context.",
+                &model_response.requests(),
+                &ContextSnapshotOptions::default().rewrite_known_segments(),
+            )
+        );
+    }
+
     let request = model_response.single_request();
-    let user_context = request.message_input_texts("user").join("\n");
+    let developer_context = request.message_input_texts("developer").join("\n");
     assert_eq!(
-        user_context.contains("<recommended_plugins>"),
+        developer_context.contains("<recommended_plugins>"),
         expect_recommendations,
     );
     assert_eq!(
-        user_context.contains("- GitHub (github@openai-curated-remote)"),
+        developer_context.contains("- GitHub (github@openai-curated-remote)"),
         expect_recommendations,
     );
+    if expect_recommendations {
+        let developer_messages = request.message_input_text_groups("developer");
+        let recommendation_message = developer_messages
+            .iter()
+            .find(|message| {
+                message
+                    .iter()
+                    .any(|text| text.starts_with("<recommended_plugins>"))
+            })
+            .expect("developer message with recommendations");
+        assert!(
+            recommendation_message
+                .iter()
+                .any(|text| text.starts_with("<permissions instructions>")),
+            "recommendations should share the developer message with other context"
+        );
+        assert_eq!(
+            recommendation_message.last().map(String::as_str),
+            Some(concat!(
+                "<recommended_plugins>\n",
+                "Here is a list of plugins that are available but not installed.\n\n",
+                "- GitHub (github@openai-curated-remote)\n",
+                "</recommended_plugins>",
+            ))
+        );
+    }
     let tools = tool_names(&request.body_json());
     assert_eq!(
         tools
@@ -618,7 +661,7 @@ async fn mcp_discovery_overlaps_endpoint_plugin_recommendations() -> Result<()> 
     let request = response.single_request();
     assert!(
         request
-            .message_input_texts("user")
+            .message_input_texts("developer")
             .join("\n")
             .contains("github@openai-curated-remote"),
         "the completed request should preserve endpoint recommendations"
@@ -729,7 +772,7 @@ async fn unavailable_recommendations_preserve_legacy_workflow(
     let request = &requests[0];
     assert!(
         !request
-            .message_input_texts("user")
+            .message_input_texts("developer")
             .join("\n")
             .contains("<recommended_plugins>")
     );
@@ -743,6 +786,117 @@ async fn unavailable_recommendations_preserve_legacy_workflow(
             .iter()
             .any(|tool| tool["id"] == DISCOVERABLE_GMAIL_ID && tool["tool_type"] == "connector")
     }));
+    Ok(())
+}
+
+#[test_case(false; "legacy connector")]
+#[test_case(true; "recommended plugin")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn subagent_install_request_returns_root_only_error(
+    recommended_plugins_enabled: bool,
+) -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let apps_server = AppsTestServer::mount(&server).await?;
+    let (recommendations, arguments) = if recommended_plugins_enabled {
+        (
+            json!({
+                "enabled": true,
+                "plugins": [{
+                    "id": REMOTE_CALENDAR_PLUGIN_ID,
+                    "name": "calendar",
+                    "display_name": "Calendar"
+                }]
+            }),
+            json!({
+                "plugin_id": REMOTE_CALENDAR_PLUGIN_CONFIG_ID,
+                "suggest_reason": "Use Calendar for this task"
+            }),
+        )
+    } else {
+        (
+            json!({"enabled": false, "plugins": []}),
+            json!({
+                "tool_type": "connector",
+                "action_type": "install",
+                "tool_id": DISCOVERABLE_GMAIL_ID,
+                "suggest_reason": "Use Gmail for this task"
+            }),
+        )
+    };
+    mount_recommendations(
+        &server,
+        ResponseTemplate::new(200).set_body_json(recommendations),
+    )
+    .await;
+    let call_id = "subagent-plugin-install";
+    let mock = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_response_created("resp-1"),
+                ev_function_call(
+                    call_id,
+                    REQUEST_PLUGIN_INSTALL_TOOL_NAME,
+                    &arguments.to_string(),
+                ),
+                ev_completed("resp-1"),
+            ]),
+            sse(vec![
+                ev_response_created("resp-2"),
+                ev_assistant_message("msg-1", "done"),
+                ev_completed("resp-2"),
+            ]),
+        ],
+    )
+    .await;
+    let test = build_test(&server, &apps_server).await?;
+    let NewThread {
+        thread: subagent, ..
+    } = test
+        .thread_manager
+        .start_thread(StartThreadOptions {
+            session_source: Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id: test.session_configured.thread_id,
+                depth: 1,
+                agent_path: None,
+                agent_nickname: None,
+                agent_role: None,
+            })),
+            ..StartThreadOptions::new(test.config.clone())
+        })
+        .await?;
+    subagent
+        .start_or_steer_turn(
+            TurnInputRequest::user_input(vec![UserInput::Text {
+                text: "Use the requested integration.".to_string(),
+                text_elements: Vec::new(),
+            }])
+            .with_thread_settings(ThreadSettingsOverrides {
+                approval_policy: Some(AskForApproval::Never),
+                permission_profile: Some(PermissionProfile::Disabled),
+                ..Default::default()
+            }),
+        )
+        .await?;
+    wait_for_event(&subagent, |event| {
+        assert!(
+            !matches!(event, EventMsg::ElicitationRequest(_)),
+            "subagents must not request plugin installation"
+        );
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        requests[1].function_call_output_text(call_id).as_deref(),
+        Some("request_plugin_install can only be used by the root thread")
+    );
+    subagent.shutdown_and_wait().await?;
+    test.codex.shutdown_and_wait().await?;
     Ok(())
 }
 
@@ -913,10 +1067,23 @@ async fn endpoint_mode_injects_candidates_hides_list_and_rejects_invented_ids() 
 
     let requests = mock.requests();
     assert_eq!(requests.len(), 2);
-    let contextual_user_message = requests[0].message_input_texts("user").join("\n");
-    assert!(contextual_user_message.contains("<recommended_plugins>"));
-    assert!(contextual_user_message.contains("github@openai-curated-remote"));
-    assert!(contextual_user_message.contains("google-calendar@openai-curated-remote"));
+    for request in &requests {
+        let recommendations = request
+            .message_input_texts("developer")
+            .into_iter()
+            .filter(|text| text.starts_with("<recommended_plugins>"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            recommendations,
+            vec![concat!(
+                "<recommended_plugins>\n",
+                "Here is a list of plugins that are available but not installed.\n\n",
+                "- GitHub (github@openai-curated-remote)\n",
+                "- Google Calendar (google-calendar@openai-curated-remote)\n",
+                "</recommended_plugins>",
+            )]
+        );
+    }
     let body = requests[0].body_json();
     let tools = tool_names(&body);
     assert!(
@@ -1059,7 +1226,7 @@ async fn run_remote_plugin_install_metadata_case() -> Result<()> {
                 "source": "endpoint_recommendation",
                 "thread_id": thread_id,
                 "turn_id": turn_id,
-                "model_slug": "gpt-5.4",
+                "model_slug": "gpt-5.5",
                 "product_client_id": codex_login::default_client::originator().value,
             }
         })
@@ -1320,7 +1487,7 @@ async fn endpoint_mode_with_no_eligible_candidates_exposes_no_suggestion_tools()
     let request = mock.single_request();
     assert!(
         !request
-            .message_input_texts("user")
+            .message_input_texts("developer")
             .join("\n")
             .contains("<recommended_plugins>")
     );

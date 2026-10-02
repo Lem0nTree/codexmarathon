@@ -1,0 +1,11 @@
+---
+source: tui/src/app/tests/math_interruption_tests.rs
+expression: rendered
+---
+• Intro.
+
+  $$
+  \frac{a+b+c+d+e+f}
+  {g+h}
+
+■ Conversation interrupted - use /feedback if something went wrong

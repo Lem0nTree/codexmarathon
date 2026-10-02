@@ -645,7 +645,7 @@ async fn automatic_admission_rechecks_plan_mode_without_committing_sparse_settin
         .await
         .expect("explicit settings update accepts the same patch");
     assert_eq!(
-        session.services.turn_environments.selections(),
+        session.configured_environment_selections().await,
         proposed_environments.environments
     );
     assert!(session.mcp_refresh.is_pending());
@@ -858,11 +858,14 @@ async fn steer_only_requires_active_turn() {
 #[tokio::test]
 async fn steer_only_enforces_expected_turn_id() {
     let (session, turn_context, _rx) = make_session_and_context_with_rx().await;
+    turn_context
+        .turn_metadata_state
+        .set_turn_trigger("composer".to_string());
     session
         .spawn_task(
             Arc::clone(&turn_context),
             vec![TurnInput::UserInput {
-                acceptance_order: None,
+                metadata: Default::default(),
                 content: vec![UserInput::Text {
                     text: "hello".to_string(),
                     text_elements: Vec::new(),
@@ -904,7 +907,12 @@ async fn steer_only_enforces_expected_turn_id() {
 
     let submission = handle(
         &session,
-        TurnInputRequest::new(SubmittedTurnInput::ResponseItem(output)),
+        TurnInputRequest::new(SubmittedTurnInput::ResponseItem(output)).on_start(
+            TurnStartOptions {
+                turn_trigger: Some("automation_cron_scheduled".to_string()),
+                ..Default::default()
+            },
+        ),
         TurnInputMode::StartOrSteer,
         "test-submission".to_string(),
     )
@@ -916,6 +924,13 @@ async fn steer_only_enforces_expected_turn_id() {
         TurnInputSubmission::Steered {
             turn_id: turn_context.sub_id.clone()
         }
+    );
+    assert_eq!(
+        turn_context
+            .turn_metadata_state
+            .current_turn_trigger()
+            .as_deref(),
+        Some("composer")
     );
     let turn_state = session
         .input_queue
@@ -952,7 +967,7 @@ async fn rejects_non_regular_turns() {
             .spawn_task(
                 Arc::clone(&turn_context),
                 vec![TurnInput::UserInput {
-                    acceptance_order: None,
+                    metadata: Default::default(),
                     content: vec![UserInput::Text {
                         text: "hello".to_string(),
                         text_elements: Vec::new(),
@@ -998,4 +1013,62 @@ async fn rejects_non_regular_turns() {
 
         session.abort_all_tasks(TurnAbortReason::Interrupted).await;
     }
+}
+
+#[test_case("automation_heartbeat_scheduled", None, UserInputOrigin::User; "human")]
+#[test_case("composer", Some("automation_heartbeat_scheduled"), UserInputOrigin::Heartbeat; "scheduled")]
+#[tokio::test]
+async fn steer_preserves_request_origin(
+    active_trigger: &str,
+    request_trigger: Option<&str>,
+    origin: UserInputOrigin,
+) {
+    let (session, turn_context, _rx) = make_session_and_context_with_rx().await;
+    turn_context
+        .turn_metadata_state
+        .set_turn_trigger(active_trigger.to_owned());
+    session
+        .spawn_task(
+            Arc::clone(&turn_context),
+            Vec::new(),
+            NeverEndingTask {
+                kind: TaskKind::Regular,
+                listen_to_cancellation_token: false,
+            },
+        )
+        .await;
+    let content = vec![UserInput::Text {
+        text: "Create the worktree now.".to_owned(),
+        text_elements: Vec::new(),
+    }];
+    handle(
+        &session,
+        TurnInputRequest::user_input(content.clone()).on_start(TurnStartOptions {
+            turn_trigger: request_trigger.map(str::to_owned),
+            ..Default::default()
+        }),
+        TurnInputMode::Steer {
+            expected_turn_id: turn_context.sub_id.clone(),
+        },
+        "steer-submission".to_owned(),
+    )
+    .await
+    .unwrap();
+    let pending = session
+        .input_queue
+        .get_pending_input(&session.active_turn)
+        .await
+        .0;
+    assert_eq!(
+        pending,
+        vec![TurnInput::UserInput {
+            content,
+            client_id: None,
+            metadata: crate::session::UserInputMetadata {
+                acceptance_order: Some(0),
+                origin,
+            },
+        }]
+    );
+    session.abort_all_tasks(TurnAbortReason::Interrupted).await;
 }

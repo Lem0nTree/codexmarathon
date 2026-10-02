@@ -56,7 +56,7 @@ async fn mount_root_collaboration_call(
     call_id: &'static str,
     tool_name: &'static str,
     arguments: serde_json::Value,
-) {
+) -> ResponseMock {
     let response_id = format!("resp-{call_id}");
     mount_sse_once_match(
         server,
@@ -75,16 +75,18 @@ async fn mount_root_collaboration_call(
     .await;
 
     let completion_id = format!("resp-{call_id}-complete");
+    let mut answer = ev_assistant_message(&format!("msg-{call_id}"), "collaboration completed");
+    answer["item"]["phase"] = json!("final_answer");
     mount_sse_once_match(
         server,
         move |request: &wiremock::Request| has_function_call_output(request, call_id),
         sse(vec![
             ev_response_created(&completion_id),
-            ev_assistant_message(&format!("msg-{call_id}"), "collaboration completed"),
+            answer,
             ev_completed(&completion_id),
         ]),
     )
-    .await;
+    .await
 }
 
 async fn mount_completed_worker(
@@ -93,6 +95,9 @@ async fn mount_completed_worker(
     parent_call_id: &'static str,
 ) -> ResponseMock {
     let response_id = format!("resp-worker-{parent_call_id}");
+    let mut answer =
+        ev_assistant_message(&format!("msg-worker-{parent_call_id}"), "worker completed");
+    answer["item"]["phase"] = json!("final_answer");
     mount_sse_once_match(
         server,
         move |request: &wiremock::Request| {
@@ -100,7 +105,7 @@ async fn mount_completed_worker(
         },
         sse(vec![
             ev_response_created(&response_id),
-            ev_assistant_message(&format!("msg-worker-{parent_call_id}"), "worker completed"),
+            answer,
             ev_completed(&response_id),
         ]),
     )
@@ -202,6 +207,109 @@ async fn v2_nested_spawn_checks_shared_active_execution_capacity() -> Result<()>
     );
     assert_eq!(test.thread_manager.list_thread_ids().await.len(), 2);
 
+    Ok(())
+}
+
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn child_turn_start_preserves_root_attribution() -> Result<()> {
+    let server = start_mock_server().await;
+    mount_root_collaboration_call(
+        &server,
+        FIRST_PROMPT,
+        "first-call",
+        "spawn_agent",
+        json!({
+            "message": FIRST_TASK, "task_name": "first", "fork_turns": "none",
+        }),
+    )
+    .await;
+    let worker = mount_completed_worker(&server, FIRST_TASK, "first-call").await;
+    let test = test_codex()
+        .with_model("gpt-5.6-sol")
+        .with_config(|config| {
+            config.otel.log_agent_responses = true;
+            config.otel.exporter = codex_config::types::OtelExporterKind::OtlpGrpc {
+                endpoint: "http://127.0.0.1:1".into(),
+                headers: Default::default(),
+                tls: None,
+            };
+            config.features.enable(Feature::Collab).unwrap();
+            config.features.enable(Feature::MultiAgentV2).unwrap();
+        })
+        .build_with_auto_env(&server)
+        .await?;
+    test.submit_turn(FIRST_PROMPT).await?;
+    let thread_ids = test.thread_manager.list_thread_ids().await;
+    assert_eq!(thread_ids.len(), 2);
+    let mut starts = Vec::new();
+    for thread_id in thread_ids {
+        let thread = test.thread_manager.get_thread(thread_id).await?;
+        if thread_id != test.session_configured.thread_id {
+            wait_for_event(&thread, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+        }
+        thread.flush_rollout().await?;
+        let history = test
+            .thread_store
+            .load_latest_model_context(codex_thread_store::LoadThreadHistoryParams {
+                thread_id,
+                include_archived: false,
+            })
+            .await?;
+        for item in history.items {
+            if let codex_history::RolloutItem::EventMsg(EventMsg::TurnStarted(event)) = item {
+                starts.push((thread_id, event));
+            }
+        }
+    }
+    worker.single_request();
+    assert_eq!(starts.len(), 2);
+    assert_ne!(starts[0].1.turn_id, starts[1].1.turn_id);
+    let root_turn_id = &starts
+        .iter()
+        .find(|(id, _)| *id == test.session_configured.thread_id)
+        .expect("root turn")
+        .1
+        .turn_id;
+    assert!(
+        starts
+            .iter()
+            .all(|(_, event)| { event.root_turn_id.as_ref() == Some(root_turn_id) })
+    );
+    logs_assert(|lines: &[&str]| {
+        let logs: Vec<_> = lines
+            .iter()
+            .filter(|line| line.contains("codex.agent_response"))
+            .collect();
+        assert_eq!(logs.len(), 2);
+        for (id, turn) in &starts {
+            let line = logs
+                .iter()
+                .find(|line| line.contains(&format!(" conversation.id={id}")))
+                .expect("response log");
+            let (agent, item, text) = if *id == test.session_configured.thread_id {
+                ("main", "msg-first-call", "collaboration completed")
+            } else {
+                assert!(line.contains(&format!(
+                    " parent.conversation.id=\"{}\"",
+                    test.session_configured.thread_id
+                )));
+                assert!(line.contains(&format!(" parent.turn.id={root_turn_id:?}")));
+                assert!(line.contains(" initiating.agent.path=\"/root\""));
+                ("subagent", "msg-worker-first-call", "worker completed")
+            };
+            for field in [
+                format!(" agent.type={agent:?}"),
+                format!(" turn.id={:?}", turn.turn_id),
+                format!(" root.turn.id={root_turn_id:?}"),
+                format!(" item.id={item:?}"),
+                format!(" response={text:?}"),
+            ] {
+                assert!(line.contains(&field), "missing {field}: {line}");
+            }
+        }
+        Ok(())
+    });
     Ok(())
 }
 
@@ -329,10 +437,7 @@ async fn v2_residency_reload_preserves_inherited_environment_and_tools(
             permission_profile: PermissionProfileSnapshot::legacy(child_permissions),
             shell_environment_policy: Default::default(),
             windows_sandbox_level: WindowsSandboxLevel::from_config(&test.config),
-            windows_sandbox_private_desktop: test
-                .config
-                .permissions
-                .windows_sandbox_private_desktop,
+            windows_sandbox_type: test.config.permissions.windows_sandbox_type,
             use_legacy_landlock: test.config.features.use_legacy_landlock(),
             exec_policy: None,
             mcp_policy: None,
@@ -510,3 +615,6 @@ async fn v2_residency_reload_preserves_inherited_environment_and_tools(
 
     Ok(())
 }
+
+#[path = "agent_eviction_tests.rs"]
+mod eviction_tests;

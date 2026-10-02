@@ -2,7 +2,6 @@ use codex_api::ImageBackground;
 use codex_api::ImageEditRequest;
 use codex_api::ImageGenerationRequest;
 use codex_api::ImageQuality;
-use codex_api::ImageUrl;
 use codex_extension_api::ToolOutput;
 use codex_extension_api::ToolPayload;
 use codex_extension_api::ToolSpec;
@@ -12,6 +11,7 @@ use codex_protocol::models::DEFAULT_IMAGE_DETAIL;
 use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::FunctionCallOutputPayload;
+use codex_protocol::models::ImageReference;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
 use codex_tools::ResponsesApiNamespaceTool;
@@ -61,6 +61,7 @@ async fn omitted_references_generate_with_fixed_defaults() {
         request_for_call_args(
             &ImagegenArgs {
                 prompt: "paint a moonlit lake".to_string(),
+                transparent_background: false,
                 referenced_image_paths: None,
                 num_last_images_to_include: None,
             },
@@ -71,7 +72,7 @@ async fn omitted_references_generate_with_fixed_defaults() {
         .expect("generation request should build"),
         ImageRequest::Generate(ImageGenerationRequest {
             prompt: "paint a moonlit lake".to_string(),
-            background: Some(ImageBackground::Auto),
+            background: Some(ImageBackground::Opaque),
             model: "gpt-image-2".to_string(),
             n: None,
             quality: Some(ImageQuality::Auto),
@@ -150,6 +151,7 @@ async fn recent_image_fallback_selects_newest_images_in_chronological_order() {
         request_for_call_args(
             &ImagegenArgs {
                 prompt: "change the lighting".to_string(),
+                transparent_background: false,
                 referenced_image_paths: None,
                 num_last_images_to_include: Some(5),
             },
@@ -166,10 +168,111 @@ async fn recent_image_fallback_selects_newest_images_in_chronological_order() {
 }
 
 #[tokio::test]
+async fn recent_image_fallback_passes_file_backed_image_to_edit_request() {
+    let request = request_for_call_args(
+        &ImagegenArgs {
+            prompt: "change the lighting".to_string(),
+            transparent_background: false,
+            referenced_image_paths: None,
+            num_last_images_to_include: Some(1),
+        },
+        &[ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![
+                input_image("older-inline-image"),
+                ContentItem::InputImage {
+                    image: ImageReference::File {
+                        file_id: "newer-file-backed-image".to_string(),
+                    },
+                    detail: None,
+                },
+            ],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        }],
+        &[],
+    )
+    .await
+    .expect("a selected file-backed image should be passed through");
+
+    assert_eq!(
+        request,
+        ImageRequest::Edit(ImageEditRequest {
+            images: vec![ImageReference::File {
+                file_id: "newer-file-backed-image".to_string(),
+            }],
+            prompt: "change the lighting".to_string(),
+            background: Some(ImageBackground::Opaque),
+            model: "gpt-image-2".to_string(),
+            n: None,
+            quality: Some(ImageQuality::Auto),
+            size: Some("auto".to_string()),
+        })
+    );
+}
+
+/// Tool-output file references must count toward the window instead of exposing an older image.
+#[tokio::test]
+async fn recent_image_fallback_passes_file_backed_tool_output_to_edit_request() {
+    let request = request_for_call_args(
+        &ImagegenArgs {
+            prompt: "change the lighting".to_string(),
+            transparent_background: false,
+            referenced_image_paths: None,
+            num_last_images_to_include: Some(1),
+        },
+        &[
+            ResponseItem::FunctionCallOutput {
+                id: None,
+                call_id: Some("older-inline-output".to_string()),
+                name: None,
+                namespace: None,
+                output: image_output("older-inline-image"),
+                internal_chat_message_metadata_passthrough: None,
+            },
+            ResponseItem::CustomToolCallOutput {
+                id: None,
+                call_id: "newer-file-backed-output".to_string(),
+                name: Some("view_image".to_string()),
+                output: FunctionCallOutputPayload::from_content_items(vec![
+                    FunctionCallOutputContentItem::InputImage {
+                        image: ImageReference::File {
+                            file_id: "newer-file-backed-image".to_string(),
+                        },
+                        detail: None,
+                    },
+                ]),
+                internal_chat_message_metadata_passthrough: None,
+            },
+        ],
+        &[],
+    )
+    .await
+    .expect("a selected file-backed tool output should be passed through");
+
+    assert_eq!(
+        request,
+        ImageRequest::Edit(ImageEditRequest {
+            images: vec![ImageReference::File {
+                file_id: "newer-file-backed-image".to_string(),
+            }],
+            prompt: "change the lighting".to_string(),
+            background: Some(ImageBackground::Opaque),
+            model: "gpt-image-2".to_string(),
+            n: None,
+            quality: Some(ImageQuality::Auto),
+            size: Some("auto".to_string()),
+        })
+    );
+}
+
+#[tokio::test]
 async fn conflicting_image_selectors_return_tool_error() {
     let error = request_for_call_args(
         &ImagegenArgs {
             prompt: "change the lighting".to_string(),
+            transparent_background: false,
             referenced_image_paths: Some(vec![
                 "/tmp/image.png"
                     .try_into()
@@ -194,6 +297,7 @@ async fn too_many_referenced_image_paths_return_tool_error() {
     let error = request_for_call_args(
         &ImagegenArgs {
             prompt: "change the lighting".to_string(),
+            transparent_background: false,
             referenced_image_paths: Some(
                 (0..6)
                     .map(|index| {
@@ -222,6 +326,7 @@ async fn recent_image_fallback_requires_requested_count() {
     let error = request_for_call_args(
         &ImagegenArgs {
             prompt: "change the lighting".to_string(),
+            transparent_background: false,
             referenced_image_paths: None,
             num_last_images_to_include: Some(2),
         },
@@ -266,7 +371,9 @@ fn generated_output_returns_image_input_and_output_hint() {
         content_items,
         vec![
             FunctionCallOutputContentItem::InputImage {
-                image_url: format!("data:image/png;base64,{RESULT}"),
+                image: ImageReference::Inline {
+                    image_url: format!("data:image/png;base64,{RESULT}")
+                },
                 detail: Some(DEFAULT_IMAGE_DETAIL),
             },
             FunctionCallOutputContentItem::InputText { text: output_hint },
@@ -311,7 +418,9 @@ fn generated_output_omits_oversized_output_hint() {
     assert_eq!(
         content_items,
         vec![FunctionCallOutputContentItem::InputImage {
-            image_url: format!("data:image/png;base64,{RESULT}"),
+            image: ImageReference::Inline {
+                image_url: format!("data:image/png;base64,{RESULT}")
+            },
             detail: Some(DEFAULT_IMAGE_DETAIL),
         }]
     );
@@ -319,14 +428,18 @@ fn generated_output_omits_oversized_output_hint() {
 
 fn input_image(image: &str) -> ContentItem {
     ContentItem::InputImage {
-        image_url: format!("data:image/png;base64,{image}"),
+        image: ImageReference::Inline {
+            image_url: format!("data:image/png;base64,{image}"),
+        },
         detail: None,
     }
 }
 
 fn image_output(image: &str) -> FunctionCallOutputPayload {
     FunctionCallOutputPayload::from_content_items(vec![FunctionCallOutputContentItem::InputImage {
-        image_url: format!("data:image/png;base64,{image}"),
+        image: ImageReference::Inline {
+            image_url: format!("data:image/png;base64,{image}"),
+        },
         detail: None,
     }])
 }
@@ -335,12 +448,12 @@ fn expected_edit_request(prompt: &str, images: &[&str]) -> ImageEditRequest {
     ImageEditRequest {
         images: images
             .iter()
-            .map(|image| ImageUrl {
+            .map(|image| ImageReference::Inline {
                 image_url: format!("data:image/png;base64,{image}"),
             })
             .collect(),
         prompt: prompt.to_string(),
-        background: Some(ImageBackground::Auto),
+        background: Some(ImageBackground::Opaque),
         model: "gpt-image-2".to_string(),
         n: None,
         quality: Some(ImageQuality::Auto),

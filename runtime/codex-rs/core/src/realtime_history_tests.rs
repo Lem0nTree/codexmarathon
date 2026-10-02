@@ -29,6 +29,7 @@ fn started_state() -> RealtimeHistoryState {
     state.observe(&EventMsg::TurnStarted(
         codex_protocol::protocol::TurnStartedEvent {
             turn_id: "turn-1".to_string(),
+            root_turn_id: None,
             trace_id: None,
             started_at: None,
             model_context_window: None,
@@ -94,6 +95,7 @@ fn mcp_tool_call(id: &str, server: &str, status: McpToolCallStatus) -> TurnItem 
         arguments: serde_json::Value::Null,
         connector_id: None,
         mcp_app_resource_uri: None,
+        mcp_app_ui: None,
         link_id: None,
         app_name: None,
         action_name: None,
@@ -128,6 +130,7 @@ fn interrupted_turn_is_not_associated_with_a_new_voice_session(
     state.observe(&EventMsg::TurnStarted(
         codex_protocol::protocol::TurnStartedEvent {
             turn_id: "turn-1".to_string(),
+            root_turn_id: None,
             trace_id: None,
             started_at: None,
             model_context_window: None,
@@ -137,6 +140,7 @@ fn interrupted_turn_is_not_associated_with_a_new_voice_session(
     let aborted = EventMsg::TurnAborted(TurnAbortedEvent {
         turn_id: aborted_turn_id.map(str::to_string),
         reason: TurnAbortReason::Interrupted,
+        error: None,
         started_at: None,
         completed_at: None,
         duration_ms: None,
@@ -171,6 +175,7 @@ fn interrupted_turn_keeps_its_existing_voice_session_for_late_artifacts() {
     state.observe(&EventMsg::TurnAborted(TurnAbortedEvent {
         turn_id: Some("turn-1".to_string()),
         reason: TurnAbortReason::Interrupted,
+        error: None,
         started_at: None,
         completed_at: None,
         duration_ms: None,

@@ -2,8 +2,11 @@ pub use codex_api::ResponseEvent;
 use codex_protocol::error::Result;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ContentItem;
+use codex_protocol::models::DEFAULT_IMAGE_DETAIL;
 use codex_protocol::models::FunctionCallOutputContentItem;
+use codex_protocol::models::ImageDetail;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::openai_models::ModelInfo;
 use codex_tools::ToolSpec;
 use futures::Stream;
 use serde_json::Value;
@@ -12,6 +15,7 @@ use std::sync::Arc;
 use std::task::Context;
 use std::task::Poll;
 use tokio::sync::mpsc;
+use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
 /// API request payload for a single model turn
@@ -55,23 +59,21 @@ impl Default for Prompt {
 impl Prompt {
     pub(crate) fn get_formatted_input_for_request(
         &self,
-        use_responses_lite: bool,
+        model_info: &ModelInfo,
     ) -> Vec<ResponseItem> {
         let mut input = self.input.clone();
-        if use_responses_lite {
-            strip_image_details(&mut input);
-        }
+        normalize_image_details(&mut input, model_info);
         input
     }
 }
 
-fn strip_image_details(items: &mut [ResponseItem]) {
+fn normalize_image_details(items: &mut [ResponseItem], model_info: &ModelInfo) {
     for item in items {
         match item {
             ResponseItem::Message { content, .. } => {
                 for content_item in content {
                     if let ContentItem::InputImage { detail, .. } = content_item {
-                        *detail = None;
+                        normalize_image_detail(detail, model_info);
                     }
                 }
             }
@@ -82,7 +84,7 @@ fn strip_image_details(items: &mut [ResponseItem]) {
                         if let FunctionCallOutputContentItem::InputImage { detail, .. } =
                             content_item
                         {
-                            *detail = None;
+                            normalize_image_detail(detail, model_info);
                         }
                     }
                 }
@@ -106,8 +108,17 @@ fn strip_image_details(items: &mut [ResponseItem]) {
     }
 }
 
+fn normalize_image_detail(detail: &mut Option<ImageDetail>, model_info: &ModelInfo) {
+    if model_info.use_responses_lite {
+        *detail = None;
+    } else if *detail == Some(ImageDetail::Original) && !model_info.supports_image_detail_original {
+        *detail = Some(DEFAULT_IMAGE_DETAIL);
+    }
+}
+
 pub struct ResponseStream {
     pub(crate) rx_event: mpsc::Receiver<Result<ResponseEvent>>,
+    pub(crate) interrupt: Option<oneshot::Sender<()>>,
     /// Signals the mapper task that the consumer stopped polling before the
     /// provider stream reached its own terminal event.
     pub(crate) consumer_dropped: CancellationToken,

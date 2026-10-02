@@ -33,6 +33,123 @@ fn migrator_through(version: i64) -> Migrator {
 }
 
 #[tokio::test]
+async fn guardian_metadata_cleanup_preserves_custom_names_and_titles() {
+    let sqlite_home = crate::runtime::test_support::unique_temp_dir();
+    tokio::fs::create_dir_all(&sqlite_home)
+        .await
+        .expect("sqlite home should be created");
+    let _cleanup = scopeguard::guard(sqlite_home.clone(), |sqlite_home| {
+        let _ = std::fs::remove_dir_all(sqlite_home);
+    });
+    let sqlite = crate::SqliteConfig::new_for_testing(sqlite_home.as_path().abs());
+    let pool = sqlite
+        .open_read_write_pool(&sqlite.state_db_path())
+        .await
+        .expect("sqlite database should open");
+    migrator_through(/*version*/ 56)
+        .run(&pool)
+        .await
+        .expect("pre-cleanup migrations should apply");
+
+    sqlx::query(
+        r#"
+INSERT INTO threads (
+    id, rollout_path, created_at, updated_at, source, model_provider, cwd,
+    title, name, preview, sandbox_policy, approval_mode, first_user_message
+) VALUES
+    ('derived', '/tmp/guardian.jsonl', 1700000000, 1700000100,
+     '{"subagent":{"other":"guardian"}}', 'openai', '/tmp',
+     ' large guardian prompt ', NULL, 'large guardian prompt',
+     'read-only', 'on-request', 'large guardian prompt'),
+    ('empty', '/tmp/empty-guardian.jsonl', 1700000000, 1700000100,
+     '{"subagent":{"other":"guardian"}}', 'openai', '/tmp',
+     ' ', ' ', 'large guardian prompt',
+     'read-only', 'on-request', 'large guardian prompt'),
+    ('worker', '/tmp/worker.jsonl', 1700000000, 1700000100,
+     '{"subagent":{"other":"worker"}}', 'openai', '/tmp',
+     'worker title', 'worker name', 'worker preview',
+     'read-only', 'on-request', 'worker first message'),
+    ('custom-title', '/tmp/named-guardian.jsonl', 1700000000, 1700000100,
+     '{"subagent":{"other":"guardian"}}', 'openai', '/tmp',
+     'Named Guardian review', NULL, 'large guardian prompt',
+     'read-only', 'on-request', 'large guardian prompt'),
+    ('custom-name', '/tmp/explicitly-named-guardian.jsonl', 1700000000, 1700000100,
+     '{"subagent":{"other":"guardian"}}', 'openai', '/tmp',
+     'large guardian prompt', 'Explicit Guardian name', 'large guardian prompt',
+     'read-only', 'on-request', 'large guardian prompt')
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .expect("legacy metadata rows should insert");
+
+    STATE_MIGRATOR
+        .run(&pool)
+        .await
+        .expect("guardian metadata cleanup should apply");
+
+    let rows =
+        sqlx::query("SELECT id, title, name, preview, first_user_message FROM threads ORDER BY id")
+            .fetch_all(&pool)
+            .await
+            .expect("cleaned metadata rows should load");
+    let actual = rows
+        .iter()
+        .map(|row| {
+            (
+                row.get::<&str, _>("id"),
+                row.get::<&str, _>("title"),
+                row.get::<Option<&str>, _>("name"),
+                row.get::<&str, _>("preview"),
+                row.get::<&str, _>("first_user_message"),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        actual,
+        vec![
+            (
+                "custom-name",
+                "Guardian review",
+                Some("Explicit Guardian name"),
+                "Approval review",
+                ""
+            ),
+            (
+                "custom-title",
+                "Named Guardian review",
+                Some("Named Guardian review"),
+                "Approval review",
+                ""
+            ),
+            (
+                "derived",
+                "Guardian review",
+                Some("Guardian review"),
+                "Approval review",
+                ""
+            ),
+            (
+                "empty",
+                "Guardian review",
+                Some("Guardian review"),
+                "Approval review",
+                ""
+            ),
+            (
+                "worker",
+                "worker title",
+                Some("worker name"),
+                "worker preview",
+                "worker first message"
+            ),
+        ]
+    );
+
+    pool.close().await;
+}
+
+#[tokio::test]
 async fn thread_section_migration_preserves_legacy_pin_compatibility() {
     let sqlite_home = crate::runtime::test_support::unique_temp_dir();
     tokio::fs::create_dir_all(&sqlite_home)
@@ -189,7 +306,7 @@ INSERT INTO threads (
 }
 
 #[tokio::test]
-async fn thread_artifact_migration_preserves_existing_section_metadata() {
+async fn thread_attachment_migration_preserves_existing_data() {
     let sqlite_home = crate::runtime::test_support::unique_temp_dir();
     tokio::fs::create_dir_all(&sqlite_home)
         .await
@@ -202,7 +319,7 @@ async fn thread_artifact_migration_preserves_existing_section_metadata() {
         .open_read_write_pool(&sqlite.state_db_path())
         .await
         .expect("sqlite database should open");
-    migrator_through(/*version*/ 50)
+    migrator_through(/*version*/ 51)
         .run(&pool)
         .await
         .expect("released thread migrations should apply");
@@ -213,10 +330,26 @@ async fn thread_artifact_migration_preserves_existing_section_metadata() {
         .await
         .expect("released section appearance should remain writable");
 
+    let thread_id = "00000000-0000-0000-0000-000000000051";
+    sqlx::query(
+        "INSERT INTO threads (id, rollout_path, created_at, updated_at, source, model_provider, cwd, title, sandbox_policy, approval_mode) VALUES (?, 'rollout.jsonl', 1, 1, 'cli', 'openai', '/tmp', '', 'read-only', 'on-request')",
+    )
+    .bind(thread_id)
+    .execute(&pool)
+    .await
+    .expect("existing thread should be inserted");
+    sqlx::query(
+        "INSERT INTO thread_artifacts (id, thread_id, artifact_type, identity_key, payload, created_at) VALUES ('attachment-1', ?, 'pull_request', 'pr-123', '{}', 1)",
+    )
+    .bind(thread_id)
+    .execute(&pool)
+    .await
+    .expect("existing attachment should be inserted using the released schema");
+
     STATE_MIGRATOR
         .run(&pool)
         .await
-        .expect("artifact migration should apply without rewriting released migrations");
+        .expect("attachment migration should apply without rewriting released migrations");
     let section = sqlx::query_as::<_, (String, String, Option<String>)>(
         "SELECT id, name, appearance FROM thread_sections WHERE id = ?",
     )
@@ -233,20 +366,30 @@ async fn thread_artifact_migration_preserves_existing_section_metadata() {
         )
     );
 
-    let artifact_tables = sqlx::query_scalar::<_, String>(
-        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'thread_artifacts'",
+    let attachment = sqlx::query_as::<_, (String, String, String, String, String, i64)>(
+        "SELECT id, thread_id, attachment_type, identity_key, payload, created_at FROM thread_attachments",
     )
-    .fetch_all(&pool)
+    .fetch_one(&pool)
     .await
-    .expect("artifact table should exist");
-    assert_eq!(artifact_tables, vec!["thread_artifacts"]);
+    .expect("existing attachment should remain available under the renamed table and column");
+    assert_eq!(
+        attachment,
+        (
+            "attachment-1".to_string(),
+            thread_id.to_string(),
+            "pull_request".to_string(),
+            "pr-123".to_string(),
+            "{}".to_string(),
+            1,
+        )
+    );
 
     let mut released_migrator = migrator_through(/*version*/ 50);
     released_migrator.ignore_missing = true;
     released_migrator
         .run(&pool)
         .await
-        .expect("released binaries should tolerate the additive artifact migration");
+        .expect("released binaries should tolerate the attachment rename migration");
 }
 
 #[tokio::test]
@@ -520,6 +663,13 @@ async fn realtime_items_preserve_older_thread_history_writers() {
             ("older-writer-item".to_string(), "turn-1".to_string()),
         ]
     );
+    let lifecycle_timestamps = sqlx::query_as::<_, (Option<i64>, Option<i64>)>(
+        "SELECT started_at_ms, completed_at_ms FROM thread_items ORDER BY rollout_ordinal",
+    )
+    .fetch_all(&older_pool)
+    .await
+    .expect("old rows and older writers leave lifecycle timestamps unknown");
+    assert_eq!(lifecycle_timestamps, vec![(None, None), (None, None)]);
     sqlx::query("DELETE FROM thread_history_projection_state WHERE thread_id = ?")
         .bind("thread-1")
         .execute(&older_pool)
@@ -862,4 +1012,76 @@ async fn repair_recency_migration_succeeds_while_another_connection_holds_writer
     read_pool.close().await;
     pool.close().await;
     repair_result.expect("current migration history should not need the writer slot");
+}
+
+#[tokio::test]
+async fn writable_pool_reads_do_not_wait_for_an_existing_writer() {
+    let sqlite_home = crate::runtime::test_support::unique_temp_dir();
+    tokio::fs::create_dir_all(&sqlite_home).await.unwrap();
+    let _cleanup = scopeguard::guard(sqlite_home.clone(), |sqlite_home| {
+        let _ = std::fs::remove_dir_all(sqlite_home);
+    });
+    let sqlite = crate::SqliteConfig::new_for_testing(sqlite_home.as_path().abs());
+
+    for (index, (setup, expected_mode)) in [
+        ("PRAGMA auto_vacuum = INCREMENTAL", 2_i64),
+        ("PRAGMA auto_vacuum = FULL", 1),
+        ("PRAGMA auto_vacuum = NONE; VACUUM", 0),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let path = sqlite_home.join(format!("pool-{index}.sqlite"));
+        let pool = sqlite.open_read_write_pool(&path).await.unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("PRAGMA auto_vacuum")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            2,
+            "new databases must support incremental vacuum"
+        );
+        sqlx::query(setup).execute(&pool).await.unwrap();
+        sqlx::query("CREATE TABLE sample (value INTEGER); INSERT INTO sample VALUES (7)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
+
+        // Reopening preserves existing FULL and legacy NONE without taking a writer lock.
+        let pool = sqlite.open_read_write_pool(&path).await.unwrap();
+        let mut connection = pool.acquire().await.unwrap();
+        let writer = connection.begin_with("BEGIN IMMEDIATE").await.unwrap();
+        let read_result = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let readers = sqlite.open_read_write_pool(&path).await.unwrap();
+            let mode = sqlx::query_scalar::<_, i64>("PRAGMA auto_vacuum")
+                .fetch_one(&readers)
+                .await
+                .unwrap();
+            let mut held_connections = Vec::new();
+            let mut values = Vec::new();
+            // Keep every connection checked out to exercise lazy pool expansion too.
+            for _ in 0..5 {
+                let mut reader = readers.acquire().await.unwrap();
+                values.push(
+                    sqlx::query_scalar::<_, i64>("SELECT value FROM sample")
+                        .fetch_one(&mut *reader)
+                        .await
+                        .unwrap(),
+                );
+                held_connections.push(reader);
+            }
+            drop(held_connections);
+            readers.close().await;
+            (mode, values)
+        })
+        .await;
+        writer.rollback().await.unwrap();
+        drop(connection);
+        pool.close().await;
+        assert_eq!(
+            read_result.expect("opening and expanding a read pool must not wait for a writer"),
+            (expected_mode, vec![7; 5])
+        );
+    }
 }

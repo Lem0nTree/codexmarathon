@@ -46,6 +46,8 @@ use tonic::transport::Server;
 mod host;
 #[path = "support/large_tool_delegate.rs"]
 mod large_tool_delegate;
+#[path = "grpc/network_policy_tests.rs"]
+mod network_policy_tests;
 #[path = "support/recording_delegate.rs"]
 mod recording_delegate;
 
@@ -122,6 +124,7 @@ fn tool(name: &str) -> ToolDefinition {
         description: String::new(),
         kind: CodeModeToolKind::Function,
         input_schema: None,
+        input_schema_max_bytes: None,
         output_schema: None,
     }
 }
@@ -144,10 +147,11 @@ fn text_response(
 async fn execute(
     session: &Arc<dyn CodeModeSession>,
     request: ExecuteRequest,
+    delegate: Arc<dyn CodeModeSessionDelegate>,
 ) -> Result<RuntimeResponse> {
     timeout(TEST_TIMEOUT, async {
         session
-            .execute(request)
+            .execute(request, delegate.clone(), /*preempt*/ None)
             .await
             .map_err(anyhow::Error::msg)?
             .initial_response()
@@ -164,7 +168,7 @@ async fn start_active_wait(
 ) -> Result<tokio::task::JoinHandle<std::result::Result<WaitOutcome, String>>> {
     let (admitted_tx, admitted_rx) = tokio::sync::oneshot::channel();
     let wait = tokio::spawn(async move {
-        let mut wait = session.wait(request);
+        let mut wait = session.wait(request, /*preempt*/ None);
         match wait.as_mut().now_or_never() {
             Some(result) => result,
             None => {
@@ -190,7 +194,7 @@ async fn grpc_endpoints_reject_credentials_without_disclosing_them() {
     ] {
         let provider = GrpcCodeModeSessionProvider::new(endpoint);
         let error = provider
-            .create_session(Arc::new(NoopCodeModeSessionDelegate))
+            .create_session()
             .await
             .err()
             .expect("gRPC credentials should be rejected");
@@ -207,12 +211,18 @@ async fn tcp_session_persists_values_and_forwards_tools_notifications_and_closur
     assert!(host.endpoint.starts_with("http://127.0.0.1:"));
     let provider = GrpcCodeModeSessionProvider::new(host.endpoint);
     let delegate = Arc::new(RecordingDelegate::default());
+    let first_delegate = Arc::new(RecordingDelegate::default());
     let session = provider
-        .create_session(delegate.clone())
+        .create_session()
         .await
         .map_err(anyhow::Error::msg)?;
 
-    let actual = execute(&session, request(r#"store("key", "persisted");"#)).await?;
+    let actual = execute(
+        &session,
+        request(r#"store("key", "persisted");"#),
+        first_delegate.clone(),
+    )
+    .await?;
     assert_eq!(
         actual,
         RuntimeResponse::Result {
@@ -228,7 +238,7 @@ async fn tcp_session_persists_values_and_forwards_tools_notifications_and_closur
     );
     callback.tool_call_id = "call-2".to_string();
     callback.enabled_tools = vec![tool("echo")];
-    let actual = execute(&session, callback).await?;
+    let actual = execute(&session, callback, delegate.clone()).await?;
     assert_eq!(
         actual,
         text_response("2", "output", actual.code_mode_host_duration())
@@ -263,8 +273,90 @@ async fn tcp_session_persists_values_and_forwards_tools_notifications_and_closur
             .closed_cells
             .lock()
             .unwrap_or_else(PoisonError::into_inner),
-        vec![cell_id("1"), cell_id("2")]
+        vec![cell_id("2")]
     );
+    assert_eq!(
+        *first_delegate
+            .closed_cells
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner),
+        vec![cell_id("1")]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn grpc_early_yield_preserves_cell_and_later_waits() -> Result<()> {
+    let host = HostHarness::start("grpc://127.0.0.1:0").await?;
+    let session = GrpcCodeModeSessionProvider::new(host.endpoint)
+        .create_session()
+        .await
+        .map_err(anyhow::Error::msg)?;
+    let delegate = Arc::new(LargeToolResultDelegate {
+        started: Semaphore::new(0),
+        release: Semaphore::new(0),
+    });
+    let mut execute = request(r#"await tools.large({}); text("done");"#);
+    execute.enabled_tools = vec![tool("large")];
+    execute.yield_time_ms = Some(60_000);
+    let signal = CancellationToken::new();
+    signal.cancel();
+    let cell = session
+        .execute(execute, delegate.clone(), Some(signal))
+        .await
+        .map_err(anyhow::Error::msg)?;
+    let cell_id = cell.cell_id.clone();
+    let response = timeout(TEST_TIMEOUT, cell.initial_response())
+        .await?
+        .map_err(anyhow::Error::msg)?;
+    assert!(matches!(response, RuntimeResponse::Yielded { .. }));
+    timeout(TEST_TIMEOUT, delegate.started.acquire())
+        .await??
+        .forget();
+
+    let wait_signal = CancellationToken::new();
+    let mut wait = session.wait(
+        WaitRequest {
+            cell_id: cell_id.clone(),
+            yield_time_ms: 60_000,
+        },
+        Some(wait_signal.clone()),
+    );
+    assert!(wait.as_mut().now_or_never().is_none());
+    wait_signal.cancel();
+    let response = timeout(TEST_TIMEOUT, wait)
+        .await?
+        .map_err(anyhow::Error::msg)?;
+    assert!(matches!(
+        response,
+        WaitOutcome::LiveCell(RuntimeResponse::Yielded { .. })
+    ));
+
+    delegate.release.add_permits(1);
+    let response = timeout(
+        TEST_TIMEOUT,
+        session.wait(
+            WaitRequest {
+                cell_id: cell_id.clone(),
+                yield_time_ms: 60_000,
+            },
+            /*preempt*/ None,
+        ),
+    )
+    .await?
+    .map_err(anyhow::Error::msg)?;
+    assert_eq!(
+        response,
+        WaitOutcome::LiveCell(RuntimeResponse::Result {
+            code_mode_host_duration: response.code_mode_host_duration(),
+            cell_id,
+            content_items: vec![FunctionCallOutputContentItem::InputText {
+                text: "done".to_string(),
+            }],
+            error_text: None,
+        })
+    );
+    session.shutdown().await.map_err(anyhow::Error::msg)?;
     Ok(())
 }
 
@@ -273,22 +365,32 @@ async fn shutdown_immediately_rejects_new_operations() -> Result<()> {
     let host = HostHarness::start("grpc://127.0.0.1:0").await?;
     let provider = GrpcCodeModeSessionProvider::new(host.endpoint);
     let session = provider
-        .create_session(Arc::new(NoopCodeModeSessionDelegate))
+        .create_session()
         .await
         .map_err(anyhow::Error::msg)?;
 
     let shutdown = session.shutdown();
     let expected = "code mode session is shutting down".to_string();
     assert_eq!(
-        session.execute(request("text('too late');")).await.err(),
+        session
+            .execute(
+                request("text('too late');"),
+                Arc::new(NoopCodeModeSessionDelegate),
+                /*preempt*/ None,
+            )
+            .await
+            .err(),
         Some(expected.clone())
     );
     assert_eq!(
         session
-            .wait(WaitRequest {
-                cell_id: cell_id("missing"),
-                yield_time_ms: 1,
-            })
+            .wait(
+                WaitRequest {
+                    cell_id: cell_id("missing"),
+                    yield_time_ms: 1,
+                },
+                /*preempt*/ None,
+            )
             .await,
         Err(expected.clone())
     );
@@ -304,13 +406,18 @@ async fn cancelling_execution_before_admission_keeps_the_session_usable() -> Res
     let provider = GrpcCodeModeSessionProvider::new(host.endpoint);
     let delegate = Arc::new(RecordingDelegate::default());
     let session = provider
-        .create_session(delegate.clone())
+        .create_session()
         .await
         .map_err(anyhow::Error::msg)?;
     let mut pending = request("await new Promise(() => {});");
     pending.yield_time_ms = Some(/*value*/ 1);
 
-    assert!(session.execute(pending).now_or_never().is_none());
+    assert!(
+        session
+            .execute(pending, delegate.clone(), /*preempt*/ None)
+            .now_or_never()
+            .is_none()
+    );
 
     let abandoned_cell = cell_id("1");
     timeout(TEST_TIMEOUT, async {
@@ -332,10 +439,13 @@ async fn cancelling_execution_before_admission_keeps_the_session_usable() -> Res
     timeout(TEST_TIMEOUT, async {
         loop {
             match session
-                .wait(WaitRequest {
-                    cell_id: abandoned_cell.clone(),
-                    yield_time_ms: 1,
-                })
+                .wait(
+                    WaitRequest {
+                        cell_id: abandoned_cell.clone(),
+                        yield_time_ms: 1,
+                    },
+                    /*preempt*/ None,
+                )
                 .await
             {
                 Ok(WaitOutcome::MissingCell(_))
@@ -354,7 +464,12 @@ async fn cancelling_execution_before_admission_keeps_the_session_usable() -> Res
     .await
     .context("cancelled execution leaked its remote cell")??;
 
-    let actual = execute(&session, request(r#"text("still alive");"#)).await?;
+    let actual = execute(
+        &session,
+        request(r#"text("still alive");"#),
+        delegate.clone(),
+    )
+    .await?;
     assert_eq!(
         actual,
         text_response("2", "still alive", actual.code_mode_host_duration())
@@ -370,21 +485,27 @@ async fn dropping_a_started_cell_off_runtime_terminates_its_buffered_remote_exec
     let provider = GrpcCodeModeSessionProvider::new(host.endpoint);
     let delegate = Arc::new(RecordingDelegate::default());
     let session = provider
-        .create_session(delegate.clone())
+        .create_session()
         .await
         .map_err(anyhow::Error::msg)?;
     let mut pending = request("await new Promise(() => {});");
     pending.yield_time_ms = Some(/*value*/ 1);
-    let started = session.execute(pending).await.map_err(anyhow::Error::msg)?;
+    let started = session
+        .execute(pending, delegate.clone(), /*preempt*/ None)
+        .await
+        .map_err(anyhow::Error::msg)?;
     let abandoned_cell = started.cell_id.clone();
 
     timeout(TEST_TIMEOUT, async {
         loop {
             match session
-                .wait(WaitRequest {
-                    cell_id: abandoned_cell.clone(),
-                    yield_time_ms: 1,
-                })
+                .wait(
+                    WaitRequest {
+                        cell_id: abandoned_cell.clone(),
+                        yield_time_ms: 1,
+                    },
+                    /*preempt*/ None,
+                )
                 .await
             {
                 Ok(WaitOutcome::LiveCell(RuntimeResponse::Yielded { .. })) => break Ok(()),
@@ -406,10 +527,13 @@ async fn dropping_a_started_cell_off_runtime_terminates_its_buffered_remote_exec
     timeout(TEST_TIMEOUT, async {
         loop {
             match session
-                .wait(WaitRequest {
-                    cell_id: abandoned_cell.clone(),
-                    yield_time_ms: 1,
-                })
+                .wait(
+                    WaitRequest {
+                        cell_id: abandoned_cell.clone(),
+                        yield_time_ms: 1,
+                    },
+                    /*preempt*/ None,
+                )
                 .await
             {
                 Ok(WaitOutcome::MissingCell(_))
@@ -436,7 +560,12 @@ async fn dropping_a_started_cell_off_runtime_terminates_its_buffered_remote_exec
             .contains(&abandoned_cell)
     );
 
-    let actual = execute(&session, request(r#"text("still alive");"#)).await?;
+    let actual = execute(
+        &session,
+        request(r#"text("still alive");"#),
+        delegate.clone(),
+    )
+    .await?;
     assert_eq!(
         actual,
         text_response("2", "still alive", actual.code_mode_host_duration())
@@ -451,12 +580,15 @@ async fn dropping_an_initial_response_terminates_its_pending_remote_execution() 
     let provider = GrpcCodeModeSessionProvider::new(host.endpoint);
     let delegate = Arc::new(RecordingDelegate::default());
     let session = provider
-        .create_session(delegate.clone())
+        .create_session()
         .await
         .map_err(anyhow::Error::msg)?;
     let mut pending = request("await new Promise(() => {});");
     pending.yield_time_ms = Some(/*value*/ 60_000);
-    let started = session.execute(pending).await.map_err(anyhow::Error::msg)?;
+    let started = session
+        .execute(pending, delegate.clone(), /*preempt*/ None)
+        .await
+        .map_err(anyhow::Error::msg)?;
     let abandoned_cell = started.cell_id.clone();
     let initial_response = tokio::spawn(started.initial_response());
     tokio::task::yield_now().await;
@@ -479,7 +611,12 @@ async fn dropping_an_initial_response_terminates_its_pending_remote_execution() 
     .await
     .context("dropping an initial response did not terminate its pending remote execution")?;
 
-    let actual = execute(&session, request(r#"text("still alive");"#)).await?;
+    let actual = execute(
+        &session,
+        request(r#"text("still alive");"#),
+        delegate.clone(),
+    )
+    .await?;
     assert_eq!(
         actual,
         text_response("2", "still alive", actual.code_mode_host_duration())
@@ -493,7 +630,7 @@ async fn synchronous_delegate_panics_do_not_orphan_callbacks_or_close_the_sessio
     let host = HostHarness::start("grpc://127.0.0.1:0").await?;
     let provider = GrpcCodeModeSessionProvider::new(host.endpoint);
     let session = provider
-        .create_session(Arc::new(PanickingDelegate))
+        .create_session()
         .await
         .map_err(anyhow::Error::msg)?;
 
@@ -501,7 +638,7 @@ async fn synchronous_delegate_panics_do_not_orphan_callbacks_or_close_the_sessio
         r#"try { await tools.echo({}); text("unexpected"); } catch (_) { text("tool recovered"); }"#,
     );
     tool_panic.enabled_tools = vec![tool("echo")];
-    let actual = execute(&session, tool_panic).await?;
+    let actual = execute(&session, tool_panic, Arc::new(PanickingDelegate)).await?;
     assert_eq!(
         actual,
         text_response("1", "tool recovered", actual.code_mode_host_duration())
@@ -510,6 +647,7 @@ async fn synchronous_delegate_panics_do_not_orphan_callbacks_or_close_the_sessio
     let actual = execute(
         &session,
         request(r#"notify("panic"); text("notification recovered");"#),
+        Arc::new(PanickingDelegate),
     )
     .await?;
     assert_eq!(
@@ -520,7 +658,12 @@ async fn synchronous_delegate_panics_do_not_orphan_callbacks_or_close_the_sessio
             actual.code_mode_host_duration()
         )
     );
-    let actual = execute(&session, request(r#"text("still alive");"#)).await?;
+    let actual = execute(
+        &session,
+        request(r#"text("still alive");"#),
+        Arc::new(PanickingDelegate),
+    )
+    .await?;
     assert_eq!(
         actual,
         text_response("3", "still alive", actual.code_mode_host_duration())
@@ -535,19 +678,24 @@ async fn tool_delegate_self_cancellation_returns_an_error_without_hanging() -> R
     let host = HostHarness::start("grpc://127.0.0.1:0").await?;
     let provider = GrpcCodeModeSessionProvider::new(host.endpoint);
     let session = provider
-        .create_session(Arc::new(SelfCancellingToolDelegate))
+        .create_session()
         .await
         .map_err(anyhow::Error::msg)?;
 
     let mut callback =
         request(r#"try { await tools.echo({}); } catch (_) { text("tool recovered"); }"#);
     callback.enabled_tools = vec![tool("echo")];
-    let actual = execute(&session, callback).await?;
+    let actual = execute(&session, callback, Arc::new(SelfCancellingToolDelegate)).await?;
     assert_eq!(
         actual,
         text_response("1", "tool recovered", actual.code_mode_host_duration())
     );
-    let actual = execute(&session, request(r#"text("still alive");"#)).await?;
+    let actual = execute(
+        &session,
+        request(r#"text("still alive");"#),
+        Arc::new(SelfCancellingToolDelegate),
+    )
+    .await?;
     assert_eq!(
         actual,
         text_response("2", "still alive", actual.code_mode_host_duration())
@@ -562,12 +710,19 @@ async fn concurrent_wait_rejects_without_displacing_the_active_observer() -> Res
     let host = HostHarness::start("grpc://127.0.0.1:0").await?;
     let provider = GrpcCodeModeSessionProvider::new(host.endpoint);
     let session = provider
-        .create_session(Arc::new(NoopCodeModeSessionDelegate))
+        .create_session()
         .await
         .map_err(anyhow::Error::msg)?;
     let mut pending = request("await new Promise(() => {});");
     pending.yield_time_ms = Some(/*value*/ 1);
-    let started = session.execute(pending).await.map_err(anyhow::Error::msg)?;
+    let started = session
+        .execute(
+            pending,
+            Arc::new(NoopCodeModeSessionDelegate),
+            /*preempt*/ None,
+        )
+        .await
+        .map_err(anyhow::Error::msg)?;
     let running_cell = started.cell_id.clone();
     let actual = started
         .initial_response()
@@ -594,10 +749,13 @@ async fn concurrent_wait_rejects_without_displacing_the_active_observer() -> Res
     assert_eq!(
         timeout(
             Duration::from_secs(/*secs*/ 1),
-            session.wait(WaitRequest {
-                cell_id: running_cell.clone(),
-                yield_time_ms: 60_000,
-            }),
+            session.wait(
+                WaitRequest {
+                    cell_id: running_cell.clone(),
+                    yield_time_ms: 60_000,
+                },
+                /*preempt*/ None,
+            ),
         )
         .await
         .context("concurrent wait did not reject immediately")?
@@ -639,12 +797,19 @@ async fn dropping_a_wait_retires_its_observer_before_the_next_wait() -> Result<(
     let host = HostHarness::start("grpc://127.0.0.1:0").await?;
     let provider = GrpcCodeModeSessionProvider::new(host.endpoint);
     let session = provider
-        .create_session(Arc::new(NoopCodeModeSessionDelegate))
+        .create_session()
         .await
         .map_err(anyhow::Error::msg)?;
     let mut pending = request("await new Promise(() => {});");
     pending.yield_time_ms = Some(/*value*/ 1);
-    let started = session.execute(pending).await.map_err(anyhow::Error::msg)?;
+    let started = session
+        .execute(
+            pending,
+            Arc::new(NoopCodeModeSessionDelegate),
+            /*preempt*/ None,
+        )
+        .await
+        .map_err(anyhow::Error::msg)?;
     let running_cell = started.cell_id.clone();
     let actual = started
         .initial_response()
@@ -672,10 +837,13 @@ async fn dropping_a_wait_retires_its_observer_before_the_next_wait() -> Result<(
 
     let actual = timeout(
         TEST_TIMEOUT,
-        session.wait(WaitRequest {
-            cell_id: running_cell.clone(),
-            yield_time_ms: 1,
-        }),
+        session.wait(
+            WaitRequest {
+                cell_id: running_cell.clone(),
+                yield_time_ms: 1,
+            },
+            /*preempt*/ None,
+        ),
     )
     .await
     .context("replacement wait did not observe cancellation retirement")?
@@ -710,12 +878,12 @@ async fn dropping_a_session_off_runtime_retires_its_active_cells() -> Result<()>
     let provider = GrpcCodeModeSessionProvider::new(host.endpoint);
     let delegate = Arc::new(RecordingDelegate::default());
     let session = provider
-        .create_session(delegate.clone())
+        .create_session()
         .await
         .map_err(anyhow::Error::msg)?;
     let mut pending = request("await new Promise(() => {});");
     pending.yield_time_ms = Some(/*value*/ 1);
-    let actual = execute(&session, pending).await?;
+    let actual = execute(&session, pending, delegate.clone()).await?;
     assert_eq!(
         actual,
         RuntimeResponse::Yielded {
@@ -757,11 +925,11 @@ async fn large_unary_tool_completion_does_not_block_an_independent_session() -> 
         release: Semaphore::new(/*permits*/ 0),
     });
     let slow_session = provider
-        .create_session(delegate.clone())
+        .create_session()
         .await
         .map_err(anyhow::Error::msg)?;
     let fast_session = provider
-        .create_session(Arc::new(NoopCodeModeSessionDelegate))
+        .create_session()
         .await
         .map_err(anyhow::Error::msg)?;
     let mut slow_request = request(
@@ -770,7 +938,7 @@ async fn large_unary_tool_completion_does_not_block_an_independent_session() -> 
     slow_request.enabled_tools = vec![tool("large")];
     slow_request.yield_time_ms = Some(/*value*/ 20_000);
     let slow_cell = slow_session
-        .execute(slow_request)
+        .execute(slow_request, delegate.clone(), /*preempt*/ None)
         .await
         .map_err(anyhow::Error::msg)?;
     timeout(TEST_TIMEOUT, delegate.started.acquire())
@@ -778,7 +946,12 @@ async fn large_unary_tool_completion_does_not_block_an_independent_session() -> 
         .context("large tool callback did not start")??
         .forget();
 
-    let actual = execute(&fast_session, request(r#"text("fast-before");"#)).await?;
+    let actual = execute(
+        &fast_session,
+        request(r#"text("fast-before");"#),
+        Arc::new(NoopCodeModeSessionDelegate),
+    )
+    .await?;
     assert_eq!(
         actual,
         text_response("1", "fast-before", actual.code_mode_host_duration())
@@ -786,7 +959,11 @@ async fn large_unary_tool_completion_does_not_block_an_independent_session() -> 
 
     delegate.release.add_permits(/*n*/ 1);
     let slow_response = timeout(TEST_TIMEOUT, slow_cell.initial_response());
-    let fast_response = execute(&fast_session, request(r#"text("fast-during");"#));
+    let fast_response = execute(
+        &fast_session,
+        request(r#"text("fast-during");"#),
+        Arc::new(NoopCodeModeSessionDelegate),
+    );
     let (slow_response, fast_response) = tokio::join!(slow_response, fast_response);
 
     let actual = fast_response?;
@@ -822,7 +999,7 @@ async fn single_subscription_processes_slow_and_fast_tools_concurrently() -> Res
         release: Semaphore::new(/*permits*/ 0),
     });
     let session = provider
-        .create_session(delegate.clone())
+        .create_session()
         .await
         .map_err(anyhow::Error::msg)?;
 
@@ -830,7 +1007,10 @@ async fn single_subscription_processes_slow_and_fast_tools_concurrently() -> Res
         request(r#"const result = await tools.large({}); text(String(result.value.length));"#);
     slow.enabled_tools = vec![tool("large")];
     slow.yield_time_ms = Some(/*value*/ 20_000);
-    let slow_cell = session.execute(slow).await.map_err(anyhow::Error::msg)?;
+    let slow_cell = session
+        .execute(slow, delegate.clone(), /*preempt*/ None)
+        .await
+        .map_err(anyhow::Error::msg)?;
     timeout(TEST_TIMEOUT, delegate.started.acquire())
         .await
         .context("slow tool did not start")??
@@ -838,7 +1018,7 @@ async fn single_subscription_processes_slow_and_fast_tools_concurrently() -> Res
 
     let mut fast = request(r#"const result = await tools.fast({}); text(result.value);"#);
     fast.enabled_tools = vec![tool("fast")];
-    let actual = execute(&session, fast).await?;
+    let actual = execute(&session, fast, delegate.clone()).await?;
     assert_eq!(
         actual,
         text_response("2", "isolated", actual.code_mode_host_duration())
@@ -869,29 +1049,23 @@ async fn sessions_enforce_independent_yield_limits() -> Result<()> {
     let host = HostHarness::start("grpc://127.0.0.1:0").await?;
     let provider = GrpcCodeModeSessionProvider::new(host.endpoint);
     let limited = provider
-        .create_session_with_limits(
-            Arc::new(NoopCodeModeSessionDelegate),
-            CodeModeSessionCellExecutionLimits {
-                max_yield_time_ms: Some(/*value*/ 1),
-                max_heap_size_bytes: Some(/*value*/ 16 * 1024 * 1024),
-            },
-        )
+        .create_session_with_limits(CodeModeSessionCellExecutionLimits {
+            max_yield_time_ms: Some(/*value*/ 1),
+            max_heap_size_bytes: Some(/*value*/ 16 * 1024 * 1024),
+        })
         .await
         .map_err(anyhow::Error::msg)?;
     let other = provider
-        .create_session_with_limits(
-            Arc::new(NoopCodeModeSessionDelegate),
-            CodeModeSessionCellExecutionLimits {
-                max_yield_time_ms: Some(/*value*/ 1_000),
-                max_heap_size_bytes: None,
-            },
-        )
+        .create_session_with_limits(CodeModeSessionCellExecutionLimits {
+            max_yield_time_ms: Some(/*value*/ 1_000),
+            max_heap_size_bytes: None,
+        })
         .await
         .map_err(anyhow::Error::msg)?;
 
     let mut pending = request("await new Promise(() => {});");
     pending.yield_time_ms = Some(/*value*/ 60_000);
-    let actual = execute(&limited, pending).await?;
+    let actual = execute(&limited, pending, Arc::new(NoopCodeModeSessionDelegate)).await?;
     assert_eq!(
         actual,
         RuntimeResponse::Yielded {
@@ -902,10 +1076,13 @@ async fn sessions_enforce_independent_yield_limits() -> Result<()> {
     );
     let actual = timeout(
         TEST_TIMEOUT,
-        limited.wait(WaitRequest {
-            cell_id: cell_id("1"),
-            yield_time_ms: 60_000,
-        }),
+        limited.wait(
+            WaitRequest {
+                cell_id: cell_id("1"),
+                yield_time_ms: 60_000,
+            },
+            /*preempt*/ None,
+        ),
     )
     .await
     .context("session yield limit did not bound an explicit wait")?
@@ -921,6 +1098,7 @@ async fn sessions_enforce_independent_yield_limits() -> Result<()> {
     let actual = execute(
         &other,
         request(r#"await new Promise(resolve => setTimeout(resolve, 25)); text("isolated");"#),
+        Arc::new(NoopCodeModeSessionDelegate),
     )
     .await?;
     assert_eq!(
@@ -939,7 +1117,12 @@ async fn sessions_enforce_independent_yield_limits() -> Result<()> {
             content_items: Vec::new(),
         })
     );
-    let actual = execute(&limited, request("await new Promise(() => {});")).await?;
+    let actual = execute(
+        &limited,
+        request("await new Promise(() => {});"),
+        Arc::new(NoopCodeModeSessionDelegate),
+    )
+    .await?;
     assert_eq!(
         actual,
         RuntimeResponse::Yielded {
@@ -1008,14 +1191,17 @@ async fn cached_session_recovers_after_a_remote_host_restarts() -> Result<()> {
     let provider = GrpcCodeModeSessionProvider::new(original.endpoint.clone());
     let delegate = Arc::new(RecordingDelegate::default());
     let session = provider
-        .create_session(delegate.clone())
+        .create_session()
         .await
         .map_err(anyhow::Error::msg)?;
 
     let mut pending = request("await tools.echo({generation: 1}); await new Promise(() => {});");
     pending.enabled_tools = vec![tool("echo")];
     pending.yield_time_ms = Some(/*value*/ 1);
-    let started = session.execute(pending).await.map_err(anyhow::Error::msg)?;
+    let started = session
+        .execute(pending, delegate.clone(), /*preempt*/ None)
+        .await
+        .map_err(anyhow::Error::msg)?;
     let old_cell_id = started.cell_id.clone();
     assert_eq!(old_cell_id, cell_id("1"));
     assert!(matches!(
@@ -1078,8 +1264,8 @@ async fn cached_session_recovers_after_a_remote_host_restarts() -> Result<()> {
     callback.tool_call_id = "reconnected-call".to_string();
     callback.enabled_tools = vec![tool("echo")];
     let (callback_response, concurrent_response) = tokio::join!(
-        execute(&session, callback),
-        execute(&session, request(r#"text("concurrent")"#)),
+        execute(&session, callback, delegate.clone()),
+        execute(&session, request(r#"text("concurrent")"#), delegate.clone()),
     );
     let callback_response = callback_response?;
     let RuntimeResponse::Result {
@@ -1145,7 +1331,10 @@ async fn cached_session_recovers_after_a_remote_host_restarts() -> Result<()> {
 
     let mut pending = request("await new Promise(() => {});");
     pending.yield_time_ms = Some(/*value*/ 1);
-    let started = session.execute(pending).await.map_err(anyhow::Error::msg)?;
+    let started = session
+        .execute(pending, delegate.clone(), /*preempt*/ None)
+        .await
+        .map_err(anyhow::Error::msg)?;
     let replacement_cell_id = started.cell_id.clone();
     assert_eq!(replacement_cell_id, cell_id("g2:3"));
     let actual = started
@@ -1161,10 +1350,13 @@ async fn cached_session_recovers_after_a_remote_host_restarts() -> Result<()> {
         }
     );
     let actual = session
-        .wait(WaitRequest {
-            cell_id: replacement_cell_id.clone(),
-            yield_time_ms: 1,
-        })
+        .wait(
+            WaitRequest {
+                cell_id: replacement_cell_id.clone(),
+                yield_time_ms: 1,
+            },
+            /*preempt*/ None,
+        )
         .await
         .map_err(anyhow::Error::msg)?;
     assert_eq!(
@@ -1189,10 +1381,13 @@ async fn cached_session_recovers_after_a_remote_host_restarts() -> Result<()> {
     );
 
     let stale_wait = session
-        .wait(WaitRequest {
-            cell_id: old_cell_id.clone(),
-            yield_time_ms: 1,
-        })
+        .wait(
+            WaitRequest {
+                cell_id: old_cell_id.clone(),
+                yield_time_ms: 1,
+            },
+            /*preempt*/ None,
+        )
         .await
         .unwrap_err();
     assert!(stale_wait.contains("stale code-mode host generation"));
@@ -1219,10 +1414,15 @@ async fn unix_socket_endpoints_execute_code_mode_cells() -> Result<()> {
         format!("unix:{}", socket_path.display()),
     ] {
         let session = GrpcCodeModeSessionProvider::new(endpoint)
-            .create_session(Arc::new(NoopCodeModeSessionDelegate))
+            .create_session()
             .await
             .map_err(anyhow::Error::msg)?;
-        let actual = execute(&session, request(r#"text("unix socket")"#)).await?;
+        let actual = execute(
+            &session,
+            request(r#"text("unix socket")"#),
+            Arc::new(NoopCodeModeSessionDelegate),
+        )
+        .await?;
         assert_eq!(
             actual,
             text_response("1", "unix socket", actual.code_mode_host_duration())

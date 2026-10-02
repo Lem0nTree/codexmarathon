@@ -4,7 +4,6 @@ use super::AnalyticsEventsQueue;
 use super::AnalyticsEventsQueueMessage;
 #[cfg(debug_assertions)]
 use super::capture_track_events_request;
-#[cfg(debug_assertions)]
 use super::send_track_events;
 #[cfg(debug_assertions)]
 use super::send_track_events_request;
@@ -49,16 +48,19 @@ use crate::events::TrackEventRequest;
 #[cfg(debug_assertions)]
 use crate::events::codex_artifact_operation_event_request;
 use crate::facts::AnalyticsFact;
+use crate::facts::AppInvocation;
 #[cfg(debug_assertions)]
 use crate::facts::ArtifactOperation;
 #[cfg(debug_assertions)]
 use crate::facts::ArtifactOperationLifecycle;
 use crate::facts::CustomAnalyticsFact;
+use crate::facts::ElicitationType;
 use crate::facts::InvocationType;
 use crate::facts::PluginMeasurementRow;
 use crate::facts::PluginMeasurementsInput;
-#[cfg(debug_assertions)]
 use crate::facts::TrackEventsContext;
+#[cfg(debug_assertions)]
+use crate::product_attribution::ThreadProducts;
 use crate::reducer::MAX_PLUGIN_MEASUREMENTS_PER_BATCH;
 use codex_app_server_protocol::ApprovalsReviewer as AppServerApprovalsReviewer;
 use codex_app_server_protocol::AskForApproval as AppServerAskForApproval;
@@ -74,6 +76,7 @@ use codex_app_server_protocol::ThreadArchiveParams;
 use codex_app_server_protocol::ThreadArchiveResponse;
 use codex_app_server_protocol::ThreadArchivedNotification;
 use codex_app_server_protocol::ThreadForkResponse;
+use codex_app_server_protocol::ThreadRealtimeItemAddedNotification;
 use codex_app_server_protocol::ThreadResumeResponse;
 use codex_app_server_protocol::ThreadStartResponse;
 use codex_app_server_protocol::ThreadStatus as AppServerThreadStatus;
@@ -86,6 +89,8 @@ use codex_app_server_protocol::TurnStartResponse;
 use codex_app_server_protocol::TurnStatus as AppServerTurnStatus;
 use codex_app_server_protocol::TurnSteerParams;
 use codex_app_server_protocol::TurnSteerResponse;
+use codex_http_client::HttpClientFactory;
+use codex_http_client::OutboundProxyPolicy;
 #[cfg(debug_assertions)]
 use codex_login::AuthManager;
 use codex_utils_absolute_path::test_support::PathBufExt;
@@ -103,6 +108,9 @@ use std::sync::Mutex;
 use std::time::SystemTime;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TryRecvError;
+
+#[path = "client_product_tests.rs"]
+mod product_tests;
 
 #[cfg(debug_assertions)]
 impl AnalyticsEventsClient {
@@ -146,9 +154,9 @@ fn sample_skill_track_event(thread_id: &str, plugin_id: Option<&str>) -> TrackEv
             skill_scope: None,
             plugin_id: plugin_id.map(str::to_string),
             remote_plugin_id: None,
-            repo_url: None,
             thread_id: Some(thread_id.to_string()),
             turn_id: Some("turn-1".to_string()),
+            voice_session_id: None,
             invoke_type: Some(InvocationType::Explicit),
             model_slug: Some("gpt-5.1-codex".to_string()),
         },
@@ -159,6 +167,7 @@ fn sample_skill_track_event(thread_id: &str, plugin_id: Option<&str>) -> TrackEv
 fn sample_artifact_operation_event(thread_id: &str) -> TrackEventRequest {
     TrackEventRequest::ArtifactOperation(codex_artifact_operation_event_request(
         TrackEventsContext {
+            turn_metadata: None,
             model_slug: "gpt-5.1-codex".to_string(),
             thread_id: thread_id.to_string(),
             turn_id: "turn-1".to_string(),
@@ -217,6 +226,7 @@ fn sample_mcp_tool_call_event(thread_id: &str, plugin_id: Option<&str>) -> Track
                 subagent_source: None,
                 parent_thread_id: None,
                 tool_name: "search".to_string(),
+                tool_event_type: None,
                 started_at_ms: 1,
                 completed_at_ms: 2,
                 duration_ms: Some(1),
@@ -235,6 +245,8 @@ fn sample_mcp_tool_call_event(thread_id: &str, plugin_id: Option<&str>) -> Track
             mcp_error_present: false,
             plugin_id: plugin_id.map(str::to_string),
             connector_id: None,
+            voice_session_id: None,
+            elicitation_type: None,
         },
     })
 }
@@ -281,6 +293,7 @@ fn client_with_receiver() -> (
     let (sender, receiver) = mpsc::channel(8);
     let queue = AnalyticsEventsQueue {
         sender,
+        product_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         app_used_emitted_keys: Arc::new(Mutex::new(HashSet::new())),
         plugin_used_emitted_keys: Arc::new(Mutex::new(HashSet::new())),
     };
@@ -361,7 +374,15 @@ async fn capture_file_writes_exact_serialized_request() {
     let expected_event = serde_json::to_value(&event).expect("serialize expected event");
     let auth = codex_login::CodexAuth::create_dummy_chatgpt_auth_for_testing();
 
-    send_track_events_request(&auth, &destination, vec![event]).await;
+    let factory = HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault);
+    send_track_events_request(
+        &auth,
+        &destination,
+        vec![event],
+        &factory,
+        /*product_sku*/ None,
+    )
+    .await;
 
     let contents = fs::read_to_string(&capture_path).expect("read capture file");
     let lines = contents.lines().collect::<Vec<_>>();
@@ -388,7 +409,15 @@ async fn capture_file_writes_final_batches_as_separate_lines() {
     ];
 
     for batch in track_event_request_batches(events) {
-        send_track_events_request(&auth, &destination, batch).await;
+        let factory = HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault);
+        send_track_events_request(
+            &auth,
+            &destination,
+            batch,
+            &factory,
+            /*product_sku*/ None,
+        )
+        .await;
     }
 
     let contents = fs::read_to_string(&capture_path).expect("read capture file");
@@ -421,6 +450,8 @@ async fn api_key_auth_sends_only_plugin_events_to_codex_backend() {
         TrackEventRequest::PluginMeasurement(CodexPluginMeasurementEventRequest {
             event_type: "codex_plugin_measurement_event",
             event_params: CodexPluginMeasurementEventParams {
+                model_slug: None,
+                reasoning_effort: None,
                 thread_id: thread_id.to_string(),
                 turn_id: "turn-1".to_string(),
                 item_id: "item-1".to_string(),
@@ -462,6 +493,7 @@ async fn api_key_auth_sends_only_plugin_events_to_codex_backend() {
             sample_artifact_operation_event("plugin-artifact"),
             plugin_measurement("plugin-measurement", "sample@test"),
         ],
+        &ThreadProducts::default(),
     )
     .await;
 
@@ -626,6 +658,7 @@ fn sample_thread(thread_id: &str) -> Thread {
 
 fn sample_thread_start_response() -> ClientResponsePayload {
     ClientResponsePayload::ThreadStart(ThreadStartResponse {
+        disabled_plugin_ids: Vec::new(),
         thread: sample_thread("thread-1"),
         model: "gpt-5".to_string(),
         model_provider: "openai".to_string(),
@@ -644,6 +677,7 @@ fn sample_thread_start_response() -> ClientResponsePayload {
 
 fn sample_thread_resume_response() -> ClientResponsePayload {
     ClientResponsePayload::ThreadResume(ThreadResumeResponse {
+        disabled_plugin_ids: Vec::new(),
         thread: sample_thread("thread-2"),
         model: "gpt-5".to_string(),
         model_provider: "openai".to_string(),
@@ -656,6 +690,7 @@ fn sample_thread_resume_response() -> ClientResponsePayload {
         sandbox: AppServerSandboxPolicy::DangerFullAccess,
         active_permission_profile: None,
         reasoning_effort: None,
+        collaboration_mode: None,
         multi_agent_mode: Default::default(),
         initial_turns_page: None,
         turns_backwards_cursor: None,
@@ -665,6 +700,7 @@ fn sample_thread_resume_response() -> ClientResponsePayload {
 
 fn sample_thread_fork_response() -> ClientResponsePayload {
     ClientResponsePayload::ThreadFork(ThreadForkResponse {
+        disabled_plugin_ids: Vec::new(),
         thread: sample_thread("thread-3"),
         model: "gpt-5".to_string(),
         model_provider: "openai".to_string(),
@@ -710,6 +746,8 @@ fn track_plugin_measurements_rejects_unbounded_inputs_before_queueing() {
         turn_id: "turn-1".to_string(),
         item_id: "item-1".to_string(),
         originator: "codex_cli_rs".to_string(),
+        model_slug: None,
+        reasoning_effort: None,
         plugin_id: "sample@openai-curated".to_string(),
         execution_id: "execution-1".to_string(),
         operation: "security_scan".to_string(),
@@ -906,6 +944,56 @@ async fn flush_is_noop_when_analytics_is_disabled() {
 }
 
 #[test]
+fn app_used_preserves_first_classification_and_emits_again_next_turn() {
+    let (client, mut receiver) = client_with_receiver();
+    let tracking = TrackEventsContext {
+        turn_metadata: None,
+        model_slug: "gpt-5".to_string(),
+        thread_id: "thread-1".to_string(),
+        turn_id: "turn-1".to_string(),
+        product_client_id: "codex_desktop".to_string(),
+    };
+    for (turn_id, elicitation_type) in [
+        ("turn-1", Some(ElicitationType::AuthOrLink)),
+        ("turn-1", None),
+        ("turn-2", None),
+    ] {
+        client.track_app_used(
+            TrackEventsContext {
+                turn_id: turn_id.to_string(),
+                ..tracking.clone()
+            },
+            AppInvocation {
+                connector_id: Some("calendar".to_string()),
+                app_name: Some("Calendar".to_string()),
+                invocation_type: Some(InvocationType::Implicit),
+            },
+            elicitation_type,
+        );
+    }
+    for (turn_id, elicitation_type) in [
+        ("turn-1", Some(ElicitationType::AuthOrLink)),
+        ("turn-2", None),
+    ] {
+        let Ok(AnalyticsEventsQueueMessage::Fact(input)) = receiver.try_recv() else {
+            panic!("expected app-used analytics fact");
+        };
+        let AnalyticsFact::Custom(CustomAnalyticsFact::AppUsed(input)) = *input else {
+            panic!("expected app-used analytics fact");
+        };
+        assert_eq!(
+            (
+                input.tracking.turn_id.as_str(),
+                input.app.connector_id.as_deref(),
+                input.elicitation_type,
+            ),
+            (turn_id, Some("calendar"), elicitation_type)
+        );
+    }
+    assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
+}
+
+#[test]
 fn track_notification_only_enqueues_analytics_relevant_notifications() {
     let (client, mut receiver) = client_with_receiver();
     let tracked_payload = TurnDiffUpdatedNotification {
@@ -937,6 +1025,34 @@ fn track_notification_only_enqueues_analytics_relevant_notifications() {
         });
 
     client.track_notification(&ignored_notification);
+    assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
+}
+
+#[test]
+fn realtime_handoff_tracks_only_marker_without_transcript() {
+    let (client, mut receiver) = client_with_receiver();
+    client.track_notification(&ServerNotification::ThreadRealtimeItemAdded(
+        ThreadRealtimeItemAddedNotification {
+            thread_id: "thread-1".to_string(),
+            item: serde_json::json!({
+                "type": "handoff_request",
+                "input_transcript": "private speech",
+            }),
+        },
+    ));
+    let Ok(AnalyticsEventsQueueMessage::Fact(input)) = receiver.try_recv() else {
+        panic!("expected realtime handoff marker");
+    };
+    assert!(matches!(
+        *input,
+        AnalyticsFact::RealtimeHandoffRequested { thread_id } if thread_id == "thread-1"
+    ));
+    client.track_notification(&ServerNotification::ThreadRealtimeItemAdded(
+        ThreadRealtimeItemAddedNotification {
+            thread_id: "thread-1".to_string(),
+            item: serde_json::json!({"type": "input_transcript"}),
+        },
+    ));
     assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
 }
 

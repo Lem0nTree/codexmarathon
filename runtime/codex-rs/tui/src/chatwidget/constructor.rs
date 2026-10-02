@@ -33,6 +33,8 @@ impl ChatWidget {
             terminal_title_invalid_items_warned,
             session_telemetry,
         } = common;
+        // Keep asynchronous widget callbacks scoped separately from the app and other widgets.
+        let app_event_tx = AppEventSender::new(app_event_tx.app_event_tx);
         let model = model.filter(|m| !m.trim().is_empty());
         let mut config = config;
         config.model = model.clone();
@@ -61,7 +63,10 @@ impl ChatWidget {
             settings: fallback_default,
         };
 
-        let active_cell = Some(Self::placeholder_session_header_cell(&config));
+        let empty_state_animation = crate::empty_state_animation::EmptyStateAnimation::default();
+        let mut header = Self::placeholder_session_header_cell(&config);
+        history_cell::set_session_greeting(header.as_mut(), &empty_state_animation.greeting);
+        let active_cell = Some(header);
 
         let current_cwd = Some(config.cwd.to_path_buf());
         let effective_service_tier = crate::service_tier_resolution::effective_service_tier(
@@ -70,7 +75,6 @@ impl ChatWidget {
             &header_model,
             &model_catalog.try_list_models().unwrap_or_default(),
         );
-        let current_terminal_info = terminal_info();
         let runtime_keymap = RuntimeKeymap::from_config(&local_settings.tui.keymap).ok();
         let default_keymap = RuntimeKeymap::defaults();
         let copy_last_response_binding = runtime_keymap
@@ -81,10 +85,6 @@ impl ChatWidget {
             .as_ref()
             .map(|keymap| keymap.chat.clone())
             .unwrap_or_else(|| default_keymap.chat.clone());
-        let queued_message_edit_hint_binding = queued_message_edit_hint_binding(
-            runtime_keymap.as_ref().unwrap_or(&default_keymap),
-            current_terminal_info,
-        );
         let pet_http_client = codex_http_client::RouteAwareClientPool::new(
             config.http_client_factory(),
             codex_http_client::ClientRouteClass::Other,
@@ -97,6 +97,7 @@ impl ChatWidget {
             pet_http_client.clone(),
         );
         let mut widget = Self {
+            empty_state_animation: std::cell::RefCell::new(empty_state_animation),
             cyber_policy_notice: Default::default(),
             app_event_tx: app_event_tx.clone(),
             frame_requester: frame_requester.clone(),
@@ -109,6 +110,7 @@ impl ChatWidget {
                 placeholder_text: placeholder.clone(),
                 disable_paste_burst: local_settings.tui.disable_paste_burst.unwrap_or(false),
                 animations_enabled: local_settings.tui.animations,
+                effects: local_settings.tui.effects,
                 skills: None,
             }),
             transcript: TranscriptState::new(active_cell),
@@ -137,15 +139,19 @@ impl ChatWidget {
             pending_marathon_login: None,
             pending_marathon_export: None,
             remote_connection: None,
+            snapshot_local_images: false,
+            pending_image_submission: None,
             local_worktree_operations: true,
+            windows_sandbox_local_server: false,
+            windows_sandbox_config: Default::default(),
+            windows_sandbox_host: crate::app::WindowsSandboxHost::Unknown,
+            #[cfg(any(target_os = "windows", test))]
+            windows_sandbox_elevated_setup_complete: false,
             token_info: None,
             token_usage_pending: false,
             rate_limit_snapshots_by_limit_id: BTreeMap::new(),
             refreshing_status_outputs: Vec::new(),
             next_status_refresh_request_id: 0,
-            refreshing_token_activity_output: None,
-            completed_token_activity_output: None,
-            next_token_activity_request_id: 0,
             pending_rate_limit_reset_request_id: None,
             pending_rate_limit_reset_idempotency_key: None,
             rate_limit_reset_picker_request_id: None,
@@ -158,7 +164,13 @@ impl ChatWidget {
             codex_rate_limit_reached_type: None,
             codex_spend_control_reached: None,
             rate_limit_warnings: RateLimitWarningState::default(),
+            clock_format: crate::clock_format::ClockFormat::system(),
+            usage_notice_state: usage_notice::UsageNoticeState::default(),
             backend_banner_state: backend_banners::BackendBannerState::default(),
+            security_setup_request_id: uuid::Uuid::new_v4(),
+            security_setup_presented: false,
+            security_setup_identity: None,
+            security_setup_dismissed: false,
             automatic_model_switch_state: backend_banners::AutomaticModelSwitchState::default(),
             backend_banner_notice_model: None,
             luna_reserve_notice_account_id: None,
@@ -169,7 +181,7 @@ impl ChatWidget {
             stream_controller: None,
             plan_stream_controller: None,
             pending_stream_consolidations: 0,
-            clipboard_lease: None,
+            pending_clipboard: None,
             copy_last_response_binding,
             running_commands: HashMap::new(),
             collab_agent_metadata: HashMap::new(),
@@ -178,6 +190,8 @@ impl ChatWidget {
             last_unified_wait: None,
             unified_exec_wait_streak: None,
             turn_lifecycle: TurnLifecycleState::new(prevent_idle_sleep),
+            realtime_conversation: RealtimeConversationUiState::default(),
+            realtime_conversation_available_for_thread: false,
             safety_buffering: SafetyBufferingState::default(),
             task_complete_pending: false,
             unified_exec_processes: Vec::new(),
@@ -220,6 +234,7 @@ impl ChatWidget {
             active_side_conversation: false,
             blocks_direct_input: false,
             external_writer_view: false,
+            fork_in_progress: false,
             misalignment_policy_violation: None,
             normal_placeholder_text: placeholder,
             side_placeholder_text: side_placeholder,
@@ -227,9 +242,9 @@ impl ChatWidget {
             interrupted_turn_notice_mode: InterruptedTurnNoticeMode::Default,
             input_queue: InputQueueState::default(),
             safety_buffering_prompt: None,
+            safety_buffering_source: UserMessageSource::Prompt,
             chat_keymap,
             permission_shortcut_pending: false,
-            queued_message_edit_hint_binding,
             show_welcome_banner: is_first_run,
             startup_tooltip_override,
             suppress_session_configured_redraw: false,
@@ -292,6 +307,9 @@ impl ChatWidget {
             usage_limit_resume_auth_reloaded: false,
             marathon_recovery_controller_enabled: std::env::var_os("CODEXMARATHON_LISTEN")
                 .is_some_and(|value| !value.is_empty()),
+            last_rendered_user_message_client_id: None,
+            #[cfg(test)]
+            test_codex_home: None,
         };
 
         widget.prefetch_rate_limits();
@@ -311,21 +329,13 @@ impl ChatWidget {
             .bottom_pane
             .set_collaboration_modes_enabled(/*enabled*/ true);
         widget.sync_service_tier_commands();
-        widget.sync_personality_command_enabled();
         widget.sync_worktrees_enabled();
         widget.sync_plugins_command_enabled();
         widget.sync_goal_command_enabled();
+        widget
+            .bottom_pane
+            .set_voice_command_enabled(/*enabled*/ false);
         widget.sync_mentions_v2_enabled();
-        widget
-            .bottom_pane
-            .set_queued_message_edit_binding(widget.queued_message_edit_hint_binding);
-        #[cfg(target_os = "windows")]
-        widget
-            .bottom_pane
-            .set_windows_degraded_sandbox_active(matches!(
-                crate::windows_sandbox::level_from_config(&widget.config),
-                WindowsSandboxLevel::RestrictedToken
-            ));
         widget.update_collaboration_mode_indicator();
 
         widget
@@ -335,10 +345,6 @@ impl ChatWidget {
             .bottom_pane
             .set_token_activity_command_enabled(widget.has_codex_backend_auth);
         widget.refresh_status_surfaces();
-        widget.bottom_pane.set_astra_sparkle(
-            widget.effective_collaboration_mode().model(),
-            &widget.local_settings.tui,
-        );
 
         widget
     }

@@ -3,6 +3,7 @@ use std::sync::Arc;
 use codex_exec_server_protocol::ExecutorCapabilityDiscoverySnapshot;
 use codex_protocol::ThreadId;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
+use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::protocol::TurnEnvironmentSelection;
 use serde_json::Value;
 
@@ -13,16 +14,22 @@ use crate::ExtensionMetrics;
 pub struct WorldStateContributionInput<'a> {
     pub thread_id: ThreadId,
     pub turn_id: &'a str,
+    /// Resolved model metadata captured for this sampling step, retained across discovery.
+    pub model_info: &'a ModelInfo,
     pub environments: &'a [TurnEnvironmentSelection],
     /// Selected roots whose stable environments are ready in this sampling step.
     pub ready_selected_capability_roots: &'a [SelectedCapabilityRoot],
     /// Executor-materialized capability files shared by all consumers in this exact step.
     pub executor_capability_discovery: Option<&'a ExecutorCapabilityDiscoverySnapshot>,
-    /// Metrics bound to the effective model for this turn.
+    /// Metrics bound to the captured model for this sampling step.
     pub extension_metrics: Option<Arc<dyn ExtensionMetrics>>,
     pub session_store: &'a ExtensionData,
     pub thread_store: &'a ExtensionData,
     pub turn_store: &'a ExtensionData,
+    /// Persisted comparison state from the last recorded step. Its rendered text may have
+    /// left model history; use a retained-fragment matcher before referring back to it.
+    /// After compaction, sections may contain only retained extension metadata.
+    pub previous_world_state: Option<&'a serde_json::Map<String, Value>>,
 }
 
 /// What the harness knows about the previous value of one extension-owned section.

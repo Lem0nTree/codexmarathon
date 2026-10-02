@@ -1,6 +1,6 @@
 //! TUI-only out-of-process reconnection. Each attempt initializes a fresh client and rejoins existing
-//! threads using ordinary resume/history semantics; no user operation is retried.
-//! Offline input and old async completions are quarantined.
+//! threads using ordinary resume/history semantics. Confirmed submissions are reconciled before
+//! unsent queues resume; uncertain submissions and old async completions remain quarantined.
 
 use super::*;
 use crate::app_server_session::ResumeModelSettings;
@@ -18,6 +18,7 @@ pub(super) struct ReconnectState {
     pub(super) offline: bool,
     pub(super) failed: bool,
     pub(super) presentation: ReconnectPresentation,
+    pub(super) seen_version_notice: Option<String>,
 }
 
 pub(super) struct Reconnected {
@@ -50,7 +51,7 @@ pub(super) async fn reconnect(
     // Connecting already has transport deadlines. Give healthy history/inventory hydration one
     // shared budget instead of repeatedly discarding its progress on a short per-attempt timer.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(/*secs*/ 120);
-    for delay in [0, 1, 2, 4, 8] {
+    for delay in [0, 1, 2, 4].into_iter().chain(std::iter::repeat(/*elt*/ 8)) {
         let attempt = async {
             tokio::time::sleep(Duration::from_secs(delay)).await;
             let client = crate::app_server_connection::connect(&target).await?;
@@ -117,10 +118,14 @@ pub(super) async fn reconnect(
         }
         // Transport errors can contain endpoint credentials. Do not render or log them.
     }
-    color_eyre::eyre::bail!("app-server session could not be restored")
+    color_eyre::eyre::bail!("Server connection could not be restored")
 }
 
 impl App {
+    pub(crate) fn is_offline(&self) -> bool {
+        self.reconnect.offline
+    }
+
     // Preserve local choices for future input, without replaying failed settings writes or
     // changing the server's authorization for work that was already admitted.
     pub(super) fn restore_runtime_permissions(
@@ -174,8 +179,27 @@ impl App {
             return false;
         }
         if !self.reconnect.offline {
+            #[cfg(target_os = "windows")]
+            if self.windows_sandbox_setup_is_local()
+                && let Some(message) = self.chat_widget.initial_user_message.take()
+            {
+                self.chat_widget.restore_user_message_to_composer(message);
+            }
+            if let Some(owner) = self.background_voice.as_mut() {
+                owner.reset_realtime_conversation();
+            }
+            self.retire_background_voice();
             self.reconnect.offline = true;
+            // Cached blank sessions are usable only while this connection owns a subscription.
+            self.agents_overview.blank_sessions.clear();
             self.reconnect.failed = false;
+            if self.pending_server_version_notice.take().is_some() {
+                self.reconnect.seen_version_notice = None;
+                self.update_server_version_overview_notice(
+                    CODEX_CLI_VERSION,
+                    /*server_version*/ None,
+                );
+            }
             self.cancel_pending_key_chord();
             self.overlay = None;
             self.commit_animation = None;
@@ -186,6 +210,9 @@ impl App {
             self.agents_overview.request_id = None;
             self.agents_overview.refresh_pending = false;
             self.agents_overview.refresh_notifications.clear();
+            self.agents_overview.pending_usage = None;
+            self.agents_overview.usage_disabled = false;
+            self.agents_overview.usage.clear();
             self.agents_overview.activity.clear();
             self.agents_overview.last_messages.clear();
             self.reconnect.presentation = if self
@@ -198,8 +225,10 @@ impl App {
                 }
                 ReconnectPresentation::Overview
             } else {
-                self.chat_widget
-                    .handle_disconnected_key(KeyEvent::new(KeyCode::Null, KeyModifiers::NONE));
+                self.chat_widget.handle_restricted_key(
+                    KeyEvent::new(KeyCode::Null, KeyModifiers::NONE),
+                    RestrictedInputMode::Disconnected,
+                );
                 ReconnectPresentation::Conversation
             };
             self.chat_widget.pause_for_disconnect();
@@ -218,12 +247,14 @@ impl App {
         app_server: &mut AppServerSession,
         app_event_rx: &mut mpsc::UnboundedReceiver<AppEvent>,
         connected: Reconnected,
+        client_version: &str,
     ) -> Result<()> {
         let Reconnected {
             mut session,
             bootstrap,
             thread,
         } = connected;
+        session.model_provider_override = self.harness_overrides.model_provider.clone();
         let selected = self
             .chat_widget
             .selected_index_for_present_view(agents_overview::AGENTS_OVERVIEW_VIEW_ID)
@@ -231,7 +262,7 @@ impl App {
         let displayed = self.current_displayed_thread_id();
         let mut input = self.chat_widget.capture_thread_input_state();
         if let Some(input) = input.as_mut() {
-            input.recovered_queue = true;
+            input.reconnect_pending = true;
         }
         self.store_active_thread_receiver().await;
         // Old request handles stay attached to the dead connection. Rotating the event channel
@@ -239,17 +270,44 @@ impl App {
         let (tx, rx) = mpsc::unbounded_channel();
         self.app_event_tx = AppEventSender::new(tx);
         *app_event_rx = rx;
+        {
+            let mut state = self
+                .agents_overview
+                .view_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.connection_notice = None;
+            if state.creating_worktree {
+                state.creating_worktree = false;
+                self.pending_managed_worktree_creation = false;
+            }
+        }
         self.agent_navigation.picker_refresh = None;
         self.last_subagent_backfill_attempt = None;
         self.rate_limit_refresh_state.invalidate_recovery();
         session.inherit_task_tool_capabilities(app_server);
         *app_server = session;
+        #[cfg(any(target_os = "windows", test))]
+        let interrupted_windows_setup = self.windows_sandbox.pending_setup.take().is_some();
+        #[cfg(any(target_os = "windows", test))]
+        {
+            if interrupted_windows_setup {
+                self.windows_sandbox.setup_started_at = None;
+                self.chat_widget.clear_windows_sandbox_setup_status();
+                self.chat_widget.windows_sandbox_elevated_setup_complete = false;
+            }
+        }
+        self.chat_widget.snapshot_local_images = self.app_server_target.uses_remote_workspace();
         self.chat_widget.set_local_worktree_operations(
             !crate::uses_remote_workspace_or_environment(
                 &self.app_server_target,
                 self.environment_manager.as_ref(),
             ),
         );
+        self.chat_widget.windows_sandbox_local_server =
+            !self.app_server_target.uses_remote_workspace()
+                && app_server.app_server_platform_os() == Some("windows");
+        self.chat_widget.windows_sandbox_host = WindowsSandboxHost::Unknown;
         self.chat_widget.cyber_policy_notice = Default::default();
         self.chat_widget.requires_openai_auth = bootstrap.requires_openai_auth;
         self.chat_widget.remote_connection =
@@ -267,28 +325,30 @@ impl App {
                 .with_collaboration_modes(bootstrap.collaboration_modes),
         );
         self.pending_app_server_requests.clear();
-        let pending_displayed_profile =
-            displayed.is_some_and(|id| self.pending_server_profiles.contains_key(&id));
-        if pending_displayed_profile {
-            self.runtime_approval_policy_override = None;
-            self.runtime_permission_profile_override = None;
-        }
         // The displayed task was resumed above. Keep offscreen selections pending until those
         // tasks can be resumed from the server too; their old confirmations cannot arrive.
-        if let Some(id) = displayed {
-            self.pending_server_profiles.remove(&id);
+        let pending_displayed_profile =
+            displayed.and_then(|id| self.pending_server_profiles.remove(&id));
+        if let Some(selection) = &pending_displayed_profile {
+            self.runtime_approval_policy_override = None;
+            if selection.approvals_reviewer.is_some() {
+                self.runtime_approvals_reviewer_override = None;
+            }
+            self.runtime_permission_profile_override = None;
         }
         self.pending_primary_events.clear();
         self.pending_plugin_enabled_writes.clear();
         self.pending_hook_enabled_writes.clear();
         self.temporary_structured_requests.clear();
-        self.pending_thread_titles.clear();
+        for (_, cancellation) in self.pending_thread_titles.drain() {
+            cancellation.cancel();
+        }
         self.sync_thread_title_progress();
         self.agents_overview.dispatched_requests.clear();
         self.agents_overview.request_id = None;
         self.agents_overview.refresh_pending = false;
         for input in self.agents_overview.input_states.values_mut() {
-            input.recovered_queue = true;
+            input.reconnect_pending = true;
         }
         self.pending_startup_thread_start = false;
         // Move cached UI state into fresh channels. Old producers retain the old sender/store,
@@ -311,7 +371,7 @@ impl App {
                 .buffer
                 .retain(|event| matches!(event, ThreadBufferedEvent::Notification(_)));
             if let Some(input) = store.input_state.as_mut() {
-                input.recovered_queue = true;
+                input.reconnect_pending = true;
             }
             *replacement.store.lock().await = store;
             *channel = replacement;
@@ -319,12 +379,12 @@ impl App {
         if let Some(id) = self.current_displayed_thread_id()
             && let Some(mut input) = input.clone()
         {
-            input.recovered_queue = true;
+            input.reconnect_pending = true;
             self.agents_overview.input_states.insert(id, input);
         }
         if let Some(mut started) = thread {
             let id = started.session.thread_id;
-            if !pending_displayed_profile
+            if pending_displayed_profile.is_none()
                 && let Some(channel) = self.thread_event_channels.get(&id)
                 && let Some(cached) = channel.store.lock().await.session.as_ref()
             {
@@ -383,15 +443,12 @@ impl App {
                 /*initial_user_message*/ None,
             );
             self.replace_chat_widget(ChatWidget::new_with_app_event(init));
-            self.chat_widget.restore_reconnected_input(input);
+            self.chat_widget.restore_reconnected_input(input, &[]);
         }
         // Discover tasks whose notifications were missed, without clearing retained rows.
         // A hidden overview performs this discovery when it is next opened.
         self.agents_overview.initialized = false;
         if self.reconnect.presentation == ReconnectPresentation::Overview {
-            if let Ok(mut state) = self.agents_overview.view_state.lock() {
-                state.connection_notice = None;
-            }
             let threads = self
                 .agents_overview
                 .threads
@@ -402,6 +459,13 @@ impl App {
             let view = self.agents_overview_view(threads, selected);
             self.chat_widget.show_bottom_pane_view(Box::new(view));
             self.refresh_agents_overview_threads(app_server);
+        }
+        #[cfg(any(target_os = "windows", test))]
+        if interrupted_windows_setup {
+            self.chat_widget.add_error_message(
+                "Windows sandbox setup was interrupted. Restart Codex before using Agent mode."
+                    .to_string(),
+            );
         }
         // Only accept fresh task-tool calls once this connection and its event queue are adopted.
         if let ThreadToolTransport::Mcp(server) = app_server.thread_tool_transport() {
@@ -415,6 +479,12 @@ impl App {
             matches!(bootstrap.auth_mode, Some(TelemetryAuthMode::Chatgpt)),
         );
         if self.chat_widget.has_chatgpt_account() {
+            crate::security_setup::prefetch(
+                &self.config,
+                app_server,
+                self.app_event_tx.clone(),
+                self.chat_widget.security_setup_request_id,
+            );
             crate::daybreak::prefetch_notice(
                 &self.config,
                 app_server,
@@ -422,9 +492,38 @@ impl App {
             );
         }
         self.feedback_audience = bootstrap.feedback_audience;
-        self.chat_widget.add_info_message(
-            "Reconnected. No input was resent. Review uncertain submissions before retrying; recovered queues remain paused.".into(), /*hint*/ None,
+        if displayed.is_some_and(|id| !self.thread_unavailable(id)) {
+            self.chat_widget.maybe_send_next_queued_input();
+        }
+        let connected_notice_key = crate::status::remote_connection::server_version_notice_key(
+            &self.app_server_target,
+            app_server.server_codex_home(),
+            client_version,
+            app_server.server_version(),
         );
+        if !self.local_settings.tui.show_server_version_notice
+            || self.reconnect.seen_version_notice != connected_notice_key
+        {
+            self.reconnect.seen_version_notice = None;
+            self.update_server_version_overview_notice(
+                client_version,
+                /*server_version*/ None,
+            );
+        }
+        if let Some((notice, key)) = crate::status::remote_connection::pending_server_version_notice(
+            &self.local_settings.tui,
+            &self.app_server_target,
+            app_server.server_codex_home(),
+            client_version,
+            app_server.server_version(),
+            self.reconnect.seen_version_notice.as_deref(),
+        ) {
+            self.reconnect.seen_version_notice = Some(key);
+            self.update_server_version_overview_notice(client_version, app_server.server_version());
+            if self.reconnect.presentation != ReconnectPresentation::Overview {
+                self.chat_widget.add_server_version_warning(notice);
+            }
+        }
         Ok(())
     }
 }

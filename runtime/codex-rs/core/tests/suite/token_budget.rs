@@ -37,7 +37,6 @@ use core_test_support::responses::ev_completed_with_tokens;
 use core_test_support::responses::ev_exec_command_call;
 use core_test_support::responses::ev_function_call;
 use core_test_support::responses::ev_response_created;
-use core_test_support::responses::mount_compact_json_once;
 use core_test_support::responses::mount_sse_once;
 use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::sse;
@@ -365,6 +364,100 @@ async fn experimental_context_requires_capable_model_and_codex_backend(
     Ok(())
 }
 
+#[test_case(false, true, false; "explicit_history_notes_without_experimental_capability")]
+#[test_case(false, true, true; "explicit_history_notes_with_experimental_capability")]
+#[test_case(false, false, false; "explicit_standalone_token_budget")]
+#[test_case(true, true, false; "model_default_history_notes_without_experimental_capability")]
+#[test_case(true, true, true; "model_default_history_notes_with_experimental_capability")]
+#[test_case(true, false, false; "model_default_standalone_token_budget")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn token_budget_history_notes_can_be_enabled_without_experimental_context(
+    use_model_defaults: bool,
+    use_history_notes: bool,
+    supports_context: bool,
+) -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let backend_url = format!("{}/backend-api/codex", server.uri());
+    let mut builder = test_codex()
+        .with_auth(CodexAuth::from_external_chatgpt_tokens(
+            "header.e30.signature",
+            "account-123",
+            Some("plus"),
+        )?)
+        .with_pre_build_hook(move |home| {
+            let config = if use_model_defaults {
+                "[features.context_management]\nexperimental_mode = false\n".to_string()
+            } else {
+                format!(
+                    "[features.context_management]\nexperimental_mode = false\n[features.token_budget]\nenabled = true\nuse_history_notes_extension = {use_history_notes}\n"
+                )
+            };
+            std::fs::write(home.join("config.toml"), config)
+                .expect("write token-budget configuration");
+        })
+        .with_model_info_override("gpt-5.2", move |model_info| {
+            model_info.supports_experimental_context = supports_context;
+            let mut defaults = model_token_budget_config();
+            defaults.enabled = use_model_defaults;
+            defaults.use_history_notes_extension = use_history_notes;
+            model_info
+                .model_messages
+                .as_mut()
+                .expect("bundled model should have model messages")
+                .token_budget = Some(defaults);
+        })
+        .with_config(move |config| {
+            config.model_provider.base_url = Some(backend_url);
+            config.model_context_window = Some(CONFIGURED_CONTEXT_WINDOW);
+        });
+    let test = builder.build_with_auto_env(&server).await?;
+
+    let response = mount_sse_sequence(
+        &server,
+        vec![sse_completed("resp-1"), sse_completed("resp-2")],
+    )
+    .await;
+    test.submit_turn("inspect token-budget activation").await?;
+    // Builder overrides are consumed by the initial build. Reapply the model and
+    // provider settings so the cold resume exercises the same activation defaults.
+    let initial_config = test.config.clone();
+    let resumed = builder
+        .with_config(move |config| {
+            config.model = initial_config.model;
+            config.model_catalog = initial_config.model_catalog;
+            config.model_provider = initial_config.model_provider;
+            config.model_context_window = initial_config.model_context_window;
+        })
+        .restart(&server, &test)
+        .await?;
+    resumed
+        .submit_turn("inspect token-budget activation after restart")
+        .await?;
+
+    let requests = response.requests();
+    assert_eq!(requests.len(), 2);
+    for request in requests {
+        assert!(
+            tool_names(&request)
+                .iter()
+                .any(|name| name == "new_context")
+        );
+        assert_eq!(token_budget_contexts(&request).len(), 1);
+        let turn_metadata: Value = serde_json::from_str(
+            &request
+                .header("x-codex-turn-metadata")
+                .expect("request should include turn metadata"),
+        )?;
+        assert_eq!(
+            turn_metadata["history_ingest_requested"].as_bool(),
+            use_history_notes.then_some(true)
+        );
+    }
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn token_budget_uses_model_message_defaults() -> Result<()> {
     skip_if_no_network!(Ok(()));
@@ -377,6 +470,7 @@ async fn token_budget_uses_model_message_defaults() -> Result<()> {
     let expected_guidance = model_defaults.guidance_message.clone();
     let test = test_codex()
         .with_model_info_override("gpt-5.2", move |model_info| {
+            model_info.supports_experimental_context = true;
             model_info
                 .model_messages
                 .as_mut()
@@ -678,7 +772,9 @@ async fn token_budget_context_injects_plain_thread_hint_text() -> Result<()> {
                     environment_id: "local".to_string(),
                     enabled: true,
                     required: false,
+                    startup_readiness: Default::default(),
                     supports_parallel_tool_calls: false,
+                    tool_input_schema_max_bytes: None,
                     omit_tools_from: None,
                     disabled_reason: None,
                     startup_timeout_sec: Some(Duration::from_secs(10)),
@@ -1058,8 +1154,6 @@ async fn token_budget_context_uses_new_window_after_compaction(
         ],
     )
     .await;
-    let compact = mount_compact_json_once(&server, json!({ "output": [] })).await;
-
     let mut model_provider = built_in_model_providers(/*openai_base_url*/ None)["openai"].clone();
     model_provider.base_url = Some(format!("{}/v1", server.uri()));
     model_provider.supports_websockets = false;
@@ -1098,10 +1192,6 @@ async fn token_budget_context_uses_new_window_after_compaction(
 
     let requests = responses.requests();
     assert_eq!(requests.len(), 2);
-    assert!(
-        compact.requests().is_empty(),
-        "token budget compaction should not call server-side compaction"
-    );
 
     let initial_token_budget = token_budget_contexts(&requests[0]);
     assert_eq!(initial_token_budget.len(), 1);
@@ -1541,7 +1631,7 @@ async fn new_context_tool_skips_auto_compact_fallback() -> Result<()> {
         include_instructions: config.include_skill_instructions,
         max_context_tokens: config.skill_max_context_tokens,
         bundled_skills_enabled: config.bundled_skills_enabled(),
-        orchestrator_skills_enabled: config.orchestrator_skills_enabled,
+        cloud_skill_enabled: config.cloud_skill_enabled,
         shadow_selection_enabled: config.features.enabled(Feature::SkillSearch),
     });
     let test = test_codex()
@@ -1598,11 +1688,8 @@ async fn new_context_tool_skips_auto_compact_fallback() -> Result<()> {
     let snapshot = context_snapshot::format_labeled_requests_snapshot(
         "New context window tool installs fresh full context before the next follow-up request.",
         &[("Final Follow-Up Request", &requests[2])],
-        &ContextSnapshotOptions::default(),
+        &ContextSnapshotOptions::default().rewrite_known_segments(),
     );
-    let snapshot = snapshot
-        .replace(&new_first_window_id, "<FIRST_WINDOW_ID>")
-        .replace(&new_window_id, "<WINDOW_ID>");
     insta::assert_snapshot!(
         "token_budget_new_context_window_tool_full_context",
         snapshot
