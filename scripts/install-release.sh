@@ -9,6 +9,7 @@ daemon_dir=$HOME/.local/bin
 unit_dir=$HOME/.config/systemd/user
 unit_dropin_dir=$unit_dir/codexmarathon-accountd.service.d
 unit_dropin=$unit_dropin_dir/10-codex-home.conf
+shared_app_server_disabled=false
 umask 077
 
 die() {
@@ -125,10 +126,14 @@ configure_embedded_app_server() {
     if [ ! -f "$config_toml" ]; then
         printf '[features]\ndaemon_auto_start = false\n' > "$config_toml"
         chmod 0600 "$config_toml"
+        shared_app_server_disabled=true
         return 0
     fi
     # Preserve an explicit choice, including a dotted key in the root table.
     if grep -Eq '^[[:space:]]*(features\.)?daemon_auto_start[[:space:]]*=' "$config_toml"; then
+        if grep -Eq '^[[:space:]]*(features\.)?daemon_auto_start[[:space:]]*=[[:space:]]*false([[:space:]]*(#.*)?)?$' "$config_toml"; then
+            shared_app_server_disabled=true
+        fi
         return 0
     fi
     config_tmp=$(mktemp "$codex_home/.config.toml.XXXXXX") || \
@@ -149,6 +154,7 @@ configure_embedded_app_server() {
     fi
     chmod 0600 "$config_tmp"
     mv -f -- "$config_tmp" "$config_toml"
+    shared_app_server_disabled=true
 }
 
 select_codex_home() {
@@ -282,6 +288,13 @@ systemctl --user enable --now \
     codexmarathon-accountd.socket codexmarathon-accountd.service
 systemctl --user is-active --quiet codexmarathon-accountd.socket
 systemctl --user is-active --quiet codexmarathon-accountd.service
+if [ "$shared_app_server_disabled" = true ]; then
+    # TUI discovery can still reuse an already-running old daemon even with
+    # daemon_auto_start disabled. Stop it so this install uses the embedded
+    # app-server and never mixes the new CLI with an older protocol.
+    "$cli_dir/codex" app-server daemon stop >/dev/null || \
+        die 'could not stop the existing Codex app-server daemon.'
+fi
 attempt=0
 while ! CODEX_HOME="$codex_home" "$cli_dir/codex" marathon accounts --daemon --format json >/dev/null; do
     attempt=$((attempt + 1))
