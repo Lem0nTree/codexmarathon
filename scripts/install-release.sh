@@ -115,6 +115,42 @@ persist_home_config() {
     fi
 }
 
+# The ARM64 archive does not contain the code-mode host and package manifest
+# required by Codex's separate app-server daemon. Keep the TUI in its embedded
+# app-server mode by default; codexmarathon-accountd remains enabled below.
+configure_embedded_app_server() {
+    [ "$(uname -m)" = aarch64 ] || return 0
+    config_toml=$codex_home/config.toml
+    [ ! -L "$config_toml" ] || die 'Codex config.toml must not be a symbolic link.'
+    if [ ! -f "$config_toml" ]; then
+        printf '[features]\ndaemon_auto_start = false\n' > "$config_toml"
+        chmod 0600 "$config_toml"
+        return 0
+    fi
+    # Preserve an explicit choice, including a dotted key in the root table.
+    if grep -Eq '^[[:space:]]*(features\.)?daemon_auto_start[[:space:]]*=' "$config_toml"; then
+        return 0
+    fi
+    config_tmp=$(mktemp "$codex_home/.config.toml.XXXXXX") || \
+        die 'could not create temporary Codex config.'
+    if grep -Eq '^[[:space:]]*\[features\][[:space:]]*(#.*)?$' "$config_toml"; then
+        awk '
+            !added && /^[[:space:]]*\[features\][[:space:]]*(#.*)?$/ {
+                print
+                print "daemon_auto_start = false"
+                added = 1
+                next
+            }
+            { print }
+        ' "$config_toml" > "$config_tmp"
+    else
+        cat "$config_toml" > "$config_tmp"
+        printf '\n[features]\ndaemon_auto_start = false\n' >> "$config_tmp"
+    fi
+    chmod 0600 "$config_tmp"
+    mv -f -- "$config_tmp" "$config_toml"
+}
+
 select_codex_home() {
     if [ "${CODEXMARATHON_CODEX_HOME+x}" = x ]; then
         normalize_path "$CODEXMARATHON_CODEX_HOME"
@@ -200,6 +236,7 @@ fi
 mkdir -p "$cli_dir" "$daemon_dir" "$unit_dir"
 mkdir -p "$codex_home/marathon"
 chmod 0700 "$codex_home" "$codex_home/marathon"
+configure_embedded_app_server
 systemctl --user stop codexmarathon-accountd.socket codexmarathon-accountd.service \
     >/dev/null 2>&1 || true
 

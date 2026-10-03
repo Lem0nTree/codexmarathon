@@ -25,6 +25,12 @@ No separate daemon, SDK, or plugin installation is required. The installer
 enables the user service and socket, enables user lingering for operation after
 logout, and verifies the account API before reporting success.
 
+On Linux ARM64, the installer also sets `features.daemon_auto_start = false`
+unless you have explicitly configured it. The ARM64 archive does not contain
+the complete package required by Codex's separate shared app-server daemon;
+the interactive CLI uses its embedded app-server instead. This does not disable
+the `codexmarathon-accountd` user service.
+
 To use a non-default Codex state directory, pass an absolute path:
 
 ```bash
