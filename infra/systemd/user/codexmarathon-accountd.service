@@ -26,7 +26,7 @@ ProtectSystem=strict
 # Marathon state directory. Hide the credential file and vault explicitly.
 ProtectHome=read-only
 ReadWritePaths=%h/.codex/marathon
-InaccessiblePaths=%h/.codex/auth.json %h/.codex/marathon/vault
+InaccessiblePaths=-%h/.codex/auth.json -%h/.codex/marathon/vault
 PrivateTmp=yes
 ProtectControlGroups=yes
 RestrictNamespaces=yes

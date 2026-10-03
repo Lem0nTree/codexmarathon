@@ -226,7 +226,7 @@ if [ "$custom_codex_home" = true ]; then
         printf 'ReadWritePaths=\n'
         printf 'ReadWritePaths=%s\n' "$(systemd_quote "$codex_home/marathon")"
         printf 'InaccessiblePaths=\n'
-        printf 'InaccessiblePaths=%s %s\n' \
+        printf 'InaccessiblePaths=-%s -%s\n' \
             "$(systemd_quote "$codex_home/auth.json")" \
             "$(systemd_quote "$codex_home/marathon/vault")"
     } > "$override_tmp"
