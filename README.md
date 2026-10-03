@@ -170,11 +170,17 @@ variables.
 The archive is authenticated age encryption with a bounded scrypt work factor.
 Import validates and decrypts the complete archive before changing state,
 stages credentials under fresh vault references, and commits the registry as
-one atomic update. Imported accounts remain inactive, and import never replaces
+one atomic update. Imported accounts start inactive, and import never replaces
 the destination's active `auth.json`. Conflicts default to `skip`; `replace`
 cannot replace the active identity, while `rename` changes only a colliding
 alias. See [Encrypted account backup and restore](docs/account-backup.md) for
 the full workflow and security contract.
+
+After an interactive import writes accounts, the CLI offers an Up/Down picker
+to activate one of the imported or replaced accounts through the normal switch
+path. Escape leaves the imported credentials available without activating one;
+dry runs, no-op imports, and non-terminal `--yes` imports do not prompt. For an
+unattended follow-up, run `codex marathon switch <alias-or-id>` separately.
 
 ## Local account API
 

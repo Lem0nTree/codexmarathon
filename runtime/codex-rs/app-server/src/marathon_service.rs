@@ -433,12 +433,14 @@ impl MarathonService {
         }
 
         let target_account = resolve_target(&state.accounts, target)?;
-        let current_account_id = self
-            .auth_manager
-            .auth_cached()
-            .and_then(|auth| auth.get_account_id())
-            .ok_or(MarathonServiceError::AuthenticationRequired)?;
-        if current_account_id == target_account.id {
+        let current_account_id = match self.auth_manager.auth_cached() {
+            None => None,
+            Some(auth) => Some(
+                auth.get_account_id()
+                    .ok_or(MarathonServiceError::AuthenticationRequired)?,
+            ),
+        };
+        if current_account_id.as_deref() == Some(target_account.id.as_str()) {
             self.registry
                 .set_active_locked(&state_lock, &target_account.id)
                 .map_err(|_| MarathonServiceError::Persistence)?;
@@ -451,34 +453,36 @@ impl MarathonService {
             });
         }
 
-        // Capture any refreshed source credentials through the guarded native
-        // AuthManager API before loading the target snapshot.
-        let source_snapshot = self
-            .auth_manager
-            .snapshot_for_transition(&current_account_id)
-            .await
+        if let Some(current_account_id) = current_account_id.as_deref() {
+            // Capture any refreshed source credentials through the guarded
+            // native AuthManager API before loading the target snapshot.
+            let source_snapshot = self
+                .auth_manager
+                .snapshot_for_transition(current_account_id)
+                .await
+                .map_err(|_| MarathonServiceError::NativeTransition)?;
+            let source_json = serde_json::to_vec(source_snapshot.as_auth_dot_json())
+                .map_err(|_| MarathonServiceError::NativeTransition)?;
+            let source_snapshot = codexmarathon_runtime::AuthSnapshot::from_owned_bytes(
+                Some(current_account_id),
+                source_json,
+            )
             .map_err(|_| MarathonServiceError::NativeTransition)?;
-        let source_json = serde_json::to_vec(source_snapshot.as_auth_dot_json())
-            .map_err(|_| MarathonServiceError::NativeTransition)?;
-        let source_snapshot = codexmarathon_runtime::AuthSnapshot::from_owned_bytes(
-            Some(&current_account_id),
-            source_json,
-        )
-        .map_err(|_| MarathonServiceError::NativeTransition)?;
-        let source_credential_ref = state
-            .accounts
-            .get(&current_account_id)
-            .map(|account| {
-                if account.credential_ref.is_empty() {
-                    account.id.clone()
-                } else {
-                    account.credential_ref.clone()
-                }
-            })
-            .unwrap_or_else(|| current_account_id.clone());
-        self.vault
-            .save_locked(&state_lock, &source_credential_ref, &source_snapshot)
-            .map_err(|_| MarathonServiceError::Persistence)?;
+            let source_credential_ref = state
+                .accounts
+                .get(current_account_id)
+                .map(|account| {
+                    if account.credential_ref.is_empty() {
+                        account.id.clone()
+                    } else {
+                        account.credential_ref.clone()
+                    }
+                })
+                .unwrap_or_else(|| current_account_id.to_string());
+            self.vault
+                .save_locked(&state_lock, &source_credential_ref, &source_snapshot)
+                .map_err(|_| MarathonServiceError::Persistence)?;
+        }
 
         let target_credential_ref = if target_account.credential_ref.is_empty() {
             target_account.id.as_str()
@@ -500,11 +504,19 @@ impl MarathonService {
             return Err(MarathonServiceError::NativeTransition);
         }
 
-        let status = self
-            .auth_manager
-            .install_snapshot_for_transition(target_auth, &current_account_id)
-            .await
-            .map_err(|_| MarathonServiceError::NativeTransition)?;
+        let status = match current_account_id {
+            Some(current_account_id) => {
+                self.auth_manager
+                    .install_snapshot_for_transition(target_auth, &current_account_id)
+                    .await
+            }
+            None => {
+                self.auth_manager
+                    .install_snapshot_for_bootstrap(target_auth)
+                    .await
+            }
+        }
+        .map_err(|_| MarathonServiceError::NativeTransition)?;
         let changed = match status {
             AuthReloadStatus::Reloaded { changed } => changed,
             AuthReloadStatus::Failed => return Err(MarathonServiceError::NativeTransition),

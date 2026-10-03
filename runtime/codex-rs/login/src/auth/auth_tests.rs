@@ -2013,6 +2013,104 @@ async fn auth_manager_transition_write_failure_preserves_file_and_cached_auth() 
     Ok(())
 }
 
+#[tokio::test]
+#[serial(codex_auth_env)]
+async fn auth_manager_bootstrap_transition_installs_into_empty_native_storage() -> anyhow::Result<()>
+{
+    let _access_token_guard = remove_access_token_env_var();
+    let codex_home = tempdir()?;
+    let manager = AuthManager::new(
+        codex_home.path().to_path_buf(),
+        /*enable_codex_api_key_env*/ false,
+        AuthCredentialsStoreMode::File,
+        /*forced_chatgpt_workspace_id*/ None,
+        /*chatgpt_base_url*/ None,
+        AuthKeyringBackendKind::default(),
+        crate::test_support::transport_default_auth_route_config(),
+    )
+    .await;
+    assert!(manager.auth_cached().is_none());
+
+    let target = AuthTransitionSnapshot::from_auth_dot_json(transition_auth(
+        "account-bootstrap",
+        "access-bootstrap",
+    ))?;
+    assert_eq!(
+        manager.install_snapshot_for_bootstrap(target).await?,
+        AuthReloadStatus::Reloaded { changed: true }
+    );
+    assert_eq!(
+        manager.auth_cached().and_then(|auth| auth.get_account_id()),
+        Some("account-bootstrap".to_string())
+    );
+    assert_eq!(
+        FileAuthStorage::new(codex_home.path().to_path_buf())
+            .load()?
+            .and_then(|auth| auth.tokens)
+            .and_then(|tokens| tokens.account_id),
+        Some("account-bootstrap".to_string())
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[serial(codex_auth_env)]
+async fn auth_manager_bootstrap_transition_refuses_active_native_auth() -> anyhow::Result<()> {
+    let _access_token_guard = remove_access_token_env_var();
+    let codex_home = tempdir()?;
+    let manager = AuthManager::from_auth_for_testing_with_home(
+        CodexAuth::create_dummy_chatgpt_auth_for_testing(),
+        codex_home.path().to_path_buf(),
+    );
+    let target = AuthTransitionSnapshot::from_auth_dot_json(transition_auth(
+        "account-bootstrap",
+        "access-bootstrap",
+    ))?;
+
+    let error = manager
+        .install_snapshot_for_bootstrap(target)
+        .await
+        .expect_err("bootstrap must not overwrite active native auth");
+    assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+    assert_eq!(
+        manager.auth_cached().and_then(|auth| auth.get_account_id()),
+        Some("account_id".to_string())
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[serial(codex_auth_env)]
+async fn auth_manager_bootstrap_transition_refuses_unreadable_native_auth() -> anyhow::Result<()> {
+    let _access_token_guard = remove_access_token_env_var();
+    let codex_home = tempdir()?;
+    let auth_file = get_auth_file(codex_home.path());
+    let malformed_auth = b"{not-valid-json".to_vec();
+    std::fs::write(&auth_file, &malformed_auth)?;
+    let manager = AuthManager::new(
+        codex_home.path().to_path_buf(),
+        /*enable_codex_api_key_env*/ false,
+        AuthCredentialsStoreMode::File,
+        /*forced_chatgpt_workspace_id*/ None,
+        /*chatgpt_base_url*/ None,
+        AuthKeyringBackendKind::default(),
+        crate::test_support::transport_default_auth_route_config(),
+    )
+    .await;
+    assert!(manager.auth_cached().is_none());
+
+    let target = AuthTransitionSnapshot::from_auth_dot_json(transition_auth(
+        "account-bootstrap",
+        "access-bootstrap",
+    ))?;
+    manager
+        .install_snapshot_for_bootstrap(target)
+        .await
+        .expect_err("bootstrap must not overwrite unreadable native auth");
+    assert_eq!(std::fs::read(&auth_file)?, malformed_auth);
+    Ok(())
+}
+
 async fn build_config(
     codex_home: &Path,
     forced_login_method: Option<ForcedLoginMethod>,

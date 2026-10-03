@@ -322,6 +322,7 @@ async fn start_client_with_prepared(
     .await?)
 }
 
+#[derive(Clone)]
 struct PreparedConfig {
     config: Config,
     cli_overrides: Vec<(String, toml::Value)>,
@@ -499,10 +500,10 @@ async fn run_backup_import(
     {
         reject_live_account_replacement(
             &preview.replaced,
-            prepared,
+            prepared.clone(),
             strict_config,
-            arg0_paths,
-            loader_overrides,
+            arg0_paths.clone(),
+            loader_overrides.clone(),
         )
         .await?;
     }
@@ -516,6 +517,16 @@ async fn run_backup_import(
         let report = transfer::import_accounts(config, &args.input, passphrase, conflict, false)
             .map_err(transfer_error)?;
         print_import_report(&report, false);
+        if interactive {
+            maybe_activate_imported_account(
+                &report,
+                prepared,
+                strict_config,
+                arg0_paths,
+                loader_overrides,
+            )
+            .await?;
+        }
         return Ok(());
     }
 
@@ -534,7 +545,87 @@ async fn run_backup_import(
     let report = transfer::import_accounts(config, &args.input, passphrase, conflict, false)
         .map_err(transfer_error)?;
     print_import_report(&report, false);
+    maybe_activate_imported_account(
+        &report,
+        prepared,
+        strict_config,
+        arg0_paths,
+        loader_overrides,
+    )
+    .await?;
     Ok(())
+}
+
+async fn maybe_activate_imported_account(
+    report: &transfer::ImportReport,
+    prepared: PreparedConfig,
+    strict_config: bool,
+    arg0_paths: Arg0DispatchPaths,
+    loader_overrides: LoaderOverrides,
+) -> anyhow::Result<()> {
+    let candidates = imported_account_candidates(report);
+    if candidates.is_empty() {
+        return Ok(());
+    }
+
+    let target = match choose_imported_account(&candidates) {
+        Ok(target) => target,
+        Err(error) => {
+            anyhow::bail!(
+                "backup import completed, but account activation selection failed: {error}; "
+                    "the imported accounts remain available; retry with `codex marathon switch "
+                    "<alias-or-id>`"
+            );
+        }
+    };
+    let Some(target) = target else {
+        println!("Account activation canceled; imported accounts remain available.");
+        return Ok(());
+    };
+    let target_for_error = target.clone();
+    if let Err(error) = activate_imported_account(
+        target,
+        prepared,
+        strict_config,
+        arg0_paths,
+        loader_overrides,
+    )
+    .await
+    {
+        anyhow::bail!(
+            "backup import completed, but activating `{target_for_error}` failed: {error}; "
+                "the imported accounts remain available; retry with `codex marathon switch "
+                "{target_for_error}`"
+        );
+    }
+    Ok(())
+}
+
+fn imported_account_candidates(report: &transfer::ImportReport) -> Vec<transfer::AccountSummary> {
+    if report.dry_run {
+        return Vec::new();
+    }
+    report
+        .imported
+        .iter()
+        .chain(report.replaced.iter())
+        .cloned()
+        .collect()
+}
+
+async fn activate_imported_account(
+    target: String,
+    prepared: PreparedConfig,
+    strict_config: bool,
+    arg0_paths: Arg0DispatchPaths,
+    loader_overrides: LoaderOverrides,
+) -> anyhow::Result<()> {
+    let mut client =
+        start_client_with_prepared(prepared, strict_config, arg0_paths, loader_overrides).await?;
+    let result = run_action(&mut client, MarathonAction::Switch { target }).await;
+    let shutdown_result = client.shutdown().await;
+    result?;
+    shutdown_result.map_err(anyhow::Error::from)
 }
 
 async fn checkpoint_before_export(
@@ -833,6 +924,90 @@ fn account_picker_loop(accounts: &[transfer::AccountSummary]) -> anyhow::Result<
             _ => {}
         }
     }
+}
+
+fn choose_imported_account(
+    accounts: &[transfer::AccountSummary],
+) -> anyhow::Result<Option<String>> {
+    if accounts.is_empty() {
+        return Ok(None);
+    }
+    terminal::enable_raw_mode()?;
+    let guard = RawModeGuard;
+    let result = imported_account_picker_loop(accounts);
+    drop(guard);
+    writeln!(io::stderr())?;
+    result
+}
+
+fn imported_account_picker_loop(
+    accounts: &[transfer::AccountSummary],
+) -> anyhow::Result<Option<String>> {
+    let mut cursor = 0usize;
+    let mut rendered_lines = 0usize;
+    let mut stderr = io::stderr();
+
+    loop {
+        rendered_lines =
+            render_imported_account_picker(&mut stderr, accounts, cursor, rendered_lines)?;
+        let Event::Key(key) = event::read()? else {
+            continue;
+        };
+        if key.kind != KeyEventKind::Press {
+            continue;
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
+        {
+            return Ok(None);
+        }
+        match key.code {
+            KeyCode::Up => {
+                cursor = if cursor == 0 {
+                    accounts.len() - 1
+                } else {
+                    cursor - 1
+                };
+            }
+            KeyCode::Down => {
+                cursor = (cursor + 1) % accounts.len();
+            }
+            KeyCode::Enter => return Ok(Some(accounts[cursor].id.clone())),
+            KeyCode::Esc => return Ok(None),
+            _ => {}
+        }
+    }
+}
+
+fn render_imported_account_picker(
+    stderr: &mut io::Stderr,
+    accounts: &[transfer::AccountSummary],
+    cursor: usize,
+    rendered_lines: usize,
+) -> anyhow::Result<usize> {
+    if rendered_lines > 0 {
+        execute!(
+            stderr,
+            cursor::MoveToColumn(0),
+            cursor::MoveUp(rendered_lines as u16),
+            terminal::Clear(ClearType::FromCursorDown)
+        )?;
+    }
+    write!(
+        stderr,
+        "Select an imported account to activate (Up/Down, Enter confirm, Esc cancel):\r\n"
+    )?;
+    for (index, account) in accounts.iter().enumerate() {
+        let pointer = if index == cursor { ">" } else { " " };
+        let alias = if account.alias.is_empty() {
+            "(no alias)"
+        } else {
+            account.alias.as_str()
+        };
+        write!(stderr, "{pointer} {alias} ({})\r\n", account.id)?;
+    }
+    stderr.flush()?;
+    Ok(accounts.len() + 1)
 }
 
 fn render_account_picker(
@@ -1603,5 +1778,68 @@ mod tests {
 
         assert!(replacement_includes_account(&accounts, "account-a"));
         assert!(!replacement_includes_account(&accounts, "account-c"));
+    }
+
+    #[test]
+    fn imported_account_candidates_only_include_written_accounts() {
+        let report = transfer::ImportReport {
+            imported: vec![transfer::AccountSummary {
+                id: "account-a".to_string(),
+                alias: "personal".to_string(),
+            }],
+            replaced: vec![transfer::AccountSummary {
+                id: "account-b".to_string(),
+                alias: "work".to_string(),
+            }],
+            skipped: vec![transfer::AccountSummary {
+                id: "account-c".to_string(),
+                alias: "archive".to_string(),
+            }],
+            dry_run: false,
+        };
+
+        assert_eq!(
+            imported_account_candidates(&report),
+            vec![
+                transfer::AccountSummary {
+                    id: "account-a".to_string(),
+                    alias: "personal".to_string(),
+                },
+                transfer::AccountSummary {
+                    id: "account-b".to_string(),
+                    alias: "work".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn imported_account_candidates_are_empty_for_noop_imports() {
+        let report = transfer::ImportReport {
+            imported: Vec::new(),
+            replaced: Vec::new(),
+            skipped: vec![transfer::AccountSummary {
+                id: "account-a".to_string(),
+                alias: "personal".to_string(),
+            }],
+            dry_run: false,
+        };
+
+        assert!(imported_account_candidates(&report).is_empty());
+    }
+
+    #[test]
+    fn imported_account_candidates_are_empty_for_dry_runs() {
+        let report = transfer::ImportReport {
+            imported: vec![transfer::AccountSummary {
+                id: "account-a".to_string(),
+                alias: "personal".to_string(),
+            }],
+            replaced: Vec::new(),
+            skipped: Vec::new(),
+            dry_run: true,
+        };
+
+        assert!(imported_account_candidates(&report).is_empty());
     }
 }

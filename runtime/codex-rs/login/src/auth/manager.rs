@@ -2686,6 +2686,55 @@ impl AuthManager {
         Ok(AuthReloadStatus::Reloaded { changed })
     }
 
+    /// Persist and activate a validated managed ChatGPT snapshot on a native
+    /// manager that is completely unauthenticated.
+    ///
+    /// Bootstrap is intentionally separate from an account transition. It
+    /// takes the same refresh guard and native storage path, but it refuses to
+    /// overwrite cached auth or any auth discoverable from the configured
+    /// native sources. Callers must use the normal transition API once an
+    /// account is active.
+    pub async fn install_snapshot_for_bootstrap(
+        &self,
+        snapshot: AuthTransitionSnapshot,
+    ) -> std::io::Result<AuthReloadStatus> {
+        let _refresh_guard = self
+            .refresh_lock
+            .acquire()
+            .await
+            .map_err(|_| std::io::Error::other("auth transition guard is unavailable"))?;
+        self.ensure_transition_storage()?;
+        if self.auth_cached().is_some() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "native auth is already active",
+            ));
+        }
+
+        // Read through the same native loader used at startup. This catches
+        // persisted, ephemeral, environment-provided, and malformed auth
+        // sources before the bootstrap can write over them.
+        if self.load_auth_from_storage().await?.is_some() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "native auth is already available",
+            ));
+        }
+
+        let candidate = self.auth_from_transition_snapshot(&snapshot).await?;
+        let storage = create_auth_storage(
+            self.codex_home.clone(),
+            self.auth_credentials_store_mode,
+            self.keyring_backend_kind,
+        );
+        storage
+            .save(snapshot.as_auth_dot_json())
+            .map_err(|_| std::io::Error::other("managed auth snapshot could not be persisted"))?;
+
+        let changed = self.set_cached_auth_after_transition(candidate)?;
+        Ok(AuthReloadStatus::Reloaded { changed })
+    }
+
     fn set_cached_auth_after_transition(&self, new_auth: CodexAuth) -> std::io::Result<bool> {
         let mut guard = self
             .inner

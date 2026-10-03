@@ -46,6 +46,11 @@ replaced, and skipped profiles before confirmation. Because the archive is
 revalidated and the plan is recalculated under the write lock, a later state
 change cannot silently reuse a stale preview.
 
+After the import completes, use Up/Down and Enter to activate one of the
+imported or replaced profiles. Escape cancels activation and keeps the imported
+profiles available. Dry runs, imports that write no profiles, and unattended
+imports do not show the picker.
+
 ## Explicit and unattended operation
 
 Repeat `--account` with stable account IDs, or use `--all`:
@@ -88,10 +93,11 @@ Use `--conflict` on import:
 - `rename` preserves IDs and snapshots but assigns a numbered alias when an
   imported alias collides with an unrelated destination profile.
 
-Imported profiles are inactive. Import preserves the destination's active
-account, enabled setting, active native credentials, and `auth.json`. Use
-`codex marathon switch <alias-or-id>` after import to install one imported
-snapshot through the normal native AuthManager path.
+The import transaction preserves the destination's active account, enabled
+setting, active native credentials, and `auth.json`. The subsequent interactive
+picker activates only the profile you select through the native AuthManager.
+You can also run `codex marathon switch <alias-or-id>` after import, including
+on a fresh installation with no active native login.
 
 ## Archive and transaction security
 
