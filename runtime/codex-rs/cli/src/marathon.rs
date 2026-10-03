@@ -1383,8 +1383,14 @@ async fn login_and_import(
         other => anyhow::bail!("native ChatGPT login returned unexpected response: {other:?}"),
     };
 
+    // Native device authentication allows 15 minutes. Keep the coordinator
+    // alive through that window and delivery of the completion notification.
+    let login_timeout = match mode {
+        LoginMode::DeviceCode => Duration::from_secs(16 * 60),
+        LoginMode::Browser => Duration::from_secs(10 * 60),
+    };
     let completion = tokio::time::timeout(
-        Duration::from_secs(10 * 60),
+        login_timeout,
         wait_for_login_completion(client, &login_id),
     )
     .await
