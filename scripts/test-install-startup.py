@@ -66,6 +66,7 @@ if "enable" in args:
     (p / "enabled").touch()
 ''')
         executable(package / "codexmarathon-accountd", '#!/bin/sh\nexit 0\n')
+        executable(package / "codex-code-mode-host", '#!/bin/sh\nexit 0\n')
         executable(package / "codex", '''#!/usr/bin/env python3
 import json, os, subprocess, sys
 from pathlib import Path

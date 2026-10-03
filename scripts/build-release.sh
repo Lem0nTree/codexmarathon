@@ -10,13 +10,16 @@ version="${CODEXMARATHON_VERSION:-codexmarathon-dev}"
 case "$target" in
   aarch64-unknown-linux-gnu)
     # rusty_v8 does not publish the sandboxed code-mode-host archive for Linux ARM64.
-    # The primary Codex CLI and its sandbox helper remain fully native on this target.
-    binaries=(codex codexmarathon-accountd bwrap)
+    # Use the pinned upstream helper while keeping the primary Codex CLI and its
+    # sandbox helper fully native on this target.
+    binaries=(codex codexmarathon-accountd codex-code-mode-host bwrap)
     asset_platform=linux-aarch64
+    use_upstream_code_mode_host=true
     ;;
   *linux*)
     binaries=(codex codexmarathon-accountd codex-code-mode-host codex-responses-api-proxy bwrap)
     asset_platform=linux-x86_64
+    use_upstream_code_mode_host=false
     ;;
   *)
     echo "scripts/build-release.sh supports Linux targets; use build-release.ps1 on Windows." >&2
@@ -42,9 +45,21 @@ mkdir -p "${output_dir}"
 archive="${output_dir}/${version}-${asset_platform}.tar.gz"
 package_dir="$(mktemp -d "${TMPDIR:-/tmp}/codexmarathon-release.XXXXXX")"
 trap 'rm -rf -- "$package_dir"' EXIT
+if [[ "$use_upstream_code_mode_host" == true ]]; then
+  sh "${repo_root}/scripts/fetch-code-mode-host.sh" "${package_dir}/codex-code-mode-host"
+fi
 for binary in "${binaries[@]}"; do
-  strip --strip-debug --strip-unneeded "${runtime_dir}/target/${target}/release/${binary}"
-  install -m 0755 "${runtime_dir}/target/${target}/release/${binary}" "${package_dir}/${binary}"
+  if [[ "$binary" == codex-code-mode-host && "$use_upstream_code_mode_host" == true ]]; then
+    install -m 0755 "${package_dir}/${binary}" "${output_dir}/${binary}"
+    continue
+  fi
+  binary_path="${runtime_dir}/target/${target}/release/${binary}"
+  [ -f "$binary_path" ] || {
+    echo "Required release binary was not built: $binary_path" >&2
+    exit 1
+  }
+  strip --strip-debug --strip-unneeded "$binary_path"
+  install -m 0755 "$binary_path" "${package_dir}/${binary}"
   install -m 0755 "${package_dir}/${binary}" "${output_dir}/${binary}"
 done
 install -Dm0755 "${repo_root}/scripts/install-release.sh" "${package_dir}/install-codexmarathon"
@@ -58,4 +73,5 @@ tar -C "$package_dir" -czf "$archive" .
 archive_manifest="$(tar -tzf "$archive")"
 grep -Fxq './install-codexmarathon' <<<"$archive_manifest"
 grep -Fxq './systemd/user/codexmarathon-accountd.service' <<<"$archive_manifest"
+grep -Fxq './codex-code-mode-host' <<<"$archive_manifest"
 echo "CodexMarathon package created at $archive (${binaries[*]})."

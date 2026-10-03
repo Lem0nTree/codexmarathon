@@ -6,8 +6,9 @@ account daemon, its automatic installer and user systemd units, plus every
 sibling executable the Codex CLI package expects:
 
 - Linux: `codex`, `codexmarathon-accountd`, `codex-code-mode-host`,
-  `codex-responses-api-proxy`, and `bwrap`. Linux ARM64 omits the unavailable
-  code-mode host and responses proxy.
+  `codex-responses-api-proxy`, and `bwrap`. Linux ARM64 includes the native
+  CLI and sandbox helper plus the pinned upstream `codex-code-mode-host`; the
+  responses proxy remains unavailable on that target.
 - Windows: `codex.exe`, `codex-code-mode-host.exe`,
   `codex-responses-api-proxy.exe`, `codex-command-runner.exe`, and
   `codex-windows-sandbox-setup.exe`.
@@ -37,6 +38,14 @@ owner-private `$XDG_CONFIG_HOME/codexmarathon/config.json` (falling back to
 `$HOME/.config`), which the modified CLI and daemon resolve automatically.
 It does not alter shell startup files.
 
+Linux ARM64 uses the unmodified `codex-code-mode-host-aarch64-unknown-linux-musl`
+asset from upstream Codex `rust-v0.160.0` because the local V8 archive is not
+available for that target. The release build verifies SHA-256
+`94066fdf13ffecd2f58776ec5cb8fc3040283a642e3d6ff25c5d82048c41038e` before
+extracting the required archive entry. The installer requires
+`codex-code-mode-host` during its preflight and fails before changing the user
+installation when it is absent.
+
 Registry mutations in v0.155.0 and later upgrade the Marathon registry from
 schema v1 to v2 for fresh credential references and batch commits. New builds
 read v1, while older builds reject v2. Stop old CodexMarathon CLI processes
@@ -64,7 +73,8 @@ commit used for the tested archive.
 From the repository root:
 
 ```bash
-sh -n scripts/install.sh scripts/install-release.sh scripts/test-install-release.sh
+sh -n scripts/install.sh scripts/install-release.sh scripts/test-install-release.sh \
+  scripts/fetch-code-mode-host.sh
 scripts/test-install-release.sh
 python3 scripts/verify_provenance.py --root .
 cd runtime/codex-rs

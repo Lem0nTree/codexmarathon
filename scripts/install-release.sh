@@ -182,6 +182,7 @@ require_file() {
 
 require_file codex
 require_file codexmarathon-accountd
+require_file codex-code-mode-host
 require_file systemd/user/codexmarathon-accountd.service
 require_file systemd/user/codexmarathon-accountd.socket
 command -v systemctl >/dev/null 2>&1 || {
@@ -218,12 +219,29 @@ configure_embedded_app_server
 systemctl --user stop codexmarathon-accountd.socket codexmarathon-accountd.service \
     >/dev/null 2>&1 || true
 
+install_binary_atomically() {
+    source=$1
+    destination=$2
+    destination_dir=${destination%/*}
+    destination_name=${destination##*/}
+    temporary_destination=$(mktemp "$destination_dir/.$destination_name.XXXXXX") ||
+        die "could not create a temporary destination for $destination_name."
+    if ! install -m 0755 "$source" "$temporary_destination"; then
+        rm -f -- "$temporary_destination"
+        die "could not stage $destination_name."
+    fi
+    if ! mv -fT -- "$temporary_destination" "$destination"; then
+        rm -f -- "$temporary_destination"
+        die "could not install $destination_name."
+    fi
+}
+
 for binary in codex codex-code-mode-host codex-responses-api-proxy bwrap; do
     if [ -f "$package_dir/$binary" ]; then
-        install -m 0755 "$package_dir/$binary" "$cli_dir/$binary"
+        install_binary_atomically "$package_dir/$binary" "$cli_dir/$binary"
     fi
 done
-install -m 0755 "$package_dir/codexmarathon-accountd" \
+install_binary_atomically "$package_dir/codexmarathon-accountd" \
     "$daemon_dir/codexmarathon-accountd"
 install -m 0644 "$package_dir/systemd/user/codexmarathon-accountd.service" \
     "$unit_dir/codexmarathon-accountd.service"

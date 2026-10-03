@@ -29,6 +29,7 @@ if [ "$*" = "features disable daemon_auto_start" ]; then
     printf "[features]\\ndaemon_auto_start = false\\n" > "$CODEX_HOME/config.toml"
 fi
 exit 0'
+make_executable "$package_dir/codex-code-mode-host" 'exit 0'
 make_executable "$package_dir/codexmarathon-accountd" 'exit 0'
 printf '%s\n' '[Unit]' 'Description=test accountd' '[Service]' 'Type=exec' \
     'ExecStart=/bin/true' > \
@@ -43,10 +44,17 @@ export XDG_CONFIG_HOME="$tmp_root/xdg config"
 custom_home="$tmp_root/custom Codex \"Home\" \\state"
 fallback_home="$tmp_root/fallback Codex Home"
 override=$HOME/.config/systemd/user/codexmarathon-accountd.service.d/10-codex-home.conf
+mkdir -p "$HOME/.local/bin"
+printf 'legacy helper\n' > "$tmp_root/legacy-code-mode-host"
+ln -s "$tmp_root/legacy-code-mode-host" "$HOME/.local/bin/codex-code-mode-host"
 
 CODEX_HOME="$tmp_root//custom Codex \"Home\" \\state/" \
 CODEXMARATHON_CODEX_HOME="$custom_home" \
     sh "$repo_root/scripts/install-release.sh" "$package_dir" >/dev/null
+[ ! -L "$HOME/.local/bin/codex-code-mode-host" ] || \
+    fail 'code-mode host install retained an existing destination symlink'
+[ "$(cat "$tmp_root/legacy-code-mode-host")" = 'legacy helper' ] || \
+    fail 'code-mode host install followed an existing destination symlink'
 [ -f "$override" ] || fail 'custom CODEX_HOME did not create the drop-in'
 [ -d "$custom_home/marathon" ] || fail 'custom Marathon state directory was not created'
 config_file=$XDG_CONFIG_HOME/codexmarathon/config.json
@@ -104,5 +112,18 @@ if XDG_CONFIG_HOME=relative CODEXMARATHON_CODEX_HOME="$custom_home" \
     sh "$repo_root/scripts/install-release.sh" "$package_dir" >/dev/null 2>&1; then
     fail 'relative XDG_CONFIG_HOME was accepted'
 fi
+
+incomplete_package=$tmp_root/incomplete-package
+cp -a "$package_dir" "$incomplete_package"
+mv "$incomplete_package/codex-code-mode-host" "$tmp_root/held-code-mode-host"
+incomplete_home=$tmp_root/incomplete-home
+if HOME="$incomplete_home" \
+    CODEXMARATHON_INSTALL_DIR="$incomplete_home/.local/bin" \
+    CODEXMARATHON_CODEX_HOME="$incomplete_home/.codex" \
+    sh "$repo_root/scripts/install-release.sh" "$incomplete_package" >/dev/null 2>&1; then
+    fail 'incomplete release without code-mode host was accepted'
+fi
+[ ! -e "$incomplete_home" ] || \
+    fail 'incomplete release mutated the install target before preflight completed'
 
 printf 'installer acceptance tests passed\n'
