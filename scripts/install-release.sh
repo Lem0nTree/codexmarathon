@@ -245,7 +245,12 @@ systemctl --user enable --now \
     codexmarathon-accountd.socket codexmarathon-accountd.service
 systemctl --user is-active --quiet codexmarathon-accountd.socket
 systemctl --user is-active --quiet codexmarathon-accountd.service
-CODEX_HOME="$codex_home" "$cli_dir/codex" marathon accounts --daemon --format json >/dev/null
+attempt=0
+while ! CODEX_HOME="$codex_home" "$cli_dir/codex" marathon accounts --daemon --format json >/dev/null; do
+    attempt=$((attempt + 1))
+    [ "$attempt" -lt 3 ] || die 'accountd did not respond after three attempts.'
+    sleep 1
+done
 
 printf 'Installed CodexMarathon CLI to %s/codex\n' "$cli_dir"
 printf 'Installed and started codexmarathon-accountd for user %s\n' "$(id -un)"
