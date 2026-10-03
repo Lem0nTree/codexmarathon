@@ -572,9 +572,7 @@ async fn maybe_activate_imported_account(
         Ok(target) => target,
         Err(error) => {
             anyhow::bail!(
-                "backup import completed, but account activation selection failed: {error}; "
-                    "the imported accounts remain available; retry with `codex marathon switch "
-                    "<alias-or-id>`"
+                "backup import completed, but account activation selection failed: {error}; the imported accounts remain available; retry with `codex marathon switch <alias-or-id>`"
             );
         }
     };
@@ -593,9 +591,7 @@ async fn maybe_activate_imported_account(
     .await
     {
         anyhow::bail!(
-            "backup import completed, but activating `{target_for_error}` failed: {error}; "
-                "the imported accounts remain available; retry with `codex marathon switch "
-                "{target_for_error}`"
+            "backup import completed, but activating `{target_for_error}` failed: {error}; the imported accounts remain available; retry with `codex marathon switch {target_for_error}`"
         );
     }
     Ok(())
