@@ -116,44 +116,16 @@ persist_home_config() {
     fi
 }
 
-# The ARM64 archive does not contain the code-mode host and package manifest
-# required by Codex's separate app-server daemon. Keep the TUI in its embedded
-# app-server mode by default; codexmarathon-accountd remains enabled below.
+# The ARM64 archive cannot run Codex's separately packaged app-server daemon.
+# Use Codex's own TOML editor to support every config layout without changing
+# unrelated settings. Marathon's account metadata service stays enabled.
 configure_embedded_app_server() {
-    [ "$(uname -m)" = aarch64 ] || return 0
+    case "$(uname -m)" in aarch64|arm64) ;; *) return 0 ;; esac
     config_toml=$codex_home/config.toml
     [ ! -L "$config_toml" ] || die 'Codex config.toml must not be a symbolic link.'
-    if [ ! -f "$config_toml" ]; then
-        printf '[features]\ndaemon_auto_start = false\n' > "$config_toml"
-        chmod 0600 "$config_toml"
-        shared_app_server_disabled=true
-        return 0
-    fi
-    # Preserve an explicit choice, including a dotted key in the root table.
-    if grep -Eq '^[[:space:]]*(features\.)?daemon_auto_start[[:space:]]*=' "$config_toml"; then
-        if grep -Eq '^[[:space:]]*(features\.)?daemon_auto_start[[:space:]]*=[[:space:]]*false([[:space:]]*(#.*)?)?$' "$config_toml"; then
-            shared_app_server_disabled=true
-        fi
-        return 0
-    fi
-    config_tmp=$(mktemp "$codex_home/.config.toml.XXXXXX") || \
-        die 'could not create temporary Codex config.'
-    if grep -Eq '^[[:space:]]*\[features\][[:space:]]*(#.*)?$' "$config_toml"; then
-        awk '
-            !added && /^[[:space:]]*\[features\][[:space:]]*(#.*)?$/ {
-                print
-                print "daemon_auto_start = false"
-                added = 1
-                next
-            }
-            { print }
-        ' "$config_toml" > "$config_tmp"
-    else
-        cat "$config_toml" > "$config_tmp"
-        printf '\n[features]\ndaemon_auto_start = false\n' >> "$config_tmp"
-    fi
-    chmod 0600 "$config_tmp"
-    mv -f -- "$config_tmp" "$config_toml"
+    CODEX_HOME="$codex_home" "$package_dir/codex" features disable daemon_auto_start >/dev/null ||
+        die 'could not configure the embedded app-server; check config.toml.'
+    chmod 0600 "$config_toml"
     shared_app_server_disabled=true
 }
 
@@ -284,6 +256,8 @@ fi
 persist_home_config
 
 systemctl --user daemon-reload
+# Recover installs that previously exhausted the namespace/startup retry limit.
+systemctl --user reset-failed codexmarathon-accountd.socket codexmarathon-accountd.service
 systemctl --user enable --now \
     codexmarathon-accountd.socket codexmarathon-accountd.service
 systemctl --user is-active --quiet codexmarathon-accountd.socket
@@ -292,7 +266,7 @@ if [ "$shared_app_server_disabled" = true ]; then
     # TUI discovery can still reuse an already-running old daemon even with
     # daemon_auto_start disabled. Stop it so this install uses the embedded
     # app-server and never mixes the new CLI with an older protocol.
-    "$cli_dir/codex" app-server daemon stop >/dev/null || \
+    CODEX_HOME="$codex_home" "$cli_dir/codex" app-server daemon stop >/dev/null || \
         die 'could not stop the existing Codex app-server daemon.'
 fi
 attempt=0

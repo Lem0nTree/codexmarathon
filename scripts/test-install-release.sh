@@ -24,7 +24,11 @@ package_dir=$tmp_root/package
 mkdir -p "$stub_bin" "$package_dir/systemd/user"
 make_executable "$stub_bin/systemctl" 'exit 0'
 make_executable "$stub_bin/loginctl" 'exit 0'
-make_executable "$package_dir/codex" 'exit 0'
+make_executable "$package_dir/codex" '
+if [ "$*" = "features disable daemon_auto_start" ]; then
+    printf "[features]\\ndaemon_auto_start = false\\n" > "$CODEX_HOME/config.toml"
+fi
+exit 0'
 make_executable "$package_dir/codexmarathon-accountd" 'exit 0'
 printf '%s\n' '[Unit]' 'Description=test accountd' '[Service]' 'Type=exec' \
     'ExecStart=/bin/true' > \
