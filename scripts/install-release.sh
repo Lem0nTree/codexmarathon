@@ -295,7 +295,8 @@ persist_home_config
 
 systemctl --user daemon-reload
 # Recover installs that previously exhausted the namespace/startup retry limit.
-systemctl --user reset-failed codexmarathon-accountd.socket codexmarathon-accountd.service codexmarathon-reset-executor.service
+# Fresh units may not be loaded yet; this recovery is advisory.
+systemctl --user reset-failed codexmarathon-accountd.socket codexmarathon-accountd.service codexmarathon-reset-executor.service || true
 systemctl --user enable --now \
     codexmarathon-accountd.socket codexmarathon-accountd.service codexmarathon-reset-executor.service
 systemctl --user is-active --quiet codexmarathon-accountd.socket

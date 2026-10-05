@@ -22,7 +22,14 @@ make_executable() {
 stub_bin=$tmp_root/bin
 package_dir=$tmp_root/package
 mkdir -p "$stub_bin" "$package_dir/systemd/user"
-make_executable "$stub_bin/systemctl" 'exit 0'
+make_executable "$stub_bin/systemctl" '
+if [ -n "${INSTALL_TEST_SYSTEMCTL_LOG:-}" ]; then
+    printf "%s\\n" "$*" >> "$INSTALL_TEST_SYSTEMCTL_LOG"
+fi
+if [ "$2" = "${INSTALL_TEST_SYSTEMCTL_FAIL_ACTION:-}" ]; then
+    exit 1
+fi
+exit 0'
 make_executable "$stub_bin/loginctl" 'exit 0'
 make_executable "$package_dir/codex" '
 if [ "$*" = "features disable daemon_auto_start" ]; then
@@ -55,7 +62,16 @@ ln -s "$tmp_root/legacy-code-mode-host" "$HOME/.local/bin/codex-code-mode-host"
 
 CODEX_HOME="$tmp_root//custom Codex \"Home\" \\state/" \
 CODEXMARATHON_CODEX_HOME="$custom_home" \
+INSTALL_TEST_SYSTEMCTL_LOG="$tmp_root/systemctl.log" \
+INSTALL_TEST_SYSTEMCTL_FAIL_ACTION=reset-failed \
     sh "$repo_root/scripts/install-release.sh" "$package_dir" >/dev/null
+grep -F -- '--user reset-failed ' "$tmp_root/systemctl.log" >/dev/null || \
+    fail 'fresh install did not exercise the reset-failed recovery'
+grep -F -- '--user enable --now ' "$tmp_root/systemctl.log" >/dev/null || \
+    fail 'reset-failed error prevented mandatory startup'
+grep -F -- '--user is-active --quiet codexmarathon-reset-executor.service' \
+    "$tmp_root/systemctl.log" >/dev/null || \
+    fail 'reset-failed error prevented executor startup verification'
 [ ! -L "$HOME/.local/bin/codex-code-mode-host" ] || \
     fail 'code-mode host install retained an existing destination symlink'
 [ "$(cat "$tmp_root/legacy-code-mode-host")" = 'legacy helper' ] || \
@@ -137,5 +153,13 @@ if HOME="$incomplete_home" \
 fi
 [ ! -e "$incomplete_home" ] || \
     fail 'incomplete release mutated the install target before preflight completed'
+
+for startup_action in enable is-active; do
+    if INSTALL_TEST_SYSTEMCTL_FAIL_ACTION="$startup_action" \
+        CODEXMARATHON_CODEX_HOME="$custom_home" CODEX_HOME="$custom_home" \
+        sh "$repo_root/scripts/install-release.sh" "$package_dir" >/dev/null 2>&1; then
+        fail "mandatory systemctl $startup_action failure was accepted"
+    fi
+done
 
 printf 'installer acceptance tests passed\n'
