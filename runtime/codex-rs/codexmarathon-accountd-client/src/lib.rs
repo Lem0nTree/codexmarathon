@@ -4,6 +4,9 @@
 //! storage/runtime crates.  The daemon maps its internal models into these
 //! provider-neutral wire DTOs, while callers use the typed request methods.
 
+pub mod expiry;
+pub use expiry::*;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -87,10 +90,21 @@ pub struct Response {
     pub version: u32,
     pub id: Option<RequestId>,
     pub ok: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_present_result",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub result: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<ProtocolError>,
+}
+
+fn deserialize_present_result<'de, D>(deserializer: D) -> Result<Option<Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Value::deserialize(deserializer).map(Some)
 }
 
 impl Response {
@@ -475,6 +489,51 @@ impl AccountdClient {
         .await
     }
 
+    pub async fn expiry_status(&self) -> Result<ExpiryStatus, AccountdClientError> {
+        self.call("auto_reset_expiry_status", Value::Null).await
+    }
+    pub async fn expiry_set_enabled(
+        &self,
+        enabled: bool,
+        expected_codex_home: &str,
+    ) -> Result<ExpiryStatus, AccountdClientError> {
+        self.call(
+            "auto_reset_expiry_set",
+            serde_json::to_value(ExpirySet {
+                enabled,
+                expected_codex_home: expected_codex_home.to_owned(),
+            })
+            .map_err(AccountdClientError::Json)?,
+        )
+        .await
+    }
+    pub async fn expiry_observe(
+        &self,
+        observation: ExpiryObservation,
+    ) -> Result<(), AccountdClientError> {
+        self.call(
+            "expiry_observe",
+            serde_json::to_value(observation).map_err(AccountdClientError::Json)?,
+        )
+        .await
+    }
+    pub async fn expiry_claim(&self) -> Result<Option<ExpiryJob>, AccountdClientError> {
+        self.call("expiry_claim", Value::Null).await
+    }
+    pub async fn expiry_complete(
+        &self,
+        completion: ExpiryCompletion,
+    ) -> Result<(), AccountdClientError> {
+        self.call(
+            "expiry_complete",
+            serde_json::to_value(completion).map_err(AccountdClientError::Json)?,
+        )
+        .await
+    }
+    pub async fn expiry_executor_heartbeat(&self) -> Result<(), AccountdClientError> {
+        self.call("expiry_executor_heartbeat", Value::Null).await
+    }
+
     /// Allocate a valid scalar request id. IDs are monotonic per client.
     pub fn next_request_id(&self) -> Result<RequestId, AccountdClientError> {
         let id = self
@@ -605,6 +664,21 @@ mod tests {
             .build()
             .expect("runtime")
             .block_on(future)
+    }
+
+    #[test]
+    fn present_null_result_survives_decode() {
+        let response: Response =
+            serde_json::from_value(json!({"version":1,"id":7,"ok":true,"result":null}))
+                .expect("response");
+        assert_eq!(response.result, Some(Value::Null));
+        validate_response(&response, &json!(7)).expect("valid null result");
+        let absent: Response =
+            serde_json::from_value(json!({"version":1,"id":7,"ok":true})).expect("response");
+        assert!(matches!(
+            validate_response(&absent, &json!(7)),
+            Err(AccountdClientError::InvalidResponse)
+        ));
     }
 
     #[test]

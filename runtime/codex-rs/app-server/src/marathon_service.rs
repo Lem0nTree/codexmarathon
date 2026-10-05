@@ -39,6 +39,8 @@ struct CachedQuota {
 
 #[derive(Debug, Error)]
 pub(crate) enum MarathonServiceError {
+    #[error("Marathon expiry automation daemon is unavailable or belongs to another Codex home")]
+    ExpiryUnavailable,
     #[error("Marathon state is unavailable")]
     StateUnavailable,
     #[error("Marathon account was not found")]
@@ -71,6 +73,7 @@ pub(crate) struct MarathonService {
     transition_mutex: Arc<Mutex<()>>,
     registry: Arc<FileAccountRegistry>,
     vault: Arc<FileSnapshotVault>,
+    codex_home: std::path::PathBuf,
     auto_reset: Arc<AutoResetStore>,
     quota_store: Arc<QuotaSnapshotStore>,
     auth_generation: AtomicU64,
@@ -96,6 +99,7 @@ impl MarathonService {
             transition_mutex,
             registry: Arc::new(FileAccountRegistry::new(config.registry_path())),
             vault: Arc::new(FileSnapshotVault::new(config.vault_dir())),
+            codex_home: config.codex_home().to_path_buf(),
             auto_reset: Arc::new(AutoResetStore::new(config.auto_reset_state_path())),
             quota_store: Arc::new(QuotaSnapshotStore::new(config.quota_db_path())),
             auth_generation: AtomicU64::new(1),
@@ -120,6 +124,12 @@ impl MarathonService {
             transition_mutex,
             registry: Arc::clone(&registry),
             vault,
+            codex_home: registry
+                .path()
+                .parent()
+                .and_then(|path| path.parent())
+                .unwrap_or_else(|| std::path::Path::new("."))
+                .to_path_buf(),
             auto_reset: Arc::new(AutoResetStore::new(
                 registry
                     .path()
@@ -294,11 +304,45 @@ impl MarathonService {
             auth_generation: self.auth_generation.load(Ordering::Acquire),
             active_turn_count,
             accounts,
+            auto_reset_expiry: None,
             auto_reset_enabled: auto_reset.enabled,
             auto_reset_phase: auto_reset_phase_label(auto_reset.phase).to_string(),
             auto_reset_last_error: (!auto_reset.last_error.is_empty())
                 .then_some(auto_reset.last_error),
         })
+    }
+
+    pub(crate) async fn expiry_status(
+        &self,
+    ) -> Result<
+        codex_app_server_protocol::MarathonAutoResetExpiryStatusResponse,
+        MarathonServiceError,
+    > {
+        let client = codexmarathon_accountd_client::AccountdClient::from_default_socket()
+            .map_err(|_| MarathonServiceError::ExpiryUnavailable)?;
+        expiry_status_from_client(&client, &self.codex_home).await
+    }
+
+    pub(crate) async fn expiry_set_enabled(
+        &self,
+        enabled: bool,
+    ) -> Result<
+        codex_app_server_protocol::MarathonAutoResetExpiryStatusResponse,
+        MarathonServiceError,
+    > {
+        let home = std::fs::canonicalize(&self.codex_home)
+            .map_err(|_| MarathonServiceError::ExpiryUnavailable)?;
+        let home = home
+            .to_str()
+            .ok_or(MarathonServiceError::ExpiryUnavailable)?;
+        let client = codexmarathon_accountd_client::AccountdClient::from_default_socket()
+            .map_err(|_| MarathonServiceError::ExpiryUnavailable)?;
+        let status = client
+            .expiry_set_enabled(enabled, home)
+            .await
+            .map_err(|_| MarathonServiceError::ExpiryUnavailable)?;
+        validate_expiry_home(&self.codex_home, &status)?;
+        Ok(expiry_response(status))
     }
 
     pub(crate) async fn set_auto_reset_enabled(
@@ -853,6 +897,65 @@ fn credential_health_label(health: CredentialHealth) -> String {
     .to_string()
 }
 
+async fn expiry_status_from_client(
+    client: &codexmarathon_accountd_client::AccountdClient,
+    codex_home: &std::path::Path,
+) -> Result<codex_app_server_protocol::MarathonAutoResetExpiryStatusResponse, MarathonServiceError>
+{
+    let status = client
+        .expiry_status()
+        .await
+        .map_err(|_| MarathonServiceError::ExpiryUnavailable)?;
+    validate_expiry_home(codex_home, &status)?;
+    Ok(expiry_response(status))
+}
+
+fn validate_expiry_home(
+    codex_home: &std::path::Path,
+    status: &codexmarathon_accountd_client::ExpiryStatus,
+) -> Result<(), MarathonServiceError> {
+    let actual = status
+        .codex_home
+        .as_deref()
+        .ok_or(MarathonServiceError::ExpiryUnavailable)?;
+    let expected =
+        std::fs::canonicalize(codex_home).map_err(|_| MarathonServiceError::ExpiryUnavailable)?;
+    let actual =
+        std::fs::canonicalize(actual).map_err(|_| MarathonServiceError::ExpiryUnavailable)?;
+    if actual != expected {
+        return Err(MarathonServiceError::ExpiryUnavailable);
+    }
+    Ok(())
+}
+
+fn expiry_response(
+    status: codexmarathon_accountd_client::ExpiryStatus,
+) -> codex_app_server_protocol::MarathonAutoResetExpiryStatusResponse {
+    codex_app_server_protocol::MarathonAutoResetExpiryStatusResponse {
+        enabled: status.enabled,
+        effective_enabled: status.effective_enabled,
+        executor_available: status.executor_available,
+        jobs_truncated: status.jobs_truncated,
+        next_attempt_at: status.next_attempt_at.map(|time| time.to_rfc3339()),
+        jobs: status
+            .jobs
+            .into_iter()
+            .map(
+                |job| codex_app_server_protocol::MarathonAutoResetExpiryJob {
+                    job_id: job.job_id,
+                    account_id: job.account_id,
+                    credit_id: job.credit_id,
+                    state: job.state,
+                    expires_at: job.expires_at.to_rfc3339(),
+                    next_attempt_at: job.next_attempt_at.map(|time| time.to_rfc3339()),
+                    attempt: job.attempt,
+                    diagnostic_code: job.diagnostic_code,
+                },
+            )
+            .collect(),
+    }
+}
+
 fn auto_reset_phase_label(phase: codexmarathon_runtime::AutoResetPhase) -> &'static str {
     match phase {
         codexmarathon_runtime::AutoResetPhase::Idle => "idle",
@@ -883,6 +986,65 @@ mod tests {
     use super::*;
     use chrono::Utc;
     use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn expiry_status_checks_daemon_home_and_preserves_effective_state() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let directory = tempdir().unwrap();
+        let home = directory.path().join("home");
+        let other_home = directory.path().join("other-home");
+        std::fs::create_dir(&home).unwrap();
+        std::fs::create_dir(&other_home).unwrap();
+        let socket = directory.path().join("accountd.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let returned_home = home.clone();
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                reader.read_line(&mut line).await.unwrap();
+                let request: codexmarathon_accountd_client::Request =
+                    serde_json::from_str(&line).unwrap();
+                let result = serde_json::json!({
+                    "codex_home": returned_home.to_str().unwrap(), "enabled": true,
+                    "effective_enabled": false, "executor_available": false,
+                    "jobs": [], "next_attempt_at": null
+                });
+                let response = codexmarathon_accountd_client::Response::success(request.id, result);
+                let mut bytes = serde_json::to_vec(&response).unwrap();
+                bytes.push(b'\n');
+                reader.get_mut().write_all(&bytes).await.unwrap();
+            }
+        });
+        let client = codexmarathon_accountd_client::AccountdClient::new(&socket);
+        let response = expiry_status_from_client(&client, &home).await.unwrap();
+        assert!(response.enabled);
+        assert!(!response.effective_enabled);
+        assert!(!response.executor_available);
+        assert!(matches!(
+            expiry_status_from_client(&client, &other_home).await,
+            Err(MarathonServiceError::ExpiryUnavailable)
+        ));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn expiry_status_missing_daemon_has_explicit_sanitized_error() {
+        let directory = tempdir().unwrap();
+        let client = codexmarathon_accountd_client::AccountdClient::new(
+            directory.path().join("missing.sock"),
+        );
+        let error = expiry_status_from_client(&client, directory.path())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, MarathonServiceError::ExpiryUnavailable));
+        assert!(
+            !error
+                .to_string()
+                .contains(directory.path().to_str().unwrap())
+        );
+    }
 
     fn rate_limit_window(used_percent: f64, window_minutes: i64) -> RateLimitWindow {
         RateLimitWindow {

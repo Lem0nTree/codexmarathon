@@ -12,6 +12,8 @@
     reason = "the daemon owns its private SQLite connection configuration"
 )]
 
+mod expiry;
+
 use chrono::{DateTime, Utc};
 use codexmarathon_accountd_client as wire;
 use codexmarathon_home::HomeError;
@@ -1212,6 +1214,8 @@ pub struct AccountDaemon {
     registry: Option<Arc<FileAccountRegistry>>,
     event_store: EventStore,
     scheduler: Scheduler,
+    expiry: expiry::ExpiryStore,
+    codex_home: Option<String>,
     request_timeout: Duration,
 }
 
@@ -1237,7 +1241,17 @@ impl AccountDaemon {
             .parent()
             .map(|parent| Arc::new(FileAccountRegistry::new(parent.join("accounts.json"))));
         let scheduler = Scheduler::initialize(event_store.clone()).await?;
+        let expiry = expiry::ExpiryStore::open(event_store.clone()).await?;
+        let codex_home = event_store
+            .path()
+            .parent()
+            .filter(|parent| parent.file_name().is_some_and(|name| name == "marathon"))
+            .and_then(Path::parent)
+            .and_then(|home| home.canonicalize().ok())
+            .and_then(|home| home.to_str().map(str::to_owned));
         Ok(Self {
+            expiry,
+            codex_home,
             quota_store,
             registry,
             event_store,
@@ -1258,7 +1272,17 @@ impl AccountDaemon {
             ));
         }
         let scheduler = Scheduler::initialize(event_store.clone()).await?;
+        let expiry = expiry::ExpiryStore::open(event_store.clone()).await?;
+        let codex_home = event_store
+            .path()
+            .parent()
+            .filter(|parent| parent.file_name().is_some_and(|name| name == "marathon"))
+            .and_then(Path::parent)
+            .and_then(|home| home.canonicalize().ok())
+            .and_then(|home| home.to_str().map(str::to_owned));
         Ok(Self {
+            expiry,
+            codex_home,
             quota_store,
             registry: None,
             event_store,
@@ -1304,11 +1328,101 @@ impl AccountDaemon {
                 .and_then(|value| {
                     serde_json::to_value(value).map_err(|_| AccountdError::StateUnavailable)
                 }),
+            "auto_reset_expiry_status"
+            | "auto_reset_expiry_set"
+            | "expiry_observe"
+            | "expiry_claim"
+            | "expiry_complete"
+            | "expiry_executor_heartbeat" => {
+                self.expiry_request(&request.method, request.params).await
+            }
             _ => Err(AccountdError::InvalidRequest),
         };
         match result {
             Ok(value) => Response::success(id, value),
             Err(error) => protocol_error_response(id, &error),
+        }
+    }
+
+    async fn expiry_request(&self, method: &str, params: Value) -> Result<Value, AccountdError> {
+        let now = Utc::now();
+        // Atomic registry preview never nests the native executor's StateLock.
+        // Missing/corrupt registry disables new claims; completion still persists
+        // confirmed consumption even after registry deletion or account removal.
+        let registry = self
+            .registry
+            .as_ref()
+            .and_then(|registry| registry.preview_state().ok());
+        let master = registry.as_ref().is_some_and(|state| state.enabled);
+        if method == "auto_reset_expiry_status" {
+            return serde_json::to_value(
+                self.expiry
+                    .status(master, self.codex_home.clone(), now)
+                    .await?,
+            )
+            .map_err(|_| AccountdError::StateUnavailable);
+        }
+        // Mutations require a verified home identity, rather than a guessed
+        // accounts.json next to an arbitrary --quota-db path.
+        let home = self
+            .codex_home
+            .as_ref()
+            .ok_or(AccountdError::StateUnavailable)?;
+        match method {
+            "auto_reset_expiry_set" => {
+                let setting: wire::ExpirySet =
+                    serde_json::from_value(params).map_err(|_| AccountdError::InvalidRequest)?;
+                let expected = Path::new(&setting.expected_codex_home)
+                    .canonicalize()
+                    .map_err(|_| AccountdError::InvalidRequest)?;
+                if expected != Path::new(home) {
+                    return Err(AccountdError::InvalidRequest);
+                }
+                self.expiry.set(setting.enabled).await?;
+                serde_json::to_value(
+                    self.expiry
+                        .status(master, self.codex_home.clone(), now)
+                        .await?,
+                )
+                .map_err(|_| AccountdError::StateUnavailable)
+            }
+            "expiry_observe" => {
+                let observation: wire::ExpiryObservation =
+                    serde_json::from_value(params).map_err(|_| AccountdError::InvalidRequest)?;
+                if !registry
+                    .as_ref()
+                    .is_some_and(|state| state.accounts.contains_key(&observation.account_id))
+                {
+                    return Err(AccountdError::InvalidRequest);
+                }
+                self.expiry.observe(observation, now).await?;
+                Ok(Value::Null)
+            }
+            "expiry_claim" => {
+                if !params.is_null() {
+                    return Err(AccountdError::InvalidRequest);
+                }
+                let eligible = registry
+                    .as_ref()
+                    .map(|state| state.accounts.keys().cloned().collect::<Vec<_>>())
+                    .unwrap_or_default();
+                serde_json::to_value(self.expiry.claim(&eligible, master, now).await?)
+                    .map_err(|_| AccountdError::StateUnavailable)
+            }
+            "expiry_complete" => {
+                let completion: wire::ExpiryCompletion =
+                    serde_json::from_value(params).map_err(|_| AccountdError::InvalidRequest)?;
+                self.expiry.complete(completion, now).await?;
+                Ok(Value::Null)
+            }
+            "expiry_executor_heartbeat" => {
+                if !params.is_null() {
+                    return Err(AccountdError::InvalidRequest);
+                }
+                self.expiry.heartbeat(now).await?;
+                Ok(Value::Null)
+            }
+            _ => Err(AccountdError::InvalidRequest),
         }
     }
 

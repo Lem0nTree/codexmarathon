@@ -75,14 +75,14 @@ impl Client {
         if supports_luna_reserve {
             req = req.header("x-openai-codex-luna-reserve", HeaderValue::from_static("1"));
         }
-        let (body, ct) = self.exec_request(req, "GET", &url).await?;
+        let (body, ct) = self.exec_request_detailed(req, "GET", &url).await?;
         self.decode_json(&url, &ct, &body)
     }
 
     pub async fn list_rate_limit_reset_credits(&self) -> Result<RateLimitResetCreditsDetails> {
         let url = self.rate_limit_reset_credits_url();
         let req = self.request(Method::GET, &url).headers(self.headers());
-        let (body, ct) = self.exec_request(req, "GET", &url).await?;
+        let (body, ct) = self.exec_request_detailed(req, "GET", &url).await?;
         self.decode_json(&url, &ct, &body)
     }
 
@@ -117,7 +117,7 @@ impl Client {
                 redeem_request_id,
                 credit_id,
             });
-        let (body, ct) = self.exec_request(req, "POST", &url).await?;
+        let (body, ct) = self.exec_request_detailed(req, "POST", &url).await?;
         self.decode_json(&url, &ct, &body)
     }
 

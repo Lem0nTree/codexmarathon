@@ -739,6 +739,12 @@ pub(crate) enum AppEvent {
 
     /// Request native Marathon status through the in-process app-server.
     MarathonStatusRequest,
+    MarathonAutoResetExpiryRequest {
+        enabled: Option<bool>,
+    },
+    MarathonAutoResetExpiryResult {
+        result: Result<codex_app_server_protocol::MarathonAutoResetExpiryStatusResponse, String>,
+    },
 
     /// Set the native Marathon enabled state through the in-process app-server.
     MarathonEnabledSetRequest {

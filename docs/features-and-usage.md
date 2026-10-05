@@ -71,7 +71,39 @@ codex marathon auto-reset off
 
 It is eligible only when every managed account has zero weekly quota and an
 account advertises a provider-supported reset capability. Development and test
-paths use mocks only; no provider reset action is invoked by this project.
+paths for this exhaustion-based policy use mocks only.
+
+Banked resets have a separate expiry policy:
+
+```bash
+codex marathon auto-reset-expiry status
+codex marathon auto-reset-expiry on
+codex marathon auto-reset-expiry off
+```
+
+This policy is off by default. With Marathon enabled, it attempts to redeem
+an available banked reset 15 minutes before the provider's expiration time,
+even if quota remains. It retries failures until redemption, expiration, or
+disablement, preserving the same redemption key across retries and restarts.
+Credits without a known expiration are not scheduled. Unknown or incomplete
+inventory does not count as proof that a credit was consumed.
+
+The account daemon owns the setting and durable jobs. The separately installed
+`codexmarathon-reset-executor` service uses native authentication to refresh
+credit inventory and redeem a selected credit without changing the active
+account. Both services must be running for unattended operation; a stopped
+machine cannot redeem a credit. Turning the policy off prevents new attempts,
+but an already submitted provider request may finish. The older exhaustion
+policy remains independent and mock-only.
+
+Integrations use `marathon/autoResetExpiry/status` and
+`marathon/autoResetExpiry/set` with `{ "enabled": true }` or `{ "enabled": false }`.
+Status reports configured and effective state, executor availability, and
+per-credit scheduling, retry, and diagnostic metadata. At most 1,000 jobs are
+returned; `jobsTruncated` indicates more history, while `nextAttemptAt` covers
+all pending jobs. The commands reject
+a daemon serving a different Codex home. The same controls are available as
+`/marathon auto-reset-expiry status|on|off` in the TUI.
 
 ## Interactive commands
 

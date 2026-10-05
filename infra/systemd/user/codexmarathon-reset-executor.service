@@ -1,0 +1,28 @@
+[Unit]
+Description=CodexMarathon native banked reset executor
+Requires=codexmarathon-accountd.socket
+After=codexmarathon-accountd.service codexmarathon-accountd.socket network-online.target
+StartLimitIntervalSec=60s
+StartLimitBurst=5
+
+[Service]
+Type=exec
+ExecStart=%h/.local/bin/codexmarathon-reset-executor
+Restart=on-failure
+RestartSec=5s
+UMask=0077
+NoNewPrivileges=yes
+# This native authority needs credentials and HTTPS. Accountd retains its
+# separate credential-free, AF_UNIX-only sandbox. The policy defaults off.
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.codex
+PrivateTmp=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=default.target

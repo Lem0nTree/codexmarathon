@@ -1717,6 +1717,27 @@ impl App {
                     app_event_tx.send(AppEvent::MarathonEnabledSetResult { enabled, result });
                 });
             }
+            AppEvent::MarathonAutoResetExpiryRequest { enabled } => {
+                let request_id = app_server.next_request_id();
+                let request_handle = app_server.request_handle();
+                let app_event_tx = self.app_event_tx.clone();
+                tokio::spawn(async move {
+                    let request = match enabled {
+                        Some(enabled) => ClientRequest::MarathonAutoResetExpirySet {
+                            request_id,
+                            params: codex_app_server_protocol::MarathonAutoResetExpirySetParams { enabled },
+                        },
+                        None => ClientRequest::MarathonAutoResetExpiryStatus { request_id, params: None },
+                    };
+                    let result = request_handle
+                        .request_typed::<codex_app_server_protocol::MarathonAutoResetExpiryStatusResponse>(request)
+                        .await.map_err(|error| error.to_string());
+                    app_event_tx.send(AppEvent::MarathonAutoResetExpiryResult { result });
+                });
+            }
+            AppEvent::MarathonAutoResetExpiryResult { result } => {
+                self.chat_widget.on_marathon_auto_reset_expiry_result(result);
+            }
             AppEvent::MarathonAutoResetSetRequest { enabled } => {
                 let request_id = app_server.next_request_id();
                 let request_handle = app_server.request_handle();

@@ -484,6 +484,7 @@ async fn set_auth_token_updates_account_and_notifies() -> Result<()> {
                 plan_type: AccountPlanType::Pro,
             }),
             requires_openai_auth: true,
+            auth_changed: false,
         }
     );
 
@@ -562,6 +563,7 @@ async fn account_read_refresh_token_is_noop_in_external_mode() -> Result<()> {
                 plan_type: AccountPlanType::Pro,
             }),
             requires_openai_auth: true,
+            auth_changed: false,
         }
     );
 
@@ -1283,6 +1285,7 @@ async fn login_amazon_bedrock_replaces_primary_auth_and_persists_provider(
                 uses_codex_managed_credentials: true,
             }),
             requires_openai_auth: false,
+            auth_changed: false,
         }
     );
 
@@ -1312,6 +1315,7 @@ async fn login_amazon_bedrock_replaces_primary_auth_and_persists_provider(
                 workspace_routing: None,
                 account: None,
                 requires_openai_auth: true,
+                auth_changed: false,
             }
         );
     }
@@ -1528,6 +1532,7 @@ async fn logout_managed_bedrock_restores_default_account(
                 uses_codex_managed_credentials: true,
             }),
             requires_openai_auth: false,
+            auth_changed: false,
         }
     );
 
@@ -1577,6 +1582,7 @@ async fn logout_managed_bedrock_restores_default_account(
             workspace_routing: None,
             account: None,
             requires_openai_auth: true,
+            auth_changed: false,
         }
     );
     Ok(())
@@ -1644,6 +1650,7 @@ async fn logout_aws_managed_bedrock_clears_provider_and_restores_default_account
                     uses_codex_managed_credentials: false,
                 }),
                 requires_openai_auth: false,
+                auth_changed: false,
             }
         );
         let mut expected_config = read_config_toml(codex_home.path())?;
@@ -1681,6 +1688,7 @@ async fn logout_aws_managed_bedrock_clears_provider_and_restores_default_account
                 workspace_routing: None,
                 account: None,
                 requires_openai_auth: true,
+                auth_changed: false,
             }
         );
     }
@@ -1750,6 +1758,7 @@ async fn logout_managed_bedrock_preserves_changed_provider_without_experimental_
             workspace_routing: None,
             account: None,
             requires_openai_auth: false,
+            auth_changed: false,
         }
     );
     Ok(())
@@ -1832,6 +1841,7 @@ async fn login_managed_bedrock_updates_active_bedrock_account() -> Result<()> {
                 uses_codex_managed_credentials: true,
             }),
             requires_openai_auth: false,
+            auth_changed: false,
         }
     );
 
@@ -2306,6 +2316,7 @@ async fn login_survives_same_owner_token_refresh(
             plan_type: AccountPlanType::Enterprise,
         }),
         requires_openai_auth: true,
+        auth_changed: false,
         workspace_routing: expected_workspace_routing(WORKSPACE_ID_DEVICE),
     };
     match refresh_trigger {
@@ -3007,6 +3018,7 @@ async fn get_account_with_api_key() -> Result<()> {
         workspace_routing: None,
         account: Some(Account::ApiKey {}),
         requires_openai_auth: true,
+        auth_changed: false,
     };
     assert_eq!(received, expected);
     Ok(())
@@ -3041,6 +3053,7 @@ async fn get_account_when_auth_not_required() -> Result<()> {
         workspace_routing: None,
         account: None,
         requires_openai_auth: false,
+        auth_changed: false,
     };
     assert_eq!(received, expected);
     Ok(())
@@ -3084,6 +3097,7 @@ region = "us-west-2"
             uses_codex_managed_credentials: false,
         }),
         requires_openai_auth: false,
+        auth_changed: false,
     };
     assert_eq!(received, expected);
     Ok(())
@@ -3123,6 +3137,7 @@ command = "print-token"
                 uses_codex_managed_credentials: false,
             }),
             requires_openai_auth: false,
+            auth_changed: false,
         }
     );
     Ok(())
@@ -3162,6 +3177,7 @@ region = "us-west-2"
                 uses_codex_managed_credentials: false,
             }),
             requires_openai_auth: false,
+            auth_changed: false,
         }
     );
 
@@ -3228,6 +3244,7 @@ async fn get_account_with_managed_bedrock_provider() -> Result<()> {
                 uses_codex_managed_credentials: true,
             }),
             requires_openai_auth: false,
+            auth_changed: false,
         }
     );
     Ok(())
@@ -3274,6 +3291,7 @@ async fn get_account_with_chatgpt() -> Result<()> {
             plan_type: AccountPlanType::Pro,
         }),
         requires_openai_auth: true,
+        auth_changed: false,
     };
     assert_eq!(received, expected);
     Ok(())
@@ -3329,6 +3347,7 @@ async fn get_account_with_chatgpt_plan_variants_returns_plan_type(
                 plan_type: expected_plan,
             }),
             requires_openai_auth: true,
+            auth_changed: false,
         }
     );
     Ok(())
@@ -3376,6 +3395,7 @@ async fn get_account_with_chatgpt_without_email() -> Result<()> {
                 plan_type: AccountPlanType::Pro,
             }),
             requires_openai_auth: true,
+            auth_changed: false,
         }
     );
     Ok(())
@@ -3455,6 +3475,7 @@ async fn get_account_omits_chatgpt_after_permanent_refresh_failure() -> Result<(
             workspace_routing: None,
             account: None,
             requires_openai_auth: true,
+            auth_changed: false,
         }
     );
     server.verify().await;
@@ -3501,6 +3522,7 @@ async fn get_account_with_chatgpt_missing_plan_claim_returns_unknown() -> Result
             plan_type: AccountPlanType::Unknown,
         }),
         requires_openai_auth: true,
+        auth_changed: false,
     };
     assert_eq!(received, expected);
     Ok(())

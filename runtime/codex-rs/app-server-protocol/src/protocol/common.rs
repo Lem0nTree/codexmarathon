@@ -1177,6 +1177,19 @@ client_request_definitions! {
         serialization: global("marathon"),
         response: v2::MarathonAutoResetSetResponse,
     },
+    /// Read daemon-authoritative banked-reset expiry automation state.
+    MarathonAutoResetExpiryStatus => "marathon/autoResetExpiry/status" {
+        params: #[ts(type = "undefined")] #[serde(skip_serializing_if = "Option::is_none")] Option<()>,
+        serialization: global_shared_read("marathon"),
+        response: v2::MarathonAutoResetExpiryStatusResponse,
+    },
+    /// Enable or disable banked-reset expiry automation independently.
+    MarathonAutoResetExpirySet => "marathon/autoResetExpiry/set" {
+        params: v2::MarathonAutoResetExpirySetParams,
+        serialization: global("marathon"),
+        manual_payload_conversion: manual,
+        response: v2::MarathonAutoResetExpiryStatusResponse,
+    },
     /// Manually switch the native Codex auth identity at an idle boundary.
     MarathonSwitch => "marathon/switch" {
         params: v2::MarathonSwitchParams,

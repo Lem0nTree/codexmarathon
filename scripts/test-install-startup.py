@@ -49,7 +49,7 @@ for name, config in cases.items():
         original = tomllib.loads(config or "") if name != "invalid_toml" else None
         if config is not None:
             (state / "config.toml").write_text(config)
-        for unit in ("codexmarathon-accountd.service", "codexmarathon-accountd.socket"):
+        for unit in ("codexmarathon-accountd.service", "codexmarathon-accountd.socket", "codexmarathon-reset-executor.service"):
             (package / "systemd/user" / unit).write_bytes((repo / "infra/systemd/user" / unit).read_bytes())
         executable(stubs / "uname", '#!/bin/sh\necho aarch64\n')
         executable(stubs / "loginctl", '#!/bin/sh\necho yes\n')
@@ -66,6 +66,7 @@ if "enable" in args:
     (p / "enabled").touch()
 ''')
         executable(package / "codexmarathon-accountd", '#!/bin/sh\nexit 0\n')
+        executable(package / "codexmarathon-reset-executor", '#!/bin/sh\nexit 0\n')
         executable(package / "codex-code-mode-host", '#!/bin/sh\nexit 0\n')
         executable(package / "codex", '''#!/usr/bin/env python3
 import json, os, subprocess, sys

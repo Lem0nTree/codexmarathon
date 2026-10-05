@@ -53,6 +53,12 @@ impl AccountRequestProcessor {
             return Err(invalid_request("creditId must not be empty"));
         }
 
+        // Serialize native manual redemption with accountd expiry execution.
+        // The file guard remains held across authentication and provider consume.
+        let _state_lock = codexmarathon_runtime::state_lock::StateLock::exclusive(
+            &self.config.codex_home.join("marathon"),
+        )
+        .map_err(|_| internal_error("Marathon reset state is busy or unavailable; retry later"))?;
         let client = self.rate_limit_reset_backend_client().await?;
         let request_timeout = RATE_LIMIT_RESET_REQUEST_TIMEOUT;
         #[cfg(debug_assertions)]

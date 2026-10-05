@@ -43,6 +43,9 @@ pub struct MarathonStatusResponse {
     pub auto_reset_phase: String,
     #[serde(default)]
     pub auto_reset_last_error: Option<String>,
+    /// Daemon-authoritative expiry automation; absent when accountd is unavailable.
+    #[serde(default)]
+    pub auto_reset_expiry: Option<MarathonAutoResetExpiryStatus>,
 }
 
 /// Enable or disable automatic use of a provider reset action when every
@@ -60,6 +63,71 @@ pub struct MarathonAutoResetSetParams {
 pub struct MarathonAutoResetSetResponse {
     pub enabled: bool,
     pub phase: String,
+}
+
+/// Configure use of banked reset credits fifteen minutes before their expiry.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase", export_to = "v2/")]
+pub struct MarathonAutoResetExpirySetParams {
+    pub enabled: bool,
+}
+
+/// Secret-free state of one durable expiry job.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase", export_to = "v2/")]
+pub struct MarathonAutoResetExpiryJob {
+    pub job_id: String,
+    pub account_id: String,
+    pub credit_id: String,
+    pub state: String,
+    pub expires_at: String,
+    pub next_attempt_at: Option<String>,
+    pub attempt: i64,
+    pub diagnostic_code: Option<String>,
+}
+
+/// Daemon-authoritative expiry state. Enabling this policy is independent of
+/// the zero-weekly-quota policy; the Marathon master switch gates execution.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase", export_to = "v2/")]
+pub struct MarathonAutoResetExpiryStatusResponse {
+    pub enabled: bool,
+    pub effective_enabled: bool,
+    pub executor_available: bool,
+    pub jobs: Vec<MarathonAutoResetExpiryJob>,
+    #[serde(default)]
+    pub jobs_truncated: bool,
+    pub next_attempt_at: Option<String>,
+}
+
+/// Shared expiry state embedded in the overall Marathon status.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase", export_to = "v2/")]
+pub struct MarathonAutoResetExpiryStatus {
+    pub enabled: bool,
+    pub effective_enabled: bool,
+    pub executor_available: bool,
+    pub jobs: Vec<MarathonAutoResetExpiryJob>,
+    #[serde(default)]
+    pub jobs_truncated: bool,
+    pub next_attempt_at: Option<String>,
+}
+
+impl From<MarathonAutoResetExpiryStatusResponse> for MarathonAutoResetExpiryStatus {
+    fn from(response: MarathonAutoResetExpiryStatusResponse) -> Self {
+        Self {
+            enabled: response.enabled,
+            effective_enabled: response.effective_enabled,
+            executor_available: response.executor_available,
+            jobs: response.jobs,
+            jobs_truncated: response.jobs_truncated,
+            next_attempt_at: response.next_attempt_at,
+        }
+    }
 }
 
 /// Enable or disable the native Marathon service.
@@ -146,4 +214,68 @@ pub struct MarathonCheckpointParams {
 pub struct MarathonCheckpointResponse {
     pub account_id: String,
     pub auth_generation: u64,
+}
+
+#[cfg(test)]
+mod expiry_tests {
+    use super::*;
+
+    #[test]
+    fn older_status_defaults_expiry_to_unavailable() {
+        let status: MarathonStatusResponse = serde_json::from_value(serde_json::json!({
+            "enabled": true, "activeAccountId": null, "currentAccountId": null,
+            "authGeneration": 1, "activeTurnCount": 0, "accounts": []
+        }))
+        .expect("older status");
+        assert!(status.auto_reset_expiry.is_none());
+        assert!(!status.auto_reset_enabled);
+    }
+
+    #[test]
+    fn expiry_set_and_status_use_camel_case_wire_fields() {
+        let params = MarathonAutoResetExpirySetParams { enabled: true };
+        assert_eq!(
+            serde_json::to_value(params).unwrap(),
+            serde_json::json!({ "enabled": true })
+        );
+        let response = MarathonAutoResetExpiryStatusResponse {
+            enabled: true,
+            effective_enabled: false,
+            executor_available: false,
+            jobs: Vec::new(),
+            jobs_truncated: false,
+            next_attempt_at: None,
+        };
+        let value = serde_json::to_value(&response).unwrap();
+        assert_eq!(value["effectiveEnabled"], false);
+        assert_eq!(value["executorAvailable"], false);
+        assert_eq!(
+            serde_json::from_value::<MarathonAutoResetExpiryStatusResponse>(value).unwrap(),
+            response
+        );
+    }
+
+    #[test]
+    fn embedded_expiry_status_preserves_rpc_wire_shape() {
+        let response = MarathonAutoResetExpiryStatusResponse {
+            enabled: true,
+            effective_enabled: false,
+            executor_available: true,
+            jobs: vec![MarathonAutoResetExpiryJob {
+                job_id: "job-1".into(),
+                account_id: "account-1".into(),
+                credit_id: "credit-1".into(),
+                state: "scheduled".into(),
+                expires_at: "2026-10-05T00:00:00Z".into(),
+                next_attempt_at: Some("2026-10-04T23:45:00Z".into()),
+                attempt: 2,
+                diagnostic_code: Some("retry".into()),
+            }],
+            jobs_truncated: true,
+            next_attempt_at: Some("2026-10-04T23:45:00Z".into()),
+        };
+        let expected = serde_json::to_value(&response).unwrap();
+        let shared = MarathonAutoResetExpiryStatus::from(response);
+        assert_eq!(serde_json::to_value(shared).unwrap(), expected);
+    }
 }

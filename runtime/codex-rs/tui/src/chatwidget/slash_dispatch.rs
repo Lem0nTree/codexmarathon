@@ -811,6 +811,26 @@ impl ChatWidget {
                     "off" | "disable" if rest.trim().is_empty() => {
                         self.request_marathon_enabled_set(false)
                     }
+                    "auto-reset-expiry" => match rest.trim().to_ascii_lowercase().as_str() {
+                        "on" | "enable" => {
+                            self.app_event_tx
+                                .send(AppEvent::MarathonAutoResetExpiryRequest {
+                                    enabled: Some(true),
+                                })
+                        }
+                        "off" | "disable" => {
+                            self.app_event_tx
+                                .send(AppEvent::MarathonAutoResetExpiryRequest {
+                                    enabled: Some(false),
+                                })
+                        }
+                        "status" | "" => self
+                            .app_event_tx
+                            .send(AppEvent::MarathonAutoResetExpiryRequest { enabled: None }),
+                        _ => self.add_error_message(
+                            "Usage: /marathon auto-reset-expiry [on|off|status]".to_string(),
+                        ),
+                    },
                     "auto-reset" | "autoreset" => match rest.trim().to_ascii_lowercase().as_str() {
                         "on" | "enable" => self.request_marathon_auto_reset_set(true),
                         "off" | "disable" => self.request_marathon_auto_reset_set(false),
@@ -1320,6 +1340,10 @@ impl ChatWidget {
                 "/marathon auto-reset on|off|status",
                 "Configure provider quota reset",
             ),
+            (
+                "/marathon auto-reset-expiry on|off|status",
+                "Use banked resets 15 minutes before expiry (default off)",
+            ),
         ];
         let command_width = commands
             .iter()
@@ -1486,6 +1510,44 @@ impl ChatWidget {
                 "CodexMarathon: could not {} service: {error}",
                 if enabled { "enable" } else { "disable" }
             )),
+        }
+    }
+
+    pub(crate) fn on_marathon_auto_reset_expiry_result(
+        &mut self,
+        result: Result<codex_app_server_protocol::MarathonAutoResetExpiryStatusResponse, String>,
+    ) {
+        match result {
+            Ok(response) => {
+                self.add_info_message(format!(
+                    "Banked reset expiry automation: {} (effective: {}, executor: {}, lead time: 15 minutes). Next attempt: {}.",
+                    if response.enabled { "enabled" } else { "disabled" },
+                    if response.effective_enabled { "enabled" } else { "disabled" },
+                    if response.executor_available { "available" } else { "unavailable" },
+                    response.next_attempt_at.as_deref().unwrap_or("none")), None);
+                for job in &response.jobs {
+                    self.add_info_message(
+                        format!(
+                            "{} / {}: {} (expiry: {}, attempts: {}, next retry: {}, result: {}).",
+                            job.account_id,
+                            job.credit_id,
+                            job.state,
+                            job.expires_at,
+                            job.attempt,
+                            job.next_attempt_at.as_deref().unwrap_or("none"),
+                            job.diagnostic_code.as_deref().unwrap_or("none")
+                        ),
+                        None,
+                    );
+                }
+                if let Some(status) = self.marathon_controller_status.as_mut() {
+                    status.auto_reset_expiry = Some(response.into());
+                }
+                self.refresh_status_line();
+            }
+            Err(error) => {
+                self.add_error_message(format!("Banked reset expiry automation: {error}"))
+            }
         }
     }
 
@@ -1711,6 +1773,27 @@ impl ChatWidget {
                 status.auth_generation.to_string().into(),
             ]),
         ];
+        lines.push(Line::from(match &status.auto_reset_expiry {
+            Some(expiry) => format!(
+                "Banked reset expiry  {} (effective: {}, executor: {}, lead time: 15 minutes)",
+                if expiry.enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                },
+                if expiry.effective_enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                },
+                if expiry.executor_available {
+                    "available"
+                } else {
+                    "unavailable"
+                }
+            ),
+            None => "Banked reset expiry  daemon unavailable".to_string(),
+        }));
         if let Some(error) = status.auto_reset_last_error.as_deref() {
             lines.push(Line::from(vec![
                 "Last reset  ".bold(),

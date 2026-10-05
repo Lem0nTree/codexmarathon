@@ -757,30 +757,6 @@
             },
             "method": {
               "enum": [
-                "thread/rollback"
-              ],
-              "title": "Thread/rollbackRequestMethod",
-              "type": "string"
-            },
-            "params": {
-              "$ref": "#/definitions/v2/ThreadRollbackParams"
-            }
-          },
-          "required": [
-            "id",
-            "method",
-            "params"
-          ],
-          "title": "Thread/rollbackRequest",
-          "type": "object"
-        },
-        {
-          "properties": {
-            "id": {
-              "$ref": "#/definitions/v2/RequestId"
-            },
-            "method": {
-              "enum": [
                 "thread/list"
               ],
               "title": "Thread/listRequestMethod",
@@ -2116,6 +2092,55 @@
             "params"
           ],
           "title": "Marathon/autoReset/setRequest",
+          "type": "object"
+        },
+        {
+          "description": "Read daemon-authoritative banked-reset expiry automation state.",
+          "properties": {
+            "id": {
+              "$ref": "#/definitions/v2/RequestId"
+            },
+            "method": {
+              "enum": [
+                "marathon/autoResetExpiry/status"
+              ],
+              "title": "Marathon/autoResetExpiry/statusRequestMethod",
+              "type": "string"
+            },
+            "params": {
+              "type": "null"
+            }
+          },
+          "required": [
+            "id",
+            "method"
+          ],
+          "title": "Marathon/autoResetExpiry/statusRequest",
+          "type": "object"
+        },
+        {
+          "description": "Enable or disable banked-reset expiry automation independently.",
+          "properties": {
+            "id": {
+              "$ref": "#/definitions/v2/RequestId"
+            },
+            "method": {
+              "enum": [
+                "marathon/autoResetExpiry/set"
+              ],
+              "title": "Marathon/autoResetExpiry/setRequestMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/v2/MarathonAutoResetExpirySetParams"
+            }
+          },
+          "required": [
+            "id",
+            "method",
+            "params"
+          ],
+          "title": "Marathon/autoResetExpiry/setRequest",
           "type": "object"
         },
         {
@@ -14854,6 +14879,141 @@
         ],
         "type": "object"
       },
+      "MarathonAutoResetExpiryJob": {
+        "description": "Secret-free state of one durable expiry job.",
+        "properties": {
+          "accountId": {
+            "type": "string"
+          },
+          "attempt": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "creditId": {
+            "type": "string"
+          },
+          "diagnosticCode": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "expiresAt": {
+            "type": "string"
+          },
+          "jobId": {
+            "type": "string"
+          },
+          "nextAttemptAt": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "state": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "accountId",
+          "attempt",
+          "creditId",
+          "expiresAt",
+          "jobId",
+          "state"
+        ],
+        "type": "object"
+      },
+      "MarathonAutoResetExpirySetParams": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "description": "Configure use of banked reset credits fifteen minutes before their expiry.",
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "enabled"
+        ],
+        "title": "MarathonAutoResetExpirySetParams",
+        "type": "object"
+      },
+      "MarathonAutoResetExpiryStatus": {
+        "description": "Shared expiry state embedded in the overall Marathon status.",
+        "properties": {
+          "effectiveEnabled": {
+            "type": "boolean"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "executorAvailable": {
+            "type": "boolean"
+          },
+          "jobs": {
+            "items": {
+              "$ref": "#/definitions/v2/MarathonAutoResetExpiryJob"
+            },
+            "type": "array"
+          },
+          "jobsTruncated": {
+            "default": false,
+            "type": "boolean"
+          },
+          "nextAttemptAt": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "effectiveEnabled",
+          "enabled",
+          "executorAvailable",
+          "jobs"
+        ],
+        "type": "object"
+      },
+      "MarathonAutoResetExpiryStatusResponse": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "description": "Daemon-authoritative expiry state. Enabling this policy is independent of the zero-weekly-quota policy; the Marathon master switch gates execution.",
+        "properties": {
+          "effectiveEnabled": {
+            "type": "boolean"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "executorAvailable": {
+            "type": "boolean"
+          },
+          "jobs": {
+            "items": {
+              "$ref": "#/definitions/v2/MarathonAutoResetExpiryJob"
+            },
+            "type": "array"
+          },
+          "jobsTruncated": {
+            "default": false,
+            "type": "boolean"
+          },
+          "nextAttemptAt": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "effectiveEnabled",
+          "enabled",
+          "executorAvailable",
+          "jobs"
+        ],
+        "title": "MarathonAutoResetExpiryStatusResponse",
+        "type": "object"
+      },
       "MarathonAutoResetSetParams": {
         "$schema": "http://json-schema.org/draft-07/schema#",
         "description": "Enable or disable automatic use of a provider reset action when every eligible managed account has zero weekly quota.",
@@ -15021,6 +15181,18 @@
           "autoResetEnabled": {
             "default": false,
             "type": "boolean"
+          },
+          "autoResetExpiry": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/MarathonAutoResetExpiryStatus"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Daemon-authoritative expiry automation; absent when accountd is unavailable."
           },
           "autoResetLastError": {
             "default": null,

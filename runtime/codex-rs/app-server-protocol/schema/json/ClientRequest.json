@@ -1991,6 +1991,18 @@
       ],
       "type": "string"
     },
+    "MarathonAutoResetExpirySetParams": {
+      "description": "Configure use of banked reset credits fifteen minutes before their expiry.",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "enabled"
+      ],
+      "type": "object"
+    },
     "MarathonAutoResetSetParams": {
       "description": "Enable or disable automatic use of a provider reset action when every eligible managed account has zero weekly quota.",
       "properties": {
@@ -4666,25 +4678,6 @@
         }
       ]
     },
-    "ThreadRollbackParams": {
-      "description": "DEPRECATED: `thread/rollback` will be removed soon.",
-      "properties": {
-        "numTurns": {
-          "description": "The number of turns to drop from the end of the thread. Must be >= 1.\n\nThis only modifies the thread's history and does not revert local file changes that have been made by the agent. Clients are responsible for reverting these changes.",
-          "format": "uint32",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "threadId": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "numTurns",
-        "threadId"
-      ],
-      "type": "object"
-    },
     "ThreadListParams": {
       "properties": {
         "archived": {
@@ -6576,30 +6569,6 @@
         },
         "method": {
           "enum": [
-            "thread/rollback"
-          ],
-          "title": "Thread/rollbackRequestMethod",
-          "type": "string"
-        },
-        "params": {
-          "$ref": "#/definitions/ThreadRollbackParams"
-        }
-      },
-      "required": [
-        "id",
-        "method",
-        "params"
-      ],
-      "title": "Thread/rollbackRequest",
-      "type": "object"
-    },
-    {
-      "properties": {
-        "id": {
-          "$ref": "#/definitions/RequestId"
-        },
-        "method": {
-          "enum": [
             "thread/list"
           ],
           "title": "Thread/listRequestMethod",
@@ -7935,6 +7904,55 @@
         "params"
       ],
       "title": "Marathon/autoReset/setRequest",
+      "type": "object"
+    },
+    {
+      "description": "Read daemon-authoritative banked-reset expiry automation state.",
+      "properties": {
+        "id": {
+          "$ref": "#/definitions/RequestId"
+        },
+        "method": {
+          "enum": [
+            "marathon/autoResetExpiry/status"
+          ],
+          "title": "Marathon/autoResetExpiry/statusRequestMethod",
+          "type": "string"
+        },
+        "params": {
+          "type": "null"
+        }
+      },
+      "required": [
+        "id",
+        "method"
+      ],
+      "title": "Marathon/autoResetExpiry/statusRequest",
+      "type": "object"
+    },
+    {
+      "description": "Enable or disable banked-reset expiry automation independently.",
+      "properties": {
+        "id": {
+          "$ref": "#/definitions/RequestId"
+        },
+        "method": {
+          "enum": [
+            "marathon/autoResetExpiry/set"
+          ],
+          "title": "Marathon/autoResetExpiry/setRequestMethod",
+          "type": "string"
+        },
+        "params": {
+          "$ref": "#/definitions/MarathonAutoResetExpirySetParams"
+        }
+      },
+      "required": [
+        "id",
+        "method",
+        "params"
+      ],
+      "title": "Marathon/autoResetExpiry/setRequest",
       "type": "object"
     },
     {

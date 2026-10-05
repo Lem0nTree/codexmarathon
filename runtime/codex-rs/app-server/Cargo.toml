@@ -71,6 +71,7 @@ codex-backend-client = { workspace = true }
 codex-file-search = { workspace = true }
 codex-chatgpt = { workspace = true }
 codex-login = { workspace = true }
+codexmarathon-accountd-client = { workspace = true }
 codexmarathon-runtime = { workspace = true }
 codexmarathon-runtime-adapter = { workspace = true }
 codex-image-generation-extension = { workspace = true }

@@ -3354,3 +3354,144 @@ async fn missing_plan_type_maps_to_unknown() {
 
     pretty_assertions::assert_eq!(auth.account_plan_type(), Some(AccountPlanType::Unknown));
 }
+
+#[tokio::test]
+async fn managed_refresh_excludes_another_native_manager_in_the_same_home() {
+    let home = tempdir().expect("home");
+    write_auth_file(
+        AuthFileParams {
+            openai_api_key: None,
+            chatgpt_plan_type: Some("pro".into()),
+            chatgpt_account_id: Some(WORKSPACE_ID_ALLOWED.into()),
+        },
+        home.path(),
+    )
+    .expect("auth");
+    let manager = AuthManager::shared(
+        home.path().to_path_buf(),
+        false,
+        AuthCredentialsStoreMode::File,
+        None,
+        None,
+        AuthKeyringBackendKind::default(),
+        crate::test_support::transport_default_auth_route_config(),
+    )
+    .await;
+    let guard = manager
+        .managed_refresh_file_lock()
+        .await
+        .expect("guard")
+        .expect("file");
+    let contender = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(home.path().join("auth-refresh.lock"))
+        .expect("contender");
+    assert!(matches!(
+        contender.try_lock(),
+        Err(std::fs::TryLockError::WouldBlock)
+    ));
+    drop(guard);
+    contender.try_lock().expect("released");
+}
+
+#[tokio::test]
+#[serial]
+async fn authority_refresh_reloads_another_process_rotation_without_contacting_provider() {
+    let _endpoint = EnvVarGuard::set(
+        REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR,
+        "http://127.0.0.1:9/token",
+    );
+    let home = tempdir().expect("home");
+    write_auth_file(
+        AuthFileParams {
+            openai_api_key: None,
+            chatgpt_plan_type: Some("pro".into()),
+            chatgpt_account_id: Some(WORKSPACE_ID_ALLOWED.into()),
+        },
+        home.path(),
+    )
+    .expect("auth");
+    let manager = AuthManager::shared(
+        home.path().to_path_buf(),
+        false,
+        AuthCredentialsStoreMode::File,
+        None,
+        None,
+        AuthKeyringBackendKind::default(),
+        crate::test_support::transport_default_auth_route_config(),
+    )
+    .await;
+    let mut updated = manager.auth_dot_json_cached().expect("snapshot");
+    let tokens = updated.tokens.as_mut().expect("tokens");
+    tokens.access_token = "rotated-access".into();
+    tokens.refresh_token = "rotated-refresh".into();
+    save_auth(
+        home.path(),
+        &updated,
+        AuthCredentialsStoreMode::File,
+        AuthKeyringBackendKind::default(),
+    )
+    .expect("external rotation");
+    // This must return on guarded reload. Invalid fake tokens would make an
+    // actual provider request fail, and no provider request is configured here.
+    manager
+        .refresh_token_from_authority()
+        .await
+        .expect("guarded reload");
+    assert_eq!(
+        manager
+            .auth_dot_json_cached()
+            .expect("new snapshot")
+            .tokens
+            .expect("tokens")
+            .refresh_token,
+        "rotated-refresh"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn authority_refresh_refuses_another_account_installed_by_another_process() {
+    let _endpoint = EnvVarGuard::set(
+        REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR,
+        "http://127.0.0.1:9/token",
+    );
+    let home = tempdir().expect("home");
+    write_auth_file(
+        AuthFileParams {
+            openai_api_key: None,
+            chatgpt_plan_type: Some("pro".into()),
+            chatgpt_account_id: Some(WORKSPACE_ID_ALLOWED.into()),
+        },
+        home.path(),
+    )
+    .expect("auth");
+    let manager = AuthManager::shared(
+        home.path().to_path_buf(),
+        false,
+        AuthCredentialsStoreMode::File,
+        None,
+        None,
+        AuthKeyringBackendKind::default(),
+        crate::test_support::transport_default_auth_route_config(),
+    )
+    .await;
+    write_auth_file(
+        AuthFileParams {
+            openai_api_key: None,
+            chatgpt_plan_type: Some("pro".into()),
+            chatgpt_account_id: Some(WORKSPACE_ID_SECOND_ALLOWED.into()),
+        },
+        home.path(),
+    )
+    .expect("other auth");
+    assert!(manager.refresh_token_from_authority().await.is_err());
+    assert_eq!(
+        manager
+            .auth_cached()
+            .and_then(|auth| auth.get_account_id())
+            .as_deref(),
+        Some(WORKSPACE_ID_ALLOWED)
+    );
+}

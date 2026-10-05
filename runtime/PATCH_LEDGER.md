@@ -19,6 +19,7 @@ the product builds from the tracked copy under `runtime/codex-rs`.
 | M07 | Native `CodexNativeRuntime`: shared AuthManager/turn-watch/auth-transition-lock composition, isolated native login/refresh handlers, active opaque snapshot read for Account A synchronization, atomic reload-plus-transport invalidation, and exact target-identity validation | Account rate-limit reads still come from the native app-server account processor; the listener/launcher remains Agent 6 work |
 | M08 | `codexmarathon-accountd` and its typed client: owner-only local metadata/quota API, durable event cursors, automatic user-systemd installation, and shared persisted Codex-home resolution | Native AuthManager remains the credential authority; accountd never reads or transports credential snapshots |
 | M09 | `codexmarathon-transfer`: password-encrypted selected-account export, bounded authenticated archive validation, fresh identity-bound vault references, cross-process locking, and atomic batch import | Native app-server checkpointing supplies the current saved identity without exposing credentials on an RPC or daemon API |
+| M10 | Opt-in banked-reset expiry scheduling, durable credit claims and retries, typed daemon/app-server controls, and a separate native reset executor service | Native backend reset-credit inventory/redemption APIs and AuthManager remain the provider and credential authorities |
 
 ## Integration limitations
 

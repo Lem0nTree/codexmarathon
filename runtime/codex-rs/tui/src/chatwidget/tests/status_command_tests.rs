@@ -40,6 +40,26 @@ async fn marathon_status_displays_current_account_state() {
 }
 
 #[tokio::test]
+async fn marathon_expiry_commands_use_common_rpc_events() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+    for (action, expected) in [("on", Some(true)), ("off", Some(false)), ("status", None)] {
+        chat.dispatch_command_with_args(
+            SlashCommand::Marathon,
+            format!("auto-reset-expiry {action}"),
+            Vec::new(),
+        );
+        assert_matches!(rx.try_recv(), Ok(AppEvent::MarathonAutoResetExpiryRequest { enabled }) if enabled == expected);
+    }
+    chat.dispatch_command_with_args(
+        SlashCommand::Marathon,
+        "auto-reset-expiry invalid".to_string(),
+        Vec::new(),
+    );
+    assert_matches!(rx.try_recv(), Ok(AppEvent::InsertHistoryCell(_)));
+    assert!(rx.try_recv().is_err());
+}
+
+#[tokio::test]
 async fn marathon_export_starts_native_secret_safe_wizard() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
 
@@ -172,6 +192,7 @@ async fn marathon_controller_status_updates_configured_status_line_items() {
         auto_reset_enabled: false,
         auto_reset_phase: "idle".to_string(),
         auto_reset_last_error: None,
+        auto_reset_expiry: None,
     }));
 
     assert_eq!(

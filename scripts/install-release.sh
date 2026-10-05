@@ -9,6 +9,8 @@ daemon_dir=$HOME/.local/bin
 unit_dir=$HOME/.config/systemd/user
 unit_dropin_dir=$unit_dir/codexmarathon-accountd.service.d
 unit_dropin=$unit_dropin_dir/10-codex-home.conf
+executor_dropin_dir=$unit_dir/codexmarathon-reset-executor.service.d
+executor_dropin=$executor_dropin_dir/10-codex-home.conf
 shared_app_server_disabled=false
 umask 077
 
@@ -182,9 +184,11 @@ require_file() {
 
 require_file codex
 require_file codexmarathon-accountd
+require_file codexmarathon-reset-executor
 require_file codex-code-mode-host
 require_file systemd/user/codexmarathon-accountd.service
 require_file systemd/user/codexmarathon-accountd.socket
+require_file systemd/user/codexmarathon-reset-executor.service
 command -v systemctl >/dev/null 2>&1 || {
     echo 'systemctl is required to install codexmarathon-accountd.' >&2
     exit 1
@@ -216,7 +220,7 @@ mkdir -p "$cli_dir" "$daemon_dir" "$unit_dir"
 mkdir -p "$codex_home/marathon"
 chmod 0700 "$codex_home" "$codex_home/marathon"
 configure_embedded_app_server
-systemctl --user stop codexmarathon-accountd.socket codexmarathon-accountd.service \
+systemctl --user stop codexmarathon-reset-executor.service codexmarathon-accountd.socket codexmarathon-accountd.service \
     >/dev/null 2>&1 || true
 
 install_binary_atomically() {
@@ -243,10 +247,14 @@ for binary in codex codex-code-mode-host codex-responses-api-proxy bwrap; do
 done
 install_binary_atomically "$package_dir/codexmarathon-accountd" \
     "$daemon_dir/codexmarathon-accountd"
+install_binary_atomically "$package_dir/codexmarathon-reset-executor" \
+    "$daemon_dir/codexmarathon-reset-executor"
 install -m 0644 "$package_dir/systemd/user/codexmarathon-accountd.service" \
     "$unit_dir/codexmarathon-accountd.service"
 install -m 0644 "$package_dir/systemd/user/codexmarathon-accountd.socket" \
     "$unit_dir/codexmarathon-accountd.socket"
+install -m 0644 "$package_dir/systemd/user/codexmarathon-reset-executor.service" \
+    "$unit_dir/codexmarathon-reset-executor.service"
 
 if [ "$custom_codex_home" = true ]; then
     mkdir -p "$unit_dropin_dir"
@@ -265,21 +273,34 @@ if [ "$custom_codex_home" = true ]; then
     } > "$override_tmp"
     chmod 0600 "$override_tmp"
     mv -f "$override_tmp" "$unit_dropin"
+    mkdir -p "$executor_dropin_dir"
+    executor_override_tmp=$(mktemp "$executor_dropin_dir/.10-codex-home.conf.XXXXXX")
+    {
+        printf '[Service]\n'
+        printf 'Environment=%s\n' "$(systemd_quote "CODEX_HOME=$codex_home")"
+        printf 'ReadWritePaths=\n'
+        printf 'ReadWritePaths=%s\n' "$(systemd_quote "$codex_home")"
+    } > "$executor_override_tmp"
+    chmod 0600 "$executor_override_tmp"
+    mv -f "$executor_override_tmp" "$executor_dropin"
 else
     # A default-path upgrade must not retain an earlier custom override.
     rm -f -- "$unit_dropin"
     rmdir "$unit_dropin_dir" 2>/dev/null || true
+    rm -f -- "$executor_dropin"
+    rmdir "$executor_dropin_dir" 2>/dev/null || true
 fi
 
 persist_home_config
 
 systemctl --user daemon-reload
 # Recover installs that previously exhausted the namespace/startup retry limit.
-systemctl --user reset-failed codexmarathon-accountd.socket codexmarathon-accountd.service
+systemctl --user reset-failed codexmarathon-accountd.socket codexmarathon-accountd.service codexmarathon-reset-executor.service
 systemctl --user enable --now \
-    codexmarathon-accountd.socket codexmarathon-accountd.service
+    codexmarathon-accountd.socket codexmarathon-accountd.service codexmarathon-reset-executor.service
 systemctl --user is-active --quiet codexmarathon-accountd.socket
 systemctl --user is-active --quiet codexmarathon-accountd.service
+systemctl --user is-active --quiet codexmarathon-reset-executor.service
 if [ "$shared_app_server_disabled" = true ]; then
     # TUI discovery can still reuse an already-running old daemon even with
     # daemon_auto_start disabled. Stop it so this install uses the embedded

@@ -31,6 +31,10 @@ fi
 exit 0'
 make_executable "$package_dir/codex-code-mode-host" 'exit 0'
 make_executable "$package_dir/codexmarathon-accountd" 'exit 0'
+make_executable "$package_dir/codexmarathon-reset-executor" 'exit 0'
+printf '%s\n' '[Unit]' 'Description=test reset executor' '[Service]' 'Type=exec' \
+    'ExecStart=/bin/true' > \
+    "$package_dir/systemd/user/codexmarathon-reset-executor.service"
 printf '%s\n' '[Unit]' 'Description=test accountd' '[Service]' 'Type=exec' \
     'ExecStart=/bin/true' > \
     "$package_dir/systemd/user/codexmarathon-accountd.service"
@@ -44,6 +48,7 @@ export XDG_CONFIG_HOME="$tmp_root/xdg config"
 custom_home="$tmp_root/custom Codex \"Home\" \\state"
 fallback_home="$tmp_root/fallback Codex Home"
 override=$HOME/.config/systemd/user/codexmarathon-accountd.service.d/10-codex-home.conf
+executor_override=$HOME/.config/systemd/user/codexmarathon-reset-executor.service.d/10-codex-home.conf
 mkdir -p "$HOME/.local/bin"
 printf 'legacy helper\n' > "$tmp_root/legacy-code-mode-host"
 ln -s "$tmp_root/legacy-code-mode-host" "$HOME/.local/bin/codex-code-mode-host"
@@ -56,6 +61,11 @@ CODEXMARATHON_CODEX_HOME="$custom_home" \
 [ "$(cat "$tmp_root/legacy-code-mode-host")" = 'legacy helper' ] || \
     fail 'code-mode host install followed an existing destination symlink'
 [ -f "$override" ] || fail 'custom CODEX_HOME did not create the drop-in'
+[ -f "$executor_override" ] || fail 'custom CODEX_HOME did not configure the reset executor'
+grep -F 'Environment="CODEX_HOME=' "$executor_override" >/dev/null || \
+    fail 'executor custom home environment is missing'
+grep -F 'ReadWritePaths=' "$executor_override" >/dev/null || \
+    fail 'executor custom home write allowlist is missing'
 [ -d "$custom_home/marathon" ] || fail 'custom Marathon state directory was not created'
 config_file=$XDG_CONFIG_HOME/codexmarathon/config.json
 [ -f "$config_file" ] || fail 'custom home was not persisted'
@@ -87,6 +97,8 @@ grep -F 'fallback Codex Home' "$config_file" >/dev/null || \
 env -u CODEXMARATHON_CODEX_HOME -u CODEX_HOME \
     sh "$repo_root/scripts/install-release.sh" "$package_dir" >/dev/null
 [ ! -e "$override" ] || fail 'default upgrade retained the custom drop-in'
+[ ! -e "$executor_override" ] || fail 'default upgrade retained the executor custom drop-in'
+[ -x "$HOME/.local/bin/codexmarathon-reset-executor" ] || fail 'reset executor binary is missing'
 [ -d "$HOME/.codex/marathon" ] || fail 'default Marathon state directory was not created'
 grep -F "$HOME/.codex" "$config_file" >/dev/null || \
     fail 'default home was not persisted'

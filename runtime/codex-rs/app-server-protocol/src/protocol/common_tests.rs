@@ -57,11 +57,13 @@ fn client_response_jsonrpc_parts_preserve_payloads_and_request_ids() -> Result<(
             ClientResponsePayload::GetAccount(v2::GetAccountResponse {
                 account: Some(v2::Account::ApiKey {}),
                 requires_openai_auth: false,
+                auth_changed: false,
                 workspace_routing: None,
             }),
             json!({
                 "account": { "type": "apiKey" },
                 "requiresOpenaiAuth": false,
+                "authChanged": false,
                 "workspaceRouting": null,
             }),
         ),

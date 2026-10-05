@@ -12,12 +12,12 @@ case "$target" in
     # rusty_v8 does not publish the sandboxed code-mode-host archive for Linux ARM64.
     # Use the pinned upstream helper while keeping the primary Codex CLI and its
     # sandbox helper fully native on this target.
-    binaries=(codex codexmarathon-accountd codex-code-mode-host bwrap)
+    binaries=(codex codexmarathon-accountd codexmarathon-reset-executor codex-code-mode-host bwrap)
     asset_platform=linux-aarch64
     use_upstream_code_mode_host=true
     ;;
   *linux*)
-    binaries=(codex codexmarathon-accountd codex-code-mode-host codex-responses-api-proxy bwrap)
+    binaries=(codex codexmarathon-accountd codexmarathon-reset-executor codex-code-mode-host codex-responses-api-proxy bwrap)
     asset_platform=linux-x86_64
     use_upstream_code_mode_host=false
     ;;
@@ -35,7 +35,7 @@ mkdir -p "${output_dir}"
   export CODEX_BWRAP_SHA256
   CODEX_BWRAP_SHA256="$(sha256sum "target/${target}/release/bwrap" | awk '{print $1}')"
   export STABLE_GIT_COMMIT="${CODEXMARATHON_UPSTREAM_COMMIT:-unknown}"
-  cargo_build_args=(cargo build --locked --release --target "$target" --bin codex --bin codexmarathon-accountd)
+  cargo_build_args=(cargo build --locked --release --target "$target" --bin codex --bin codexmarathon-accountd --bin codexmarathon-reset-executor)
   if [[ "$target" != "aarch64-unknown-linux-gnu" ]]; then
     cargo_build_args+=(--bin codex-code-mode-host --bin codex-responses-api-proxy)
   fi
@@ -67,11 +67,15 @@ install -Dm0644 "${repo_root}/infra/systemd/user/codexmarathon-accountd.service"
   "${package_dir}/systemd/user/codexmarathon-accountd.service"
 install -Dm0644 "${repo_root}/infra/systemd/user/codexmarathon-accountd.socket" \
   "${package_dir}/systemd/user/codexmarathon-accountd.socket"
+install -Dm0644 "${repo_root}/infra/systemd/user/codexmarathon-reset-executor.service" \
+  "${package_dir}/systemd/user/codexmarathon-reset-executor.service"
 
 tar -C "$package_dir" -czf "$archive" .
 "${package_dir}/codex" marathon --help >/dev/null
 archive_manifest="$(tar -tzf "$archive")"
 grep -Fxq './install-codexmarathon' <<<"$archive_manifest"
 grep -Fxq './systemd/user/codexmarathon-accountd.service' <<<"$archive_manifest"
+grep -Fxq './systemd/user/codexmarathon-reset-executor.service' <<<"$archive_manifest"
+grep -Fxq './codexmarathon-reset-executor' <<<"$archive_manifest"
 grep -Fxq './codex-code-mode-host' <<<"$archive_manifest"
 echo "CodexMarathon package created at $archive (${binaries[*]})."

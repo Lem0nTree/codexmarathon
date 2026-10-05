@@ -96,6 +96,12 @@ pub(crate) enum MarathonAction {
         action: AutoResetAction,
     },
 
+    /// Use banked reset credits fifteen minutes before expiry (default off).
+    AutoResetExpiry {
+        #[command(subcommand)]
+        action: AutoResetAction,
+    },
+
     /// Store the currently authenticated native Codex identity under ALIAS.
     Import {
         /// Local account alias, for example `personal` or `work`.
@@ -1081,6 +1087,35 @@ async fn run_action(
                 }
             );
         }
+        MarathonAction::AutoResetExpiry { action } => {
+            let response: codex_app_server_protocol::MarathonAutoResetExpiryStatusResponse =
+                match action {
+                    AutoResetAction::Status => {
+                        request(
+                            client,
+                            ClientRequest::MarathonAutoResetExpiryStatus {
+                                request_id: request_id("marathon-expiry-status"),
+                                params: None,
+                            },
+                        )
+                        .await?
+                    }
+                    AutoResetAction::On | AutoResetAction::Off => {
+                        request(
+                            client,
+                            ClientRequest::MarathonAutoResetExpirySet {
+                                request_id: request_id("marathon-expiry-set"),
+                                params:
+                                    codex_app_server_protocol::MarathonAutoResetExpirySetParams {
+                                        enabled: matches!(action, AutoResetAction::On),
+                                    },
+                            },
+                        )
+                        .await?
+                    }
+                };
+            print_expiry_status(&response.into());
+        }
         MarathonAction::AutoReset { action } => match action {
             AutoResetAction::Status => {
                 let status: MarathonStatusResponse = request(
@@ -1389,12 +1424,10 @@ async fn login_and_import(
         LoginMode::DeviceCode => Duration::from_secs(16 * 60),
         LoginMode::Browser => Duration::from_secs(10 * 60),
     };
-    let completion = tokio::time::timeout(
-        login_timeout,
-        wait_for_login_completion(client, &login_id),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("native login timed out"))??;
+    let completion =
+        tokio::time::timeout(login_timeout, wait_for_login_completion(client, &login_id))
+            .await
+            .map_err(|_| anyhow::anyhow!("native login timed out"))??;
     if !completion.success {
         anyhow::bail!(
             "native login failed{}",
@@ -1495,6 +1528,42 @@ fn request_id(label: &str) -> RequestId {
     RequestId::String(label.to_string())
 }
 
+fn print_expiry_status(status: &codex_app_server_protocol::MarathonAutoResetExpiryStatus) {
+    println!(
+        "Banked reset expiry automation: {} (effective: {}, executor: {}, lead time: 15 minutes)",
+        if status.enabled {
+            "enabled"
+        } else {
+            "disabled"
+        },
+        if status.effective_enabled {
+            "enabled"
+        } else {
+            "disabled"
+        },
+        if status.executor_available {
+            "available"
+        } else {
+            "unavailable"
+        }
+    );
+    if let Some(next) = &status.next_attempt_at {
+        println!("Next expiry attempt: {next}");
+    }
+    for job in &status.jobs {
+        println!(
+            "  {} / {}: {} (expiry: {}, attempts: {}, next retry: {}, result: {})",
+            job.account_id,
+            job.credit_id,
+            job.state,
+            job.expires_at,
+            job.attempt,
+            job.next_attempt_at.as_deref().unwrap_or("none"),
+            job.diagnostic_code.as_deref().unwrap_or("none")
+        );
+    }
+}
+
 fn print_status(status: &MarathonStatusResponse) {
     println!(
         "Native Marathon: {}",
@@ -1519,6 +1588,10 @@ fn print_status(status: &MarathonStatusResponse) {
     );
     if let Some(error) = &status.auto_reset_last_error {
         println!("Automatic quota reset last result: {error}");
+    }
+    match &status.auto_reset_expiry {
+        Some(expiry) => print_expiry_status(expiry),
+        None => println!("Banked reset expiry automation: daemon unavailable"),
     }
     println!("Accounts: {}", status.accounts.len());
     for account in &status.accounts {
@@ -1655,6 +1728,29 @@ mod tests {
     fn bare_command_defaults_to_status() {
         let command = MarathonCommand::try_parse_from(["marathon"]).expect("valid command");
         assert!(command.action.is_none());
+    }
+
+    #[test]
+    fn parses_independent_expiry_actions() {
+        for (action, expected) in [
+            ("on", AutoResetAction::On),
+            ("off", AutoResetAction::Off),
+            ("status", AutoResetAction::Status),
+        ] {
+            let command =
+                MarathonCommand::try_parse_from(["marathon", "auto-reset-expiry", action])
+                    .expect("valid expiry command");
+            match command.action {
+                Some(MarathonAction::AutoResetExpiry { action }) => assert_eq!(
+                    std::mem::discriminant(&action),
+                    std::mem::discriminant(&expected)
+                ),
+                _ => panic!("expected expiry action"),
+            }
+        }
+        assert!(
+            MarathonCommand::try_parse_from(["marathon", "auto-reset-expiry", "invalid"]).is_err()
+        );
     }
 
     #[test]

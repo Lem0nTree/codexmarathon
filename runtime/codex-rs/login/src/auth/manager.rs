@@ -2607,6 +2607,7 @@ impl AuthManager {
             .acquire()
             .await
             .map_err(|_| std::io::Error::other("auth transition guard is unavailable"))?;
+        let _file_guard = self.managed_refresh_file_lock().await?;
         self.ensure_transition_storage()?;
         let (_current_auth, current_account_id) = self.current_transition_source()?;
         if current_account_id != expected_account_id {
@@ -2649,6 +2650,7 @@ impl AuthManager {
             .acquire()
             .await
             .map_err(|_| std::io::Error::other("auth transition guard is unavailable"))?;
+        let _file_guard = self.managed_refresh_file_lock().await?;
         self.ensure_transition_storage()?;
         let (_current_auth, current_account_id) = self.current_transition_source()?;
         if current_account_id != expected_source_id {
@@ -2703,6 +2705,7 @@ impl AuthManager {
             .acquire()
             .await
             .map_err(|_| std::io::Error::other("auth transition guard is unavailable"))?;
+        let _file_guard = self.managed_refresh_file_lock().await?;
         self.ensure_transition_storage()?;
         if self.auth_cached().is_some() {
             return Err(std::io::Error::new(
@@ -3272,6 +3275,53 @@ impl AuthManager {
         Ok(auth)
     }
 
+    /// Coordinate managed refresh with other native processes using this home.
+    /// The semaphore is always acquired first. Marathon callers acquire their
+    /// state lock before entering native auth, so native refresh never acquires
+    /// Marathon state while holding this file lock.
+    async fn managed_refresh_file_lock(&self) -> std::io::Result<Option<std::fs::File>> {
+        if self.has_external_auth() || !matches!(self.auth_cached(), Some(CodexAuth::Chatgpt(_))) {
+            return Ok(None);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            use std::os::unix::fs::OpenOptionsExt;
+            let path = self.codex_home.join("auth-refresh.lock");
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(path)?;
+            let metadata = file.metadata()?;
+            if !metadata.is_file()
+                || metadata.mode() & 0o077 != 0
+                || metadata.uid() != unsafe { libc::geteuid() }
+            {
+                return Err(std::io::Error::other("unsafe native auth refresh lock"));
+            }
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                match file.try_lock() {
+                    Ok(()) => return Ok(Some(file)),
+                    Err(std::fs::TryLockError::WouldBlock)
+                        if tokio::time::Instant::now() < deadline =>
+                    {
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                    }
+                    Err(error) => return Err(std::io::Error::from(error)),
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(None)
+        }
+    }
+
     /// Attempt to refresh the token by first performing a guarded reload from
     /// the active auth source. If the loaded token differs from the cached token,
     /// we can assume that the source already refreshed it. Otherwise, ask the
@@ -3283,6 +3333,10 @@ impl AuthManager {
                 REFRESH_TOKEN_UNKNOWN_MESSAGE.to_string(),
             ))
         })?;
+        let _file_guard = self
+            .managed_refresh_file_lock()
+            .await
+            .map_err(RefreshTokenError::Transient)?;
         let auth_before_reload = self.auth_cached();
         if auth_before_reload
             .as_ref()
@@ -3322,6 +3376,28 @@ impl AuthManager {
                 REFRESH_TOKEN_UNKNOWN_MESSAGE.to_string(),
             ))
         })?;
+        let _file_guard = self
+            .managed_refresh_file_lock()
+            .await
+            .map_err(RefreshTokenError::Transient)?;
+        // A different process may have rotated the refresh token while we
+        // waited. Reload under the same lock before issuing another rotation.
+        if !self.has_external_auth() {
+            let expected = self
+                .auth_cached()
+                .as_ref()
+                .and_then(CodexAuth::get_account_id);
+            match self.reload_if_account_id_matches(expected.as_deref()).await {
+                ReloadOutcome::ReloadedChanged => return Ok(()),
+                ReloadOutcome::ReloadedNoChange => {}
+                ReloadOutcome::Skipped => {
+                    return Err(RefreshTokenError::Permanent(RefreshTokenFailedError::new(
+                        RefreshTokenFailedReason::Other,
+                        REFRESH_TOKEN_ACCOUNT_MISMATCH_MESSAGE.to_string(),
+                    )));
+                }
+            }
+        }
         self.refresh_token_from_authority_impl().await
     }
 

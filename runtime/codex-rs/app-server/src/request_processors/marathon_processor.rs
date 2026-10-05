@@ -16,10 +16,30 @@ impl MarathonRequestProcessor {
         Self { service }
     }
 
-    pub(crate) fn status(&self) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
+    pub(crate) async fn status(&self) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
+        let mut response = self.service.status().map_err(map_service_error)?;
+        response.auto_reset_expiry = self.service.expiry_status().await.ok().map(Into::into);
+        Ok(Some(response.into()))
+    }
+
+    pub(crate) async fn expiry_status(
+        &self,
+    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
         self.service
-            .status()
+            .expiry_status()
+            .await
             .map(|response| Some(response.into()))
+            .map_err(map_service_error)
+    }
+
+    pub(crate) async fn expiry_set(
+        &self,
+        params: codex_app_server_protocol::MarathonAutoResetExpirySetParams,
+    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
+        self.service
+            .expiry_set_enabled(params.enabled)
+            .await
+            .map(|response| Some(ClientResponsePayload::MarathonAutoResetExpirySet(response)))
             .map_err(map_service_error)
     }
 

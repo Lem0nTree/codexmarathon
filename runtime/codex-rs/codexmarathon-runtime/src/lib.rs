@@ -30,6 +30,7 @@ pub mod accounts;
 pub mod auto_reset;
 pub mod config;
 pub mod errors;
+pub mod expiry_executor;
 pub mod journal;
 pub mod legacy;
 mod persistence;

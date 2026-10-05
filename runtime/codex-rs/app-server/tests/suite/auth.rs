@@ -231,6 +231,7 @@ async fn personal_access_token_without_email_supports_auth_status_and_account_re
                 plan_type: AccountPlanType::EnterpriseCbpAutomation,
             }),
             requires_openai_auth: true,
+            auth_changed: false,
         }
     );
 

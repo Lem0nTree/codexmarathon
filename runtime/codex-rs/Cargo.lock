@@ -2139,6 +2139,7 @@ dependencies = [
  "codex-web-search-extension",
  "codex-websocket-auth",
  "codex-windows-sandbox",
+ "codexmarathon-accountd-client",
  "codexmarathon-runtime",
  "codexmarathon-runtime-adapter",
  "core_test_support",
@@ -3818,6 +3819,7 @@ dependencies = [
  "http 1.4.0",
  "jsonwebtoken",
  "keyring",
+ "libc",
  "once_cell",
  "os_info",
  "pretty_assertions",
@@ -5367,6 +5369,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -5396,12 +5399,15 @@ dependencies = [
 name = "codexmarathon-runtime"
 version = "0.160.0"
 dependencies = [
+ "anyhow",
  "chrono",
  "codex-backend-client",
  "codex-core",
  "codex-http-client",
  "codex-login",
  "codex-protocol",
+ "codexmarathon-accountd-client",
+ "codexmarathon-home",
  "codexmarathon-runtime-adapter",
  "libc",
  "log",
@@ -5413,6 +5419,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "wiremock",
  "zeroize",
 ]
 

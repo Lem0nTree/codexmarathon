@@ -1273,7 +1273,13 @@ impl MessageProcessor {
                 .clients_revoke(params)
                 .await
                 .map(|response| Some(response.into())),
-            ClientRequest::MarathonStatus { .. } => self.marathon_processor.status(),
+            ClientRequest::MarathonStatus { .. } => self.marathon_processor.status().await,
+            ClientRequest::MarathonAutoResetExpiryStatus { .. } => {
+                self.marathon_processor.expiry_status().await
+            }
+            ClientRequest::MarathonAutoResetExpirySet { params, .. } => {
+                self.marathon_processor.expiry_set(params).await
+            }
             ClientRequest::MarathonEnabledSet { params, .. } => {
                 self.marathon_processor.enabled_set(params).await
             }

@@ -1395,6 +1395,7 @@ mod tests {
                         workspace_routing: None,
                         account: None,
                         requires_openai_auth: false,
+                        auth_changed: false,
                     })
                     .expect("response should serialize"),
                 }),
@@ -1451,6 +1452,7 @@ mod tests {
                         workspace_routing: None,
                         account: None,
                         requires_openai_auth: false,
+                        auth_changed: false,
                     })
                     .expect("response should serialize"),
                 }),
@@ -1501,6 +1503,7 @@ mod tests {
                     result: serde_json::json!({
                         "account": null,
                         "requiresOpenaiAuth": false,
+                        "authChanged": false,
                         "padding": padding,
                     }),
                 }),
@@ -1528,6 +1531,7 @@ mod tests {
                 workspace_routing: None,
                 account: None,
                 requires_openai_auth: false,
+                auth_changed: false,
             }
         );
 
@@ -1632,6 +1636,7 @@ mod tests {
                         workspace_routing: None,
                         account: None,
                         requires_openai_auth: false,
+                        auth_changed: false,
                     })
                     .expect("response should serialize"),
                 }),
@@ -1686,6 +1691,7 @@ mod tests {
                 workspace_routing: None,
                 account: None,
                 requires_openai_auth: false,
+                auth_changed: false,
             }
         );
 

@@ -1,0 +1,86 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "MarathonAutoResetExpiryJob": {
+      "description": "Secret-free state of one durable expiry job.",
+      "properties": {
+        "accountId": {
+          "type": "string"
+        },
+        "attempt": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "creditId": {
+          "type": "string"
+        },
+        "diagnosticCode": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "expiresAt": {
+          "type": "string"
+        },
+        "jobId": {
+          "type": "string"
+        },
+        "nextAttemptAt": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "state": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "accountId",
+        "attempt",
+        "creditId",
+        "expiresAt",
+        "jobId",
+        "state"
+      ],
+      "type": "object"
+    }
+  },
+  "description": "Daemon-authoritative expiry state. Enabling this policy is independent of the zero-weekly-quota policy; the Marathon master switch gates execution.",
+  "properties": {
+    "effectiveEnabled": {
+      "type": "boolean"
+    },
+    "enabled": {
+      "type": "boolean"
+    },
+    "executorAvailable": {
+      "type": "boolean"
+    },
+    "jobs": {
+      "items": {
+        "$ref": "#/definitions/MarathonAutoResetExpiryJob"
+      },
+      "type": "array"
+    },
+    "jobsTruncated": {
+      "default": false,
+      "type": "boolean"
+    },
+    "nextAttemptAt": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "effectiveEnabled",
+    "enabled",
+    "executorAvailable",
+    "jobs"
+  ],
+  "title": "MarathonAutoResetExpiryStatusResponse",
+  "type": "object"
+}

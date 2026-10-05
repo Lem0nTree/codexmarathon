@@ -1,14 +1,14 @@
 # `codexmarathon-accountd`
 
 Status: the metadata-only SQLite quota store, app-server ingestion, accountd
-binary, scheduler seam, durable events/jobs, and read-only local API are
-implemented. Autospin and its native executor remain deliberately absent.
+binary, durable events/jobs, and local API are implemented. The banked-reset
+expiry policy adds durable scheduling and a separate native executor. The
+older exhaustion-based autospin policy remains mock-only.
 
 ## Decision
 
 `codexmarathon-accountd` is a long-lived, user-scoped metadata daemon and
-scheduler. It is deliberately separate from the native executor that may be
-added later. Accountd owns account identifiers and aliases, quota observations,
+scheduler. It is separate from the native reset executor. Accountd owns account identifiers and aliases, quota observations,
 job intent, durable job state, scheduling, and a replayable event stream. It
 does not own credentials, provider authentication, a Codex turn, or arbitrary
 process execution.
@@ -46,18 +46,43 @@ local clients
      |  AF_UNIX, owner-only permissions
      v
 accountd: metadata + SQLite + scheduler + events
-     |  vetted metadata job / acknowledgement, later phase
+     |  vetted metadata job / acknowledgement
      v
 constrained native executor: Codex authority and side effects
 ```
 
 Accountd may queue and schedule an allow-listed job description, but it must
 not receive tokens, cookies, authorization headers, credential snapshots, or
-raw shell commands. The future native executor is a separate trust boundary:
+raw shell commands. The native executor is a separate trust boundary:
 it validates the job, owns any native Codex authority it needs, applies its
 own sandbox and idempotency rules, and returns status/acknowledgement data.
-No executor is started by these units, and no provider call is made by the
-metadata daemon.
+The accountd units start no executor and make no provider calls. Releases also
+install `codexmarathon-reset-executor.service`, a separate native authority with
+credential access and HTTPS capability. Its expiry policy is disabled by
+default. Accountd keeps its existing credential and network restrictions.
+
+## Banked reset expiry
+
+`auto_reset_expiry_status` and `auto_reset_expiry_set` expose the persistent
+expiry policy. Setting requests include the expected Codex home, which the
+daemon checks before mutation. Native app-server methods expose the same
+policy to integrations. Existing version 1 read methods remain compatible.
+
+The narrow executor methods `expiry_executor_heartbeat`, `expiry_observe`,
+`expiry_claim`, and `expiry_complete` carry only typed metadata. Credits are
+bound to a managed account and an opaque provider credit ID. Expiration comes
+from the provider inventory, never a quota-window reset timestamp. Each
+logical redemption retains one idempotency key, including after a crash.
+Claims have leases and completion tokens so an old executor cannot acknowledge
+a newer claim. The scheduler attempts available credits at expiration minus
+900 seconds; overdue unexpired credits are eligible immediately.
+
+Retries use 5, 10, 20, then 30-second delays until the credit expires or the
+policy is disabled. Missing inventory details do not erase prior observations
+or establish redemption. A confirmed provider redemption is persisted before
+subsequent quota refresh so refresh failure cannot cause another credit to be
+spent. Success and retry diagnostics are available through the existing event
+stream and expiry status. All development tests use fake metadata/providers.
 
 ## Readiness and events
 
@@ -117,10 +142,11 @@ accountd), endpoint and allowed operation, idempotency behavior, rate/terms
 constraints, dry-run behavior, timeout, rollback or recovery path, and the
 post-action quota revalidation evidence. The constrained executor must enforce
 that contract and reject unknown providers, stale versions, missing evidence,
-or unsupported account modes. Every development and test path uses a fake
-executor; no real reset action is enabled by this project.
+or unsupported account modes. The exhaustion-based autospin implementation remains mock-only. The separate
+banked-reset expiry policy uses the existing native reset API after explicit
+opt-in; its tests use disposable metadata and simulated provider responses.
 
-## Phased delivery
+## Original autospin delivery phases
 
 1. **Foundation:** land the units and this design; implement private SQLite
    metadata, migrations, event replay, readiness, and crash reconciliation.
@@ -138,22 +164,26 @@ executor; no real reset action is enabled by this project.
 
 ## Installation and operations
 
-Build and install the account daemon and the CLI, then install the paired user
-units. Run these commands from the repository root:
+Build and install the account daemon, reset executor, and CLI, then install
+the user units. Run these commands from the repository root:
 
 ```bash
 cd runtime/codex-rs
-cargo build --release -p codexmarathon-accountd -p codex-cli
+cargo build --release --bin codexmarathon-accountd --bin codexmarathon-reset-executor --bin codex
 install -Dm0755 target/release/codexmarathon-accountd \
   "$HOME/.local/bin/codexmarathon-accountd"
 install -Dm0755 target/release/codex "$HOME/.local/bin/codex"
+install -Dm0755 target/release/codexmarathon-reset-executor \
+  "$HOME/.local/bin/codexmarathon-reset-executor"
 cd ../..
 install -Dm0644 infra/systemd/user/codexmarathon-accountd.service \
   "$HOME/.config/systemd/user/codexmarathon-accountd.service"
 install -Dm0644 infra/systemd/user/codexmarathon-accountd.socket \
   "$HOME/.config/systemd/user/codexmarathon-accountd.socket"
+install -Dm0644 infra/systemd/user/codexmarathon-reset-executor.service \
+  "$HOME/.config/systemd/user/codexmarathon-reset-executor.service"
 systemctl --user daemon-reload
-systemctl --user enable --now codexmarathon-accountd.socket codexmarathon-accountd.service
+systemctl --user enable --now codexmarathon-accountd.socket codexmarathon-accountd.service codexmarathon-reset-executor.service
 systemctl --user status codexmarathon-accountd.service codexmarathon-accountd.socket
 ```
 
