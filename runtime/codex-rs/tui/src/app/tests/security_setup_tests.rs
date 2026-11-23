@@ -3,6 +3,7 @@ use super::disconnect::serve_reconnect_requests;
 use super::*;
 use crate::app_server_session::ThreadParamsMode;
 use crate::security_setup::Identity;
+use crate::status::StatusAccountDisplay;
 use app_test_support::ChatGptAuthFixture;
 use app_test_support::write_chatgpt_auth;
 use codex_app_server_client::AppServerEvent;
@@ -27,6 +28,7 @@ async fn security_setup_fetch_with_default_features_uses_authenticated_codex_end
     write_chatgpt_auth(
         &app.config.codex_home,
         ChatGptAuthFixture::new("test-token")
+            .email("user@example.com")
             .account_id("account")
             .chatgpt_user_id("user"),
         AuthCredentialsStoreMode::File,
@@ -111,6 +113,7 @@ async fn security_setup_fetch_with_default_features_uses_authenticated_codex_end
             &server,
             AppServerEvent::ServerNotification(Box::new(ServerNotification::AccountUpdated(
                 AccountUpdatedNotification {
+                    reason: None,
                     auth_mode: Some(AuthMode::Chatgpt),
                     plan_type: None,
                 },
@@ -141,9 +144,14 @@ async fn security_setup_fetch_with_default_features_uses_authenticated_codex_end
         );
         app.replace_chat_widget(ChatWidget::new_with_app_event(init));
         let event = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut security_notice = None;
+            let mut email_loaded = false;
             loop {
                 let event = events.recv().await.unwrap();
-                if let AppEvent::SecuritySetupLoaded {
+                if matches!(event, AppEvent::AccountEmailLoaded { .. }) {
+                    app.handle_event(&mut tui, &mut server, event).await?;
+                    email_loaded = true;
+                } else if let AppEvent::SecuritySetupLoaded {
                     request_id: actual,
                     identity: actual_identity,
                     ..
@@ -151,11 +159,33 @@ async fn security_setup_fetch_with_default_features_uses_authenticated_codex_end
                 {
                     assert_eq!(*actual, request_id);
                     assert_eq!(actual_identity, &identity);
-                    break event;
+                    security_notice = Some(event);
+                }
+                if email_loaded && let Some(event) = security_notice.take() {
+                    break Result::<AppEvent>::Ok(event);
                 }
             }
         })
+        .await??;
+        app.handle_event(
+            &mut tui,
+            &mut server,
+            AppEvent::AccountEmailLoaded {
+                request_id: uuid::Uuid::new_v4(),
+                email: Some("stale@example.com".into()),
+                workspace: Some("stale-account".into()),
+                plan_type: codex_protocol::account::PlanType::Plus,
+            },
+        )
         .await?;
+        assert_eq!(
+            app.chat_widget.status_account_display(),
+            Some(&StatusAccountDisplay::ChatGpt {
+                email: Some("user@example.com".into()),
+                plan: None,
+                workspace: Some("account".to_string()),
+            })
+        );
         app.handle_event(&mut tui, &mut server, event).await?;
         assert!(!render_bottom_popup(&app.chat_widget, /*width*/ 70).contains("Set up security"));
     }
@@ -165,16 +195,15 @@ async fn security_setup_fetch_with_default_features_uses_authenticated_codex_end
 }
 
 #[tokio::test]
-async fn security_setup_skips_fetch_when_server_auth_does_not_match_saved_login() -> Result<()> {
-    for (auth_method, auth_token) in [
-        (
-            Some(AuthMode::ChatgptAuthTokens),
-            Some("other-account-token"),
-        ),
-        (Some(AuthMode::ChatgptAuthTokens), Some("saved-token")),
-        (Some(AuthMode::Chatgpt), Some("other-account-token")),
-        (Some(AuthMode::Chatgpt), None),
-        (None, None),
+async fn security_setup_skips_unavailable_or_mismatched_server_notice() -> Result<()> {
+    for response in [
+        json!({"result": {"notice": null}}),
+        json!({"error": {"code": -32601, "message": "Method not found"}}),
+        json!({"result": {"notice": {
+            "accountId": "other-account", "userId": "other-user",
+            "title": "Keep using Daybreak mode", "description": "Set up security.",
+            "action": {"label": "Set up security", "url": "https://chatgpt.com/cyber"}
+        }}}),
     ] {
         let (mut app, _events, _ops) = make_test_app_with_channels().await;
         let backend = wiremock::MockServer::start().await;
@@ -204,19 +233,13 @@ async fn security_setup_skips_fetch_when_server_auth_does_not_match_saved_login(
         let daemon = tokio::spawn(async move {
             let (stream, _) = listener.accept().await?;
             serve_reconnect_requests(tokio_tungstenite::accept_async(stream).await?, |request| {
-                assert_eq!(request.method, "getAuthStatus");
-                assert_eq!(
-                    request.params,
-                    Some(json!({"includeToken": true, "refreshToken": false}))
-                );
-                std::future::ready(Some(json!({"result": {
-                    "authMethod": auth_method, "authToken": auth_token,
-                    "requiresOpenaiAuth": true
-                }})))
+                assert_eq!(request.method, "account/securitySetup/read");
+                std::future::ready(Some(response.clone()))
             })
             .await
         });
         let server = AppServerSession::new(
+            crate::backend_id::BackendId::new(),
             crate::connect_remote_app_server(endpoint).await?,
             ThreadParamsMode::Embedded,
         );
@@ -236,7 +259,11 @@ async fn security_setup_skips_fetch_when_server_auth_does_not_match_saved_login(
         backend.verify().await;
         server.shutdown().await?;
         let methods = daemon.await??;
-        assert!(methods.iter().any(|method| method == "getAuthStatus"));
+        assert!(
+            methods
+                .iter()
+                .any(|method| method == "account/securitySetup/read")
+        );
     }
     Ok(())
 }

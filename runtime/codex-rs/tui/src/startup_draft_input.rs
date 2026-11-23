@@ -23,6 +23,9 @@ use crate::tui::TuiEvent;
 impl StartupDraftPump {
     pub(super) fn handle_event(&mut self, tui: &mut Tui, event: TuiEvent) -> io::Result<()> {
         let screen_size = tui.screen_size_for_event(&event)?;
+        if tui.dismiss_shortcut_on_input(&event, &mut self.key_chord_matcher) {
+            return Ok(());
+        }
         if let Some((started_at, mut newlines)) = self.pending_paste_newline.take() {
             let continues_paste = match &event {
                 TuiEvent::Key(KeyEvent {
@@ -30,7 +33,12 @@ impl StartupDraftPump {
                     modifiers,
                     kind: KeyEventKind::Press | KeyEventKind::Repeat,
                     ..
-                }) => !key_hint::has_ctrl_or_alt(*modifiers),
+                }) => {
+                    !key_hint::has_ctrl_or_alt(*modifiers)
+                        && !modifiers.intersects(
+                            KeyModifiers::SUPER | KeyModifiers::HYPER | KeyModifiers::META,
+                        )
+                }
                 TuiEvent::Key(KeyEvent {
                     code: KeyCode::Enter,
                     modifiers,
@@ -78,30 +86,39 @@ impl StartupDraftPump {
                     crate::keymap::KeyChordMatch::Completed(key) => key,
                     crate::keymap::KeyChordMatch::PassThrough => key,
                     crate::keymap::KeyChordMatch::Pending(_)
-                    | crate::keymap::KeyChordMatch::Cancelled
-                    | crate::keymap::KeyChordMatch::Ignored => return Ok(()),
+                    | crate::keymap::KeyChordMatch::Cancelled => {
+                        tui.frame_requester().schedule_frame();
+                        return Ok(());
+                    }
+                    crate::keymap::KeyChordMatch::Ignored => return Ok(()),
                 };
                 if key.code == KeyCode::Enter
                     && key.modifiers.is_empty()
-                    && self.bottom_pane.is_in_paste_burst()
+                    && (self.bottom_pane.is_startup_composer_action(key)
+                        || !self.bottom_pane.is_safe_startup_editor_key(key))
                 {
                     let text_len = self.bottom_pane.composer_text().len();
+                    let retained_paste = self.session_action
+                        == super::StartupDraftSessionAction::NewWhileRunning
+                        && !self.bottom_pane.is_in_paste_burst()
+                        && self
+                            .bottom_pane
+                            .has_startup_paste_window(Instant::now().into_std());
                     self.bottom_pane.flush_composer_paste_burst();
-                    if self
-                        .bottom_pane
-                        .composer_text()
-                        .len()
-                        .saturating_sub(text_len)
-                        > 1
-                        && (self.bottom_pane.is_startup_composer_action(key)
-                            || !self.bottom_pane.is_safe_startup_editor_key(key))
+                    if retained_paste
+                        || self
+                            .bottom_pane
+                            .composer_text()
+                            .len()
+                            .saturating_sub(text_len)
+                            > 1
                     {
                         self.pending_paste_newline = Some((Instant::now(), "\n".to_string()));
                     }
                 }
                 if self.initial_screen == StartupDraftInitialScreen::Composer
                     && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
-                    && self.session_action != super::StartupDraftSessionAction::NewFromCommandCenter
+                    && self.session_action != super::StartupDraftSessionAction::NewWhileRunning
                     && self.bottom_pane.is_startup_submit_key(key)
                 {
                     self.bottom_pane.flush_composer_paste_burst();
@@ -130,8 +147,7 @@ impl StartupDraftPump {
                 }
                 let previous_text = self.bottom_pane.composer_text();
                 if let Err(error) = handle_startup_draft_key(&mut self.bottom_pane, key)
-                    && !(self.session_action
-                        == super::StartupDraftSessionAction::NewFromCommandCenter
+                    && !(self.session_action == super::StartupDraftSessionAction::NewWhileRunning
                         && StartupCancelled::matches(&error))
                 {
                     if StartupCancelled::matches(&error)
@@ -151,7 +167,6 @@ impl StartupDraftPump {
                 }
             }
             TuiEvent::Paste(text) => {
-                self.key_chord_matcher.cancel();
                 if self.initial_screen == StartupDraftInitialScreen::Composer {
                     self.cancel_submission();
                     self.bottom_pane.flush_composer_paste_burst();
@@ -160,7 +175,6 @@ impl StartupDraftPump {
             }
             TuiEvent::Draw | TuiEvent::Resize(_) | TuiEvent::Resume | TuiEvent::FocusGained => {}
             TuiEvent::FocusLost => {
-                self.key_chord_matcher.cancel();
                 self.blossom.borrow_mut().cancel_replay();
                 return Ok(());
             }
@@ -170,7 +184,7 @@ impl StartupDraftPump {
                     || !matches!(
                         self.session_action,
                         super::StartupDraftSessionAction::New
-                            | super::StartupDraftSessionAction::NewFromCommandCenter
+                            | super::StartupDraftSessionAction::NewWhileRunning
                     )
                 {
                     return Ok(());
@@ -225,13 +239,14 @@ pub(super) fn handle_startup_draft_key(
         }
     }
 
-    if key_hint::has_ctrl_or_alt(key.modifiers) && !bottom_pane.is_safe_startup_editor_key(key)
-        || key.code == KeyCode::Enter && !bottom_pane.is_safe_startup_editor_key(key)
-        || key
-            .modifiers
-            .intersects(KeyModifiers::SUPER | KeyModifiers::HYPER | KeyModifiers::META)
-        || !bottom_pane.is_safe_startup_editor_key(key)
-            && !matches!(
+    let is_safe_startup_editor_key = bottom_pane.is_safe_startup_editor_key(key);
+    if !is_safe_startup_editor_key
+        && (key_hint::has_ctrl_or_alt(key.modifiers)
+            || key.code == KeyCode::Enter
+            || key
+                .modifiers
+                .intersects(KeyModifiers::SUPER | KeyModifiers::HYPER | KeyModifiers::META)
+            || !matches!(
                 key.code,
                 KeyCode::Char(_)
                     | KeyCode::Enter
@@ -244,7 +259,7 @@ pub(super) fn handle_startup_draft_key(
                     | KeyCode::End
                     | KeyCode::Backspace
                     | KeyCode::Delete
-            )
+            ))
     {
         return Ok(());
     }

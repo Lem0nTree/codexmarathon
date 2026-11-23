@@ -22,8 +22,24 @@ async fn build_config(temp_dir: &TempDir) -> Config {
         .expect("config should build")
 }
 
-#[tokio::test]
-async fn remote_resume_restores_saved_server_profile_without_permission_overrides() -> Result<()> {
+#[test]
+fn remote_resume_restores_saved_server_profile_without_permission_overrides() -> Result<()> {
+    // The embedded server and client load full configurations on the same test thread.
+    const TEST_STACK_SIZE_BYTES: usize = 16 * 1024 * 1024;
+    std::thread::Builder::new()
+        .name("tui-resume-permissions".into())
+        .stack_size(TEST_STACK_SIZE_BYTES)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?
+                .block_on(crate::boxed_future!(resume_with_saved_server_profile()))
+        })?
+        .join()
+        .expect("permission profile test thread panicked")
+}
+
+async fn resume_with_saved_server_profile() -> Result<()> {
     let home = tempfile::tempdir()?;
     std::fs::write(
         home.path().join("config.toml"),
@@ -83,7 +99,7 @@ async fn remote_resume_restores_saved_server_profile_without_permission_override
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
             if let Some(codex_app_server_client::AppServerEvent::ServerNotification(notification)) =
-                server.next_event().await
+                server.next_event().await.map(|event| event.event)
                 && let codex_app_server_protocol::ServerNotification::ThreadSettingsUpdated(
                     settings,
                 ) = *notification
@@ -130,13 +146,7 @@ async fn remote_resume_restores_saved_server_profile_without_permission_override
             ),
         );
     }
-    // A locally remembered profile may have been removed since selection.
-    let stale_selection = crate::app_event::PermissionProfileSelection {
-        profile_id: "removed-profile".into(),
-        approval_policy: None,
-        approvals_reviewer: None,
-        display_label: "removed-profile".into(),
-    };
+    // With no new selection, remote forks retain the saved profile.
     let forked = server
         .fork_thread_at(
             &local_settings,
@@ -145,7 +155,7 @@ async fn remote_resume_restores_saved_server_profile_without_permission_override
             /*last_turn_id*/ None,
             /*before_turn_id*/ None,
             ForkGoalContinuation::StartIfIdle,
-            Some(&stale_selection),
+            /*selected_profile*/ None,
         )
         .await?;
     assert_eq!(
@@ -165,7 +175,13 @@ async fn remote_resume_restores_saved_server_profile_without_permission_override
         codex_protocol::config_types::ApprovalsReviewer::AutoReview
     );
     let side = server
-        .fork_side_thread(&local_settings, client_config, thread_id)
+        .fork_side_thread(
+            &local_settings,
+            client_config,
+            thread_id,
+            /*selected_profile*/ None,
+            crate::app_server_session::SideChatStorage::Temporary,
+        )
         .await?;
     assert_eq!(
         side.session.active_permission_profile.unwrap().id,
@@ -415,7 +431,7 @@ async fn rollout_maintenance_contention_disables_cached_legacy_resume_shortcut()
         )
         .await?;
 
-    assert_eq!(app_server.next_request_id, next_request_id + 3);
+    assert_eq!(app_server.next_request_id, next_request_id + 4);
     assert_eq!(resumed.session.thread_id, thread_id);
     assert_eq!(
         app_server

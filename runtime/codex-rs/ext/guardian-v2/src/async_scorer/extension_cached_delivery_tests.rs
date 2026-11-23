@@ -1,5 +1,7 @@
 //! Verifies that confirmed Code Mode messaging invalidates cached approvals in both root and worker.
 
+use crate::async_scorer::conversation::ConversationBackend;
+
 use super::*;
 use codex_core::TurnInputRequest;
 use codex_protocol::user_input::UserInput;
@@ -116,7 +118,7 @@ async fn confirmed_root_delivery_invalidates_root_and_worker_cached_approvals() 
     let (_, test, registry, thread_server) = sample_configured_conversation_history_with_delivery(
         Vec::new(),
         r#"{"path":"README.md"}"#,
-        Some(TEST_GUARDIAN_POLICY),
+        (Some(TEST_GUARDIAN_POLICY), /* extra_policy */ None),
         "",
         /*model_defaults*/ None,
         ToolCallSource::Direct,
@@ -126,7 +128,9 @@ async fn confirmed_root_delivery_invalidates_root_and_worker_cached_approvals() 
     wait_for_mcp_server(&test.codex, "codex_apps").await?;
     allow_messaging_guardian_review(&thread_server).await;
     let root_store = test.codex.thread_extension_data();
-    let root_progress = root_store.get::<GuardianV2ScoreProgress>().unwrap();
+    let root_progress = ConversationBackend::for_turn(root_store, root_store)
+        .map(|cache| Arc::clone(&cache.progress))
+        .unwrap();
     tokio::time::timeout(ASYNC_TEST_TIMEOUT, async {
         while cached_score(root_store).is_none() || root_progress.inspect(/*call_id*/ None).lag > 0
         {
@@ -205,6 +209,7 @@ async fn confirmed_root_delivery_invalidates_root_and_worker_cached_approvals() 
     let mut config = test.config.clone();
     config.features.enable(Feature::GuardianV2)?;
     let session_store = ExtensionData::new("worker-cache-session");
+    worker.thread_extension_data().insert(config.clone());
     registry.thread_lifecycle_contributors()[0]
         .on_thread_start(ThreadStartInput {
             config: &config,
@@ -229,10 +234,21 @@ async fn confirmed_root_delivery_invalidates_root_and_worker_cached_approvals() 
     // Hold tool lag at zero so only the delivery can invalidate either approval.
     for (thread, before) in [(&test.codex, &root_before), (&worker, &worker_before)] {
         let store = thread.thread_extension_data();
-        let progress = store.get::<GuardianV2ScoreProgress>().unwrap();
+        let turn_store = ExtensionData::new("approval-turn");
+        turn_store.insert_arc(store.get::<Config>().expect("captured test config"));
+        let progress = ConversationBackend::for_turn(store, store)
+            .map(|cache| Arc::clone(&cache.progress))
+            .unwrap();
         seed_cached_score(&progress, store, /*index*/ 1_000, before.clone());
         assert_eq!(
-            cached_approval(&registry, store, "review action", /*metrics*/ None).await,
+            cached_approval(
+                &registry,
+                store,
+                &turn_store,
+                "review action",
+                /*metrics*/ None
+            )
+            .await,
             Some(ReviewDecision::Approved)
         );
     }
@@ -266,10 +282,14 @@ async fn confirmed_root_delivery_invalidates_root_and_worker_cached_approvals() 
         }
     );
     for thread in [&test.codex, &worker] {
+        let store = thread.thread_extension_data();
+        let turn_store = ExtensionData::new("approval-turn");
+        turn_store.insert_arc(store.get::<Config>().expect("captured test config"));
         assert_eq!(
             cached_approval(
                 &registry,
-                thread.thread_extension_data(),
+                store,
+                &turn_store,
                 "review action",
                 /*metrics*/ None
             )
@@ -277,6 +297,46 @@ async fn confirmed_root_delivery_invalidates_root_and_worker_cached_approvals() 
             None
         );
     }
+    // Missing retained root instructions must not permanently veto a matching LOW score.
+    ThreadIdle::wait(&test.codex).await;
+    ThreadIdle::wait(&worker).await;
+    test.codex
+        .inject_response_items(
+            (0..20)
+                .map(|index| user_instruction(&format!("Root instruction {index}.")))
+                .collect(),
+        )
+        .await?;
+    let snapshot = worker
+        .guardian_root_snapshot()
+        .await
+        .expect("root snapshot");
+    assert!(!snapshot.authorization_version.retained_context_complete);
+    assert!(
+        snapshot
+            .messages
+            .contains(&codex_core::GuardianRootMessage::IncompleteRootInstructions)
+    );
+    let store = worker.thread_extension_data();
+    let turn_store = ExtensionData::new("approval-turn");
+    turn_store.insert_arc(store.get::<Config>().expect("captured test config"));
+    let progress = ConversationBackend::for_turn(store, store)
+        .map(|cache| Arc::clone(&cache.progress))
+        .unwrap();
+    let authorization = ScoreAuthorization::current(&worker, &Default::default()).await;
+    assert!(authorization.local.retained_context_complete);
+    seed_cached_score(&progress, store, /*index*/ 1_000, authorization);
+    assert_eq!(
+        cached_approval(
+            &registry,
+            store,
+            &turn_store,
+            "review action",
+            /*metrics*/ None
+        )
+        .await,
+        Some(ReviewDecision::Approved)
+    );
     let shutdown = test
         .thread_manager
         .shutdown_all_threads_bounded(ASYNC_TEST_TIMEOUT)

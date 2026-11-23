@@ -2,6 +2,8 @@ use anyhow::Context as _;
 use anyhow::ensure;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use codex_protocol::protocol::TurnEnvironmentRequest;
+use codex_protocol::protocol::TurnEnvironmentRequests;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -23,9 +25,11 @@ use codex_config::types::McpServerConfig;
 use codex_config::types::McpServerEnvVar;
 use codex_config::types::McpServerTransportConfig;
 use codex_config::types::OAuthCredentialsStoreMode;
+use codex_core::AgentMcpMetadataRecipient;
 use codex_core::EnvironmentConfig;
 use codex_core::EnvironmentMcpPolicy;
 use codex_core::TurnInputRequest;
+use codex_core::TurnStartOptions;
 use codex_core::X_CODEX_ROUTING_HINT_HEADER;
 use codex_core::config::Config;
 use codex_core::windows_sandbox::WindowsSandboxLevelExt;
@@ -37,7 +41,10 @@ use codex_features::Feature;
 use codex_http_client::HttpClientBuilder;
 use codex_login::CodexAuth;
 use codex_mcp::CODEX_APPS_MCP_SERVER_NAME;
+use codex_mcp::MCP_SANDBOX_LAUNCHER_META_KEY;
+use codex_mcp::MCP_SANDBOX_STATE_CAPABILITY;
 use codex_mcp::MCP_SANDBOX_STATE_META_CAPABILITY;
+use codex_mcp::McpProtocolMode;
 use codex_mcp::SandboxState;
 use codex_models_manager::manager::RefreshStrategy;
 use codex_utils_path_uri::LegacyAppPathString;
@@ -83,14 +90,14 @@ use codex_protocol::protocol::McpStartupStatus;
 use codex_protocol::protocol::McpToolCallBeginEvent;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::ThreadSettingsOverrides;
-use codex_protocol::protocol::TurnEnvironmentSelection;
-use codex_protocol::protocol::TurnEnvironmentSelections;
 use codex_protocol::protocol::TurnSettingsUpdate;
 use codex_protocol::protocol::TurnSettingsUpdateOutcome;
 use codex_protocol::request_user_input::RequestUserInputAnswer;
 use codex_protocol::request_user_input::RequestUserInputResponse;
+use codex_protocol::turn_input::CyberAccessProgram;
 use codex_protocol::turn_input::TurnInput;
 use codex_protocol::user_input::UserInput;
+use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_cargo_bin::cargo_bin;
 use codex_utils_path_uri::PathUri;
 use core_test_support::apps_test_server::AppsTestServer;
@@ -130,8 +137,14 @@ use tokio::time::Instant;
 use tokio::time::sleep;
 use wiremock::MockServer;
 
+#[path = "mcp_network_policy_compat_tests.rs"]
+mod network_policy_compat_tests;
 #[path = "mcp_oauth_refresh_tests.rs"]
 mod oauth_refresh_tests;
+#[path = "mcp_sandbox_tests.rs"]
+mod sandbox_tests;
+#[path = "mcp_storage_telemetry_tests.rs"]
+mod storage_telemetry_tests;
 
 static OPENAI_PNG: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAD0AAAA9CAYAAAAeYmHpAAAE6klEQVR4Aeyau44UVxCGx1fZsmRLlm3Zoe0XcGQ5cUiCCIgJeS9CHgAhMkISQnIuGQgJEkBcxLW+nqnZ6uqqc+nuWRC7q/P3qetf9e+MtOwyX25O4Nep6JPyop++0qev9HrfgZ+F6r2DuB/vHOrt/UIkqdDHYvujOW6fO7h/CNEI+a5jc+pBR8uy0jVFsziYu5HtfSUk+Io34q921hLNctFSX0gwww+S8wce8K1LfCU+cYW4888aov8NxqvQILUPPReLOrm6zyLxa4i+6VZuFbJo8d1MOHZm+7VUtB/aIvhPWc/3SWg49JcwFLlHxuXKjtyloo+YNhuW3VS+WPBuUEMvCFKjEDVgFBQHXrnazpqiSxNZCkQ1kYiozsbm9Oz7l4i2Il7vGccGNWAc3XosDrZe/9P3ZnMmzHNEQw4smf8RQ87XEAMsC7Az0Au+dgXerfH4+sHvEc0SYGic8WBBUGqFH2gN7yDrazy7m2pbRTeRmU3+MjZmr1h6LJgPbGy23SI6GlYT0brQ71IY8Us4PNQCm+zepSbaD2BY9xCaAsD9IIj/IzFmKMSdHHonwdZATbTnYREf6/VZGER98N9yCWIvXQwXDoDdhZJoT8jwLnJXDB9w4Sb3e6nK5ndzlkTLnP3JBu4LKkbrYrU69gCVceV0JvpyuW1xlsUVngzhwMetn/XamtTORF9IO5YnWNiyeF9zCAfqR3fUW+vZZKLtgP+ts8BmQRBREAdRDhH3o8QuRh/YucNFz2BEjxbRN6LGzphfKmvP6v6QhqIQyZ8XNJ0W0X83MR1PEcJBNO2KC2Z1TW/v244scp9FwRViZxIOBF0Lctk7ZVSavdLvRlV1hz/ysUi9sr8CIcB3nvWBwA93ykTz18eAYxQ6N/K2DkPA1lv3iXCwmDUT7YkjIby9siXueIJj9H+pzSqJ9oIuJWTUgSSt4WO7o/9GGg0viR4VinNRUDoIj34xoCd6pxD3aK3zfdbnx5v1J3ZNNEJsE0sBG7N27ReDrJc4sFxz7dI/ZAbOmmiKvHBitQXpAdR6+F7v+/ol/tOouUV01EeMZQF2BoQDn6dP4XNr+j9GZEtEK1/L8pFw7bd3a53tsTa7WD+054jOFmPg1XBKPQgnqFfmFcy32ZRvjmiIIQTYFvyDxQ8nH8WIwwGwlyDjDznnilYyFr6njrlZwsKkBpO59A7OwgdzPEWRm+G+oeb7IfyNuzjEEVLrOVxJsxvxwF8kmCM6I2QYmJunz4u4TrADpfl7mlbRTWQ7VmrBzh3+C9f6Grc3YoGN9dg/SXFthpRsT6vobfXRs2VBlgBHXVMLHjDNbIZv1sZ9+X3hB09cXdH1JKViyG0+W9bWZDa/r2f9zAFR71sTzGpMSWz2iI4YssWjWo3REy1MDGjdwe5e0dFSiAC1JakBvu4/CUS8Eh6dqHdU0Or0ioY3W5ClSqDXAy7/6SRfgw8vt4I+tbvvNtFT2kVDhY5+IGb1rCqYaXNF08vSALsXCPmt0kQNqJT1p5eI1mkIV/BxCY1z85lOzeFbPBQHURkkPTlwTYK9gTVE25l84IbFFN+YJDHjdpn0gq6mrHht0dkcjbM4UL9283O5p77GN+SPW/QwVB4IUYg7Or+Kp7naR6qktP98LNF2UxWo9yObPIT9KYg+hK4i56no4rfnM0qeyFf6AwAAAP//trwR3wAAAAZJREFUAwBZ0sR75itw5gAAAABJRU5ErkJggg==";
 
@@ -405,7 +418,8 @@ async fn call_cwd_tool(
     server_name: &str,
     call_id: &str,
 ) -> anyhow::Result<Value> {
-    call_structured_tool(server, fixture, server_name, "cwd", call_id).await
+    let start = TurnStartOptions::default();
+    call_structured_tool(server, fixture, server_name, "cwd", call_id, start).await
 }
 
 async fn call_structured_tool(
@@ -414,6 +428,7 @@ async fn call_structured_tool(
     server_name: &str,
     tool_name: &str,
     call_id: &str,
+    start: TurnStartOptions,
 ) -> anyhow::Result<Value> {
     let namespace = format!("mcp__{server_name}");
     mount_sse_once(
@@ -434,10 +449,8 @@ async fn call_structured_tool(
     )
     .await;
 
-    fixture
-        .codex
-        .start_or_steer_turn(read_only_user_turn(fixture, "call the requested rmcp tool"))
-        .await?;
+    let input = read_only_user_turn(fixture, "call the requested rmcp tool").on_start(start);
+    fixture.codex.start_or_steer_turn(input).await?;
 
     wait_for_event(&fixture.codex, |ev| {
         matches!(ev, EventMsg::McpToolCallBegin(_))
@@ -461,6 +474,85 @@ async fn call_structured_tool(
 
     wait_for_event(&fixture.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
     Ok(structured_content)
+}
+
+enum AgentMetadataCase {
+    ApprovedPlugin,
+    NoHostOptIn,
+    UserOverride,
+}
+
+#[test_case(AgentMetadataCase::ApprovedPlugin, Some(CyberAccessProgram::Standard); "approved plugin")]
+#[test_case(AgentMetadataCase::ApprovedPlugin, None; "approved plugin without an explicit program")]
+#[test_case(AgentMetadataCase::UserOverride, Some(CyberAccessProgram::Standard); "same-name user override")]
+#[test_case(AgentMetadataCase::NoHostOptIn, Some(CyberAccessProgram::Standard); "matching plugin without host opt-in")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn agent_metadata_is_only_sent_to_the_selected_plugin(
+    case: AgentMetadataCase,
+    cyber_access_program: Option<CyberAccessProgram>,
+) -> anyhow::Result<()> {
+    skip_if_wine_exec!(
+        Ok(()),
+        "requires a Windows test_stdio_server in the Wine-exec environment"
+    );
+    let server = start_mock_server().await;
+    let home = Arc::new(tempdir()?);
+    let plugin_root = super::plugins::write_sample_plugin_manifest_and_config(&home);
+    let command = stdio_server_bin()?;
+    fs::write(
+        plugin_root.join(".mcp.json"),
+        serde_json::to_vec(&json!({ "mcpServers": { "sample": { "command": command } } }))?,
+    )?;
+    let transport = stdio_transport(command, /*env*/ None, Vec::new());
+    let recipient = AgentMcpMetadataRecipient {
+        plugin_id: "sample@test".into(),
+        plugin_root: PathUri::from_abs_path(&AbsolutePathBuf::try_from(plugin_root)?),
+        server_name: "sample".into(),
+        transport: transport.clone(),
+    };
+    let user_override = matches!(case, AgentMetadataCase::UserOverride);
+    let fixture = test_codex()
+        .with_home(home)
+        .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+        .with_config(move |config| {
+            if user_override {
+                insert_mcp_server(config, "sample", transport, TestMcpServerOptions::default());
+            }
+        })
+        .build(&server)
+        .await?;
+    if !matches!(case, AgentMetadataCase::NoHostOptIn) {
+        fixture.codex.thread_extension_data().insert(recipient);
+    }
+    wait_for_mcp_server(&fixture.codex, "sample").await?;
+
+    let call_id = "call-agent-context";
+    let meta = call_structured_tool(
+        &server,
+        &fixture,
+        "sample",
+        "sandbox_meta",
+        call_id,
+        TurnStartOptions {
+            root_turn_id: Some("original-root".into()),
+            turn_trigger: Some("composer".into()),
+            cyber_access_program,
+            ..Default::default()
+        },
+    )
+    .await?;
+    assert_eq!(meta["callId"], json!(call_id));
+    assert_eq!(meta["x-codex-turn-metadata"]["turn_trigger"], "composer");
+    let expect_private_metadata = matches!(case, AgentMetadataCase::ApprovedPlugin);
+    assert_eq!(
+        meta.get("x-codex-root-turn-id").cloned(),
+        expect_private_metadata.then(|| json!("original-root"))
+    );
+    assert_eq!(
+        meta.get("x-codex-cyber-access-program").cloned(),
+        expect_private_metadata.then(|| json!(cyber_access_program))
+    );
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
@@ -502,6 +594,7 @@ async fn assert_openai_form_capability_advertisement(expected: bool) -> anyhow::
         server_name,
         "client_capabilities",
         "call-client-capabilities",
+        Default::default(),
     )
     .await?;
     assert_eq!(
@@ -810,11 +903,11 @@ async fn environment_mcp_policy_filters_runtime_config_and_model_tools(
     submit_thread_settings(
         &fixture.codex,
         ThreadSettingsOverrides {
-            environments: Some(TurnEnvironmentSelections::new(
+            environments: Some(TurnEnvironmentRequests::new(
                 fixture.config.cwd.clone(),
-                vec![TurnEnvironmentSelection {
+                vec![TurnEnvironmentRequest {
                     config: EnvironmentConfigState::Pending,
-                    ..selection.clone()
+                    ..selection.clone().into_request()
                 }],
             )),
             ..Default::default()
@@ -859,6 +952,7 @@ async fn environment_mcp_policy_filters_runtime_config_and_model_tools(
         .environment_ready(
             &selection,
             EnvironmentConfig {
+                environment_hooks: Default::default(),
                 allow_login_shell: true,
                 workspace_roots: selection.workspace_roots.clone(),
                 permission_profile: PermissionProfileSnapshot::legacy(
@@ -884,6 +978,7 @@ async fn environment_mcp_policy_filters_runtime_config_and_model_tools(
         .codex
         .call_mcp_tool(
             "allowed",
+            /*environment_id*/ None,
             "echo",
             Some(json!({ "message": "ready" })),
             /*meta*/ None,
@@ -976,6 +1071,7 @@ async fn future_environment_mcp_policy_applies_on_the_next_turn() -> anyhow::Res
     wait_for_mcp_server(&fixture.codex, "environment_policy").await?;
     let selection = fixture.codex.environment_selections().await.remove(0);
     let mut config = EnvironmentConfig {
+        environment_hooks: Default::default(),
         allow_login_shell: fixture.config.permissions.allow_login_shell,
         workspace_roots: selection.workspace_roots.clone(),
         permission_profile: PermissionProfileSnapshot::legacy(
@@ -1001,11 +1097,11 @@ async fn future_environment_mcp_policy_applies_on_the_next_turn() -> anyhow::Res
         selected_capability_roots: Vec::new(),
     };
     let settings = |config| ThreadSettingsOverrides {
-        environments: Some(TurnEnvironmentSelections::new(
+        environments: Some(TurnEnvironmentRequests::new(
             fixture.config.cwd.clone(),
-            vec![TurnEnvironmentSelection {
+            vec![TurnEnvironmentRequest {
                 config: EnvironmentConfigState::Ready(config),
-                ..selection.clone()
+                ..selection.clone().into_request()
             }],
         )),
         ..Default::default()
@@ -1058,6 +1154,144 @@ async fn future_environment_mcp_policy_applies_on_the_next_turn() -> anyhow::Res
         .collect::<Vec<_>>();
     assert_eq!(tool_is_visible, vec![true, true, false]);
     Ok(())
+}
+
+#[test_case(Some("discovery"), true; "notification_during_listing")]
+#[test_case(Some("pagination"), true; "notification_invalidates_cursor")]
+#[test_case(None, false; "disabled")]
+#[test_case(Some("startup"), true; "notification_during_startup")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn discovers_and_calls_new_mcp_tool_in_same_turn(
+    invalidation: Option<&'static str>,
+    enabled: bool,
+) -> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+    skip_if_wine_exec!(Ok(()), "requires a Windows test_stdio_server binary");
+    mcp_tool_discovery_scenario(ToolMode::Direct, invalidation, enabled)
+        .await
+        .map(|_| ())
+}
+
+pub(super) async fn mcp_tool_discovery_scenario(
+    tool_mode: ToolMode,
+    invalidation: Option<&'static str>,
+    enabled: bool,
+) -> anyhow::Result<Vec<responses::ResponsesRequest>> {
+    let server = responses::start_mock_server().await;
+    let command = remote_aware_stdio_server_bin()?;
+    let test = test_codex()
+        .with_config(move |config| {
+            config.code_mode.disable_in_process_fallback = true;
+            config
+                .features
+                .enable(Feature::CodeModeHost)
+                .expect("enable Code Mode host");
+            if enabled {
+                config
+                    .features
+                    .enable(Feature::McpToolListChanged)
+                    .expect("enable tool-list refresh");
+            }
+            let mut env = HashMap::from([
+                ("MCP_TEST_DISCOVER_TOOLS".to_string(), "1".to_string()),
+                ("MCP_TEST_VALUE".to_string(), "discovered".to_string()),
+            ]);
+            if let Some(phase) = invalidation {
+                env.insert("MCP_TEST_INVALIDATE_LISTING".to_string(), phase.to_string());
+            }
+            insert_mcp_server(
+                config,
+                "discovery",
+                stdio_transport(command, Some(env), Vec::new()),
+                TestMcpServerOptions {
+                    environment_id: remote_aware_environment_id(),
+                    ..Default::default()
+                },
+            );
+        })
+        .with_model_info_override("gpt-5.5", move |model| {
+            model.tool_mode = Some(tool_mode);
+            model.supports_search_tool = false;
+            model.use_responses_lite = false;
+        })
+        .build_with_auto_env(&server)
+        .await?;
+    wait_for_mcp_server(&test.codex, "discovery").await?;
+    let mut mocks = Vec::new();
+    for (call_id, tool, arguments) in [
+        ("discover", "search_tools", r#"{"message":"find echo"}"#),
+        ("invoke", "echo", r#"{"message":"hello"}"#),
+    ] {
+        if !enabled && tool == "echo" {
+            break;
+        }
+        let call = if tool_mode == ToolMode::CodeModeOnly {
+            responses::ev_custom_tool_call(
+                call_id,
+                "exec",
+                &format!("text(await tools.mcp__discovery__{tool}({arguments}));"),
+            )
+        } else {
+            responses::ev_function_call_with_namespace(call_id, "mcp__discovery", tool, arguments)
+        };
+        mocks.push(
+            responses::mount_sse_once(
+                &server,
+                responses::sse(vec![
+                    responses::ev_response_created(call_id),
+                    call,
+                    responses::ev_completed(call_id),
+                ]),
+            )
+            .await,
+        );
+    }
+    mocks.push(responses::mount_sse_once(&server, responses::sse_completed("done")).await);
+    test.submit_turn("Discover the echo tool, then call it with hello.")
+        .await?;
+    let requests = mocks
+        .iter()
+        .map(responses::ResponseMock::single_request)
+        .collect::<Vec<_>>();
+    if tool_mode == ToolMode::Direct {
+        assert!(
+            requests[0]
+                .tool_by_name("mcp__discovery", "search_tools")
+                .is_some()
+        );
+        assert_eq!(
+            requests[0].tool_by_name("mcp__discovery", "echo").is_some(),
+            invalidation == Some("startup")
+        );
+        if !enabled {
+            assert_eq!(
+                requests[1].body_json()["tools"],
+                requests[0].body_json()["tools"]
+            );
+            return Ok(requests);
+        }
+        assert!(requests[1].tool_by_name("mcp__discovery", "echo").is_some());
+        let output = requests[2]
+            .function_call_output_text("invoke")
+            .expect("echo output");
+        let (_, payload) = output
+            .split_once("\nOutput:\n")
+            .expect("wrapped MCP output");
+        assert_eq!(
+            serde_json::from_str::<Value>(payload)?,
+            json!({
+                "echo": "ECHOING: hello", "env": "discovered",
+            })
+        );
+    } else {
+        assert!(
+            requests[2]
+                .custom_tool_call_output("invoke")
+                .to_string()
+                .contains("ECHOING: hello")
+        );
+    }
+    Ok(requests)
 }
 
 #[test_case("rmcp", "mcp__rmcp"; "simple name")]
@@ -1195,23 +1429,17 @@ async fn stdio_server_round_trip(server_name: &'static str, namespace: &str) -> 
 
     wait_for_event(&fixture.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
-    let search_request = search_mock.single_request().body_json();
-    let search_description = search_request
-        .get("tools")
-        .and_then(Value::as_array)
-        .and_then(|tools| {
-            tools
-                .iter()
-                .find(|tool| tool.get("type").and_then(Value::as_str) == Some("tool_search"))
-        })
-        .and_then(|tool| tool.get("description").and_then(Value::as_str))
-        .expect("the model should receive a tool search description");
+    let search_request = search_mock.single_request();
+    let tools_state = search_request
+        .message_input_texts("developer")
+        .into_iter()
+        .find(|text| text.starts_with("<tools>"))
+        .expect("the model should receive the deferred tools block");
     assert!(
-        search_description.len() < 513 * 1024,
-        "the complete tool search description must remain bounded"
+        tools_state.len() <= 4 * 1024,
+        "the deferred tools block must remain bounded"
     );
-    assert!(search_description.contains(&format!("- {server_name}: {expected_description}")));
-    assert!(search_description.contains("🦀keep the complete MCP metadata"));
+    assert!(tools_state.contains(&format!("- {namespace}: ")));
 
     let search_output = call_mock
         .single_request()
@@ -1365,9 +1593,12 @@ server_names = ["history", "notes"]
     Ok(())
 }
 
+#[test_case(McpProtocolMode::Legacy; "legacy")]
+#[test_case(McpProtocolMode::V20260728; "modern")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn modern_mcp_pagination_preserves_valid_tools_and_rejects_oversized_cursors()
--> anyhow::Result<()> {
+async fn mcp_pagination_preserves_valid_tools_and_rejects_oversized_cursors(
+    protocol_mode: McpProtocolMode,
+) -> anyhow::Result<()> {
     skip_if_wine_exec!(
         Ok(()),
         "requires a Windows test_stdio_server in the Wine-exec environment"
@@ -1375,43 +1606,45 @@ async fn modern_mcp_pagination_preserves_valid_tools_and_rejects_oversized_curso
     skip_if_no_network!(Ok(()));
 
     let server = responses::start_mock_server().await;
+    let call_id = "call-second-page-tool";
     let response = mount_sse_once(
         &server,
         responses::sse(vec![
             responses::ev_response_created("resp-1"),
-            responses::ev_assistant_message("msg-1", "done"),
+            responses::ev_function_call_with_namespace(call_id, "mcp__paginated", "sync", "{}"),
             responses::ev_completed("resp-1"),
         ]),
     )
     .await;
+    let final_mock = mount_sse_once(&server, responses::sse_completed("resp-2")).await;
     let command = remote_aware_stdio_server_bin()?;
     let fixture = test_codex()
         .with_model_info_override("gpt-5.4", |model| model.supports_search_tool = false)
         .with_config(move |config| {
             config
                 .features
-                .enable(Feature::Mcp20260728)
-                .expect("test config should allow modern MCP");
+                .set_enabled(
+                    Feature::Mcp20260728,
+                    protocol_mode == McpProtocolMode::V20260728,
+                )
+                .expect("test config should allow MCP protocol selection");
             for (server_name, pagination) in
                 [("paginated", "two-pages"), ("rejected", "oversized-cursor")]
             {
+                let mut env = HashMap::from([(
+                    "MCP_TEST_TOOL_PAGINATION".to_string(),
+                    pagination.to_string(),
+                )]);
+                if protocol_mode == McpProtocolMode::V20260728 {
+                    env.insert(
+                        "CODEX_MCP_PROTOCOL_VERSION".to_string(),
+                        "2026-07-28".to_string(),
+                    );
+                }
                 insert_mcp_server(
                     config,
                     server_name,
-                    stdio_transport(
-                        command.clone(),
-                        Some(HashMap::from([
-                            (
-                                "CODEX_MCP_PROTOCOL_VERSION".to_string(),
-                                "2026-07-28".to_string(),
-                            ),
-                            (
-                                "MCP_TEST_TOOL_PAGINATION".to_string(),
-                                pagination.to_string(),
-                            ),
-                        ])),
-                        Vec::new(),
-                    ),
+                    stdio_transport(command.clone(), Some(env), Vec::new()),
                     TestMcpServerOptions {
                         environment_id: remote_aware_environment_id(),
                         ..Default::default()
@@ -1422,10 +1655,25 @@ async fn modern_mcp_pagination_preserves_valid_tools_and_rejects_oversized_curso
         .build_with_auto_env(&server)
         .await?;
 
+    let mut started = std::collections::BTreeSet::new();
     let startup = loop {
         let event = fixture.codex.next_event().await?;
-        if let EventMsg::McpStartupComplete(startup) = event.msg {
-            break startup;
+        match event.msg {
+            EventMsg::McpStartupUpdate(update)
+                if matches!(update.server.as_str(), "paginated" | "rejected") =>
+            {
+                if matches!(update.status, McpStartupStatus::Starting) {
+                    started.insert(update.server);
+                } else {
+                    assert_eq!(
+                        started.len(),
+                        2,
+                        "both eager starts precede the first terminal status"
+                    );
+                }
+            }
+            EventMsg::McpStartupComplete(startup) => break startup,
+            _ => {}
         }
     };
     assert!(startup.ready.iter().any(|name| name == "paginated"));
@@ -1444,9 +1692,9 @@ async fn modern_mcp_pagination_preserves_valid_tools_and_rejects_oversized_curso
 
     fixture
         .codex
-        .start_or_steer_turn(read_only_user_turn(
+        .start_or_steer_turn(auto_approved_user_turn(
             &fixture,
-            "show the paginated MCP tools",
+            "call the paginated sync tool",
         ))
         .await?;
     wait_for_event(&fixture.codex, |event| {
@@ -1465,6 +1713,12 @@ async fn modern_mcp_pagination_preserves_valid_tools_and_rejects_oversized_curso
         responses::namespace_child_tool(&body, "mcp__rejected", "echo").is_none(),
         "a rejected MCP catalog must not reach the model"
     );
+    let output = final_mock.single_request().function_call_output(call_id);
+    let output_text = output["output"]
+        .as_str()
+        .unwrap_or_else(|| panic!("expected successful MCP tool output, got {output}"));
+    let output_json: Value = serde_json::from_str(split_wall_time_wrapped_output(output_text))?;
+    assert_eq!(output_json, json!({"result": "ok"}));
     Ok(())
 }
 
@@ -1761,15 +2015,6 @@ async fn startup_prewarm_connects_before_delayed_mcp_tools_then_reuses_socket(
     assert_eq!(prewarm["generate"].as_bool(), Some(false));
     assert!(prewarm.get("previous_response_id").is_none());
     assert_eq!(prewarm["service_tier"].as_str(), Some(service_tier));
-    let tool_body = if use_responses_lite {
-        &prewarm["input"][0]
-    } else {
-        &prewarm
-    };
-    assert!(
-        responses::namespace_child_tool(tool_body, namespace, "echo").is_some(),
-        "prewarm should contain the discovered MCP echo tool: {prewarm:?}"
-    );
     let metadata: Value = serde_json::from_str(
         prewarm["client_metadata"]["x-codex-turn-metadata"]
             .as_str()
@@ -1793,6 +2038,18 @@ async fn startup_prewarm_connects_before_delayed_mcp_tools_then_reuses_socket(
     assert_eq!(first_turn["type"], "response.create");
     assert!(first_turn.get("generate").is_none());
     assert_eq!(first_turn["previous_response_id"], "warm-1");
+    let tool_body = if use_responses_lite {
+        first_turn["input"]
+            .as_array()
+            .and_then(|items| items.iter().find(|item| item["type"] == "additional_tools"))
+            .context("first Responses Lite turn should declare discovered tools")?
+    } else {
+        &prewarm
+    };
+    assert!(
+        responses::namespace_child_tool(tool_body, namespace, "echo").is_some(),
+        "startup should declare the discovered MCP echo tool before sampling: {tool_body:?}"
+    );
     let handshakes = server.handshakes();
     assert_eq!(handshakes.len(), connection_index + 1);
     if close_eager_socket {
@@ -1941,6 +2198,15 @@ async fn interrupt_during_mcp_startup_preserves_user_input_in_history(
             )
         })
         .expect("an interrupted turn should retain its submitted user prompt");
+    assert!(
+        history.items[..user_prompt_index]
+            .iter()
+            .any(|item| matches!(
+                item,
+                RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(applied))
+                    if applied.thread_id == Some(fixture.session_configured.thread_id)
+            ))
+    );
     let RolloutItem::ResponseItem(envelope) = &history.items[user_prompt_index] else {
         unreachable!("found the user prompt");
     };
@@ -2053,6 +2319,10 @@ async fn stdio_server_uses_configured_cwd_before_runtime_fallback() -> anyhow::R
 #[serial(mcp_cwd)]
 async fn local_stdio_server_uses_runtime_fallback_cwd_when_config_omits_cwd() -> anyhow::Result<()>
 {
+    use codex_core::StartThreadOptions;
+    use core_test_support::exec_server::ExecServerProcess;
+    use core_test_support::test_codex::local;
+
     skip_if_no_network!(Ok(()));
 
     let server = responses::start_mock_server().await;
@@ -2066,9 +2336,28 @@ async fn local_stdio_server_uses_runtime_fallback_cwd_when_config_omits_cwd() ->
             .expect("test stdio server binary should have a file name"),
     );
     let relative_command = relative_server_path.to_string_lossy().into_owned();
+    let additional_workspace = tempdir()?;
+    let additional_root = AbsolutePathBuf::try_from(additional_workspace.path().to_path_buf())?;
 
-    let fixture = test_codex()
+    let mut extensions = codex_extension_api::ExtensionRegistryBuilder::new();
+    codex_skills_extension::install(&mut extensions, |config: &Config| {
+        codex_skills_extension::SkillsExtensionConfig {
+            include_instructions: config.include_skill_instructions,
+            catalog_deltas_enabled: config.features.enabled(Feature::SkillCatalogDeltas),
+            omit_descriptions: false,
+            max_context_tokens: config.skill_max_context_tokens,
+            bundled_skills_enabled: config.bundled_skills_enabled(),
+            cloud_skill_enabled: config.cloud_skill_enabled,
+            shadow_selection_enabled: config.features.enabled(Feature::SkillSearch),
+        }
+    });
+    let mut fixture = test_codex()
+        .with_extensions(Arc::new(extensions.build()))
         .with_config(move |config| {
+            config.workspace_roots = vec![config.cwd.clone(), additional_root.clone()];
+            config
+                .permissions
+                .set_workspace_roots(config.workspace_roots.clone());
             *expected_cwd_for_config
                 .lock()
                 .expect("expected cwd lock should not be poisoned") =
@@ -2079,7 +2368,8 @@ async fn local_stdio_server_uses_runtime_fallback_cwd_when_config_omits_cwd() ->
                 .parent()
                 .expect("relative test server path should include a parent");
             fs::create_dir_all(target_dir).expect("create relative MCP bin directory");
-            fs::copy(&rmcp_test_server_bin, &target_bin).expect("copy test stdio server");
+            codex_utils_cargo_bin::copy_executable(&rmcp_test_server_bin, &target_bin)
+                .expect("copy test stdio server");
 
             insert_mcp_server(
                 config,
@@ -2108,24 +2398,160 @@ async fn local_stdio_server_uses_runtime_fallback_cwd_when_config_omits_cwd() ->
         call_cwd_tool(&server, &fixture, server_name, "call-local-fallback-cwd").await?;
 
     assert_cwd_tool_output(&structured, &expected_cwd);
+
+    // The relative MCP executable exists only in the host workspace. A remote
+    // primary must not change its command resolution at startup or refresh.
+    let executor = ExecServerProcess::start().await?;
+    let remote_workspace = tempdir()?;
+    let remote_skill = remote_workspace
+        .path()
+        .join(".agents/skills/remote-fixture");
+    fs::create_dir_all(&remote_skill)?;
+    fs::write(
+        remote_skill.join("SKILL.md"),
+        "---\nname: remote-fixture\ndescription: Remote repository skill fixture\n---\nRemote instructions\n",
+    )?;
+    let manager = fixture.thread_manager.environment_manager();
+    manager.upsert_environment(
+        "other".to_string(),
+        executor.websocket_url.clone(),
+        /*connect_timeout*/ None,
+    )?;
+    for local_roots in [
+        Some(vec![fixture.config.cwd.clone()]),
+        Some(Vec::new()),
+        None,
+    ] {
+        let mut environments = vec![TurnEnvironmentRequest {
+            environment_id: "other".to_string(),
+            cwd: PathUri::from_host_native_path(remote_workspace.path())?,
+            workspace_roots: vec![PathUri::from_host_native_path(remote_workspace.path())?],
+            config: EnvironmentConfigState::FromThread,
+        }];
+        if let Some(roots) = &local_roots {
+            let mut local = local(fixture.config.cwd.clone()).into_request();
+            local.workspace_roots = roots.iter().map(PathUri::from_abs_path).collect();
+            environments.push(local);
+        }
+        let started = fixture
+            .thread_manager
+            .start_thread(StartThreadOptions {
+                environments: Some(environments),
+                ..StartThreadOptions::new(fixture.config.clone())
+            })
+            .await?;
+        fixture.codex = started.thread;
+        fixture.session_configured = started.session_configured;
+        wait_for_mcp_server(&fixture.codex, server_name).await?;
+
+        // A fresh thread must still discover the primary executor's repository
+        // skills; host routing must not silently replace them with local skills.
+        let request = responses::mount_sse_once(
+            &server,
+            responses::sse(vec![responses::ev_completed("remote-skills")]),
+        )
+        .await;
+        fixture.submit_turn("list repository skills").await?;
+        assert!(
+            request
+                .single_request()
+                .message_input_texts("developer")
+                .join("\n")
+                .contains("Remote repository skill fixture")
+        );
+
+        let initial = call_cwd_tool(&server, &fixture, server_name, "before-refresh").await?;
+        assert_cwd_tool_output(&initial, &expected_cwd);
+        fixture.codex.submit(Op::RefreshMcpServers).await?;
+        let refreshed = call_cwd_tool(&server, &fixture, server_name, "after-refresh").await?;
+        assert_cwd_tool_output(&refreshed, &expected_cwd);
+
+        // Host MCP policy follows explicit local roots, including an empty list,
+        // and falls back to the saved host roots only when local is absent.
+        for (phase, updated_roots) in [("initial", None), ("revoked", Some(Vec::new()))] {
+            let expected_roots = local_roots
+                .as_ref()
+                .or(updated_roots.as_ref())
+                .unwrap_or(&fixture.config.workspace_roots)
+                .clone();
+            let call_id = format!("host-sandbox-{phase}");
+            mount_sse_once(
+                &server,
+                responses::sse(vec![
+                    responses::ev_function_call_with_namespace(
+                        &call_id,
+                        &format!("mcp__{server_name}"),
+                        "sandbox_meta",
+                        "{}",
+                    ),
+                    responses::ev_completed("sandbox-meta"),
+                ]),
+            )
+            .await;
+            let final_request = mount_sse_once(
+                &server,
+                responses::sse(vec![responses::ev_completed("sandbox-meta-done")]),
+            )
+            .await;
+            fixture
+                .codex
+                .start_or_steer_turn(
+                    TurnInputRequest::user_input(vec![UserInput::Text {
+                        text: "inspect host MCP permissions".into(),
+                        text_elements: Vec::new(),
+                    }])
+                    .with_thread_settings(ThreadSettingsOverrides {
+                        permission_profile: Some(PermissionProfile::workspace_write()),
+                        runtime_workspace_roots: updated_roots,
+                        ..Default::default()
+                    }),
+                )
+                .await?;
+            wait_for_event(&fixture.codex, |event| {
+                matches!(event, EventMsg::TurnComplete(_))
+            })
+            .await;
+            let output = final_request
+                .single_request()
+                .function_call_output(&call_id);
+            let metadata: Value = serde_json::from_str(split_wall_time_wrapped_output(
+                output["output"]
+                    .as_str()
+                    .context("sandbox metadata output")?,
+            ))?;
+            assert_eq!(
+                metadata.get(MCP_SANDBOX_STATE_CAPABILITY),
+                Some(&serde_json::to_value(SandboxState {
+                    permission_profile: PermissionProfile::workspace_write()
+                        .materialize_project_roots_with_workspace_roots(&expected_roots),
+                    codex_linux_sandbox_exe: fixture.config.codex_linux_sandbox_exe.clone(),
+                    sandbox_cwd: PathUri::from_abs_path(&fixture.config.cwd),
+                    use_legacy_landlock: false,
+                    use_mxc: false,
+                })?),
+            );
+        }
+    }
     server.verify().await;
     Ok(())
 }
 
-#[test_case("rmcp", false, false, false, Some("catalog policy"), Some("native catalog policy"); "both disabled")]
-#[test_case("rmcp", true, false, false, Some("catalog policy"), Some("native catalog policy"); "auto review required")]
-#[test_case("rmcp", false, true, false, Some("catalog policy"), Some("native catalog policy"); "disabled")]
-#[test_case("rmcp", true, true, false, Some("catalog policy"), Some("native catalog policy"); "both enabled")]
-#[test_case("rmcp", false, false, true, Some("catalog policy"), Some("native catalog policy"); "attachment-owned permissions preserve foreign workspace roots")]
-#[test_case("node_repl", false, false, false, Some("  # Policy A\r\n{literal} <raw> & café\n"), Some("\t# Native A\n{{literal}} & desktop\r\n"); "node repl raw policy")]
-#[test_case("cua_repl", false, false, false, Some("\t# Policy B\n${literal} </policy>\r\n "), Some("  # Native B\r\n<computer> ${native}\n "); "cua repl raw policy")]
-#[test_case("node_repl", false, false, false, None, None; "node repl missing policy")]
-#[test_case("cua_repl", false, false, false, Some(""), Some("native retained"); "cua repl empty policy")]
-#[test_case("node_repl", false, false, false, Some(" \r\n\t"), Some("native retained"); "node repl blank policy")]
-#[test_case("node_repl", false, false, false, None, Some("native retained"); "node repl missing browser policy")]
-#[test_case("cua_repl", false, false, false, Some("browser retained"), None; "cua repl missing computer policy")]
-#[test_case("node_repl", false, false, false, Some("browser retained"), Some(""); "node repl empty computer policy")]
-#[test_case("cua_repl", false, false, false, Some("browser retained"), Some(" \r\n\t"); "cua repl blank computer policy")]
+#[test_case("rmcp", false, false, false, Some("catalog policy"), Some("native catalog policy"), false; "both disabled")]
+#[test_case("rmcp", true, false, false, Some("catalog policy"), Some("native catalog policy"), false; "auto review required")]
+#[test_case("rmcp", false, true, false, Some("catalog policy"), Some("native catalog policy"), false; "disabled")]
+#[test_case("rmcp", true, true, false, Some("catalog policy"), Some("native catalog policy"), false; "both enabled")]
+#[test_case("rmcp", false, false, true, Some("catalog policy"), Some("native catalog policy"), false; "attachment-owned permissions preserve foreign workspace roots")]
+#[test_case("node_repl", false, false, false, Some("  # Policy A\r\n{literal} <raw> & café\n"), Some("\t# Native A\n{{literal}} & desktop\r\n"), false; "node repl raw policy")]
+#[test_case("cua_repl", false, false, false, Some("\t# Policy B\n${literal} </policy>\r\n "), Some("  # Native B\r\n<computer> ${native}\n "), false; "cua repl raw policy")]
+#[test_case("node_repl", false, false, false, None, None, false; "node repl missing policy")]
+#[test_case("cua_repl", false, false, false, Some(""), Some("native retained"), false; "cua repl empty policy")]
+#[test_case("node_repl", false, false, false, Some(" \r\n\t"), Some("native retained"), false; "node repl blank policy")]
+#[test_case("node_repl", false, false, false, None, Some("native retained"), false; "node repl missing browser policy")]
+#[test_case("cua_repl", false, false, false, Some("browser retained"), None, false; "cua repl missing computer policy")]
+#[test_case("node_repl", false, false, false, Some("browser retained"), Some(""), false; "node repl empty computer policy")]
+#[test_case("cua_repl", false, false, false, Some("browser retained"), Some(" \r\n\t"), false; "cua repl blank computer policy")]
+#[test_case("cua_repl", false, false, false, None, None, true; "mxc backend handoff")]
+#[test_case("cua_repl", false, false, true, None, None, true; "mxc preference does not leak to attachment")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn stdio_mcp_tool_call_includes_sandbox_state_meta(
     server_name: &'static str,
@@ -2134,6 +2560,7 @@ async fn stdio_mcp_tool_call_includes_sandbox_state_meta(
     attachment_owned_permissions: bool,
     browser_policy: Option<&str>,
     computer_policy: Option<&str>,
+    prefer_mxc: bool,
 ) -> anyhow::Result<()> {
     // TODO(anp): Remove after packaging a Windows stdio test server for Wine exec.
     skip_if_wine_exec!(
@@ -2207,6 +2634,15 @@ async fn stdio_mcp_tool_call_includes_sandbox_state_meta(
         .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
         .with_model("gpt-5.5")
         .with_config(move |config| {
+            config.prefer_mxc = prefer_mxc;
+            // The real CLI is explicitly provided; the test harness is not a CLI.
+            config.codex_self_exe = Some(
+                AbsolutePathBuf::from_absolute_path_checked(
+                    cargo_bin("codex").expect("codex binary"),
+                )
+                .expect("absolute codex binary path")
+                .into_path_buf(),
+            );
             insert_mcp_server(
                 config,
                 server_name,
@@ -2264,11 +2700,11 @@ async fn stdio_mcp_tool_call_includes_sandbox_state_meta(
         submit_thread_settings(
             &fixture.codex,
             ThreadSettingsOverrides {
-                environments: Some(TurnEnvironmentSelections::new(
+                environments: Some(TurnEnvironmentRequests::new(
                     fixture.config.cwd.clone(),
-                    vec![TurnEnvironmentSelection {
+                    vec![TurnEnvironmentRequest {
                         config: EnvironmentConfigState::Pending,
-                        ..selection.clone()
+                        ..selection.clone().into_request()
                     }],
                 )),
                 ..Default::default()
@@ -2280,6 +2716,7 @@ async fn stdio_mcp_tool_call_includes_sandbox_state_meta(
             .environment_ready(
                 &selection,
                 EnvironmentConfig {
+                    environment_hooks: Default::default(),
                     allow_login_shell: fixture.config.permissions.allow_login_shell,
                     workspace_roots: workspace_roots.clone(),
                     permission_profile: PermissionProfileSnapshot::legacy(
@@ -2390,7 +2827,7 @@ async fn stdio_mcp_tool_call_includes_sandbox_state_meta(
     assert_eq!(output_json["callId"], json!(call_id));
 
     let sandbox_meta = meta
-        .get(MCP_SANDBOX_STATE_META_CAPABILITY)
+        .get(MCP_SANDBOX_STATE_CAPABILITY)
         .expect("sandbox state metadata should be present");
     let sandbox_state: SandboxState = serde_json::from_value(sandbox_meta.clone())?;
     if attachment_owned_permissions {
@@ -2408,15 +2845,30 @@ async fn stdio_mcp_tool_call_includes_sandbox_state_meta(
             );
         }
     }
+    let expected_state = serde_json::to_value(SandboxState {
+        permission_profile: owner_permission_profile
+            .materialize_project_roots_with_path_uris(&owner_workspace_roots),
+        codex_linux_sandbox_exe: fixture.config.codex_linux_sandbox_exe.clone(),
+        sandbox_cwd: PathUri::from_abs_path(&fixture.config.cwd),
+        use_legacy_landlock: false,
+        use_mxc: prefer_mxc && cfg!(windows) && !attachment_owned_permissions,
+    })?;
+    let expected_launcher = (remote_aware_environment_id()
+        == codex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID)
+        .then_some(fixture.config.codex_self_exe.as_ref())
+        .flatten()
+        .map(|executable| json!({"codexExecutable": executable}));
     assert_eq!(
-        sandbox_state,
-        SandboxState {
-            permission_profile: owner_permission_profile
-                .materialize_project_roots_with_path_uris(&owner_workspace_roots),
-            codex_linux_sandbox_exe: fixture.config.codex_linux_sandbox_exe.clone(),
-            sandbox_cwd: PathUri::from_abs_path(&fixture.config.cwd),
-            use_legacy_landlock: false,
-        }
+        (
+            meta.get(MCP_SANDBOX_STATE_CAPABILITY),
+            meta.get(MCP_SANDBOX_STATE_META_CAPABILITY),
+            meta.get(MCP_SANDBOX_LAUNCHER_META_KEY),
+        ),
+        (
+            Some(&expected_state),
+            Some(&expected_state),
+            expected_launcher.as_ref()
+        ),
     );
 
     server.verify().await;
@@ -2918,6 +3370,7 @@ async fn stdio_image_responses_round_trip() -> anyhow::Result<()> {
             call_id: call_id.to_string(),
             invocation: McpInvocation {
                 server: server_name.to_string(),
+                environment_id: None,
                 tool: "image".to_string(),
                 arguments: Some(json!({})),
             },
@@ -2945,6 +3398,7 @@ async fn stdio_image_responses_round_trip() -> anyhow::Result<()> {
         end.invocation,
         McpInvocation {
             server: server_name.to_string(),
+            environment_id: None,
             tool: "image".to_string(),
             arguments: Some(json!({})),
         }
@@ -3001,7 +3455,7 @@ async fn stdio_image_responses_resize_large_image() -> anyhow::Result<()> {
     let server_name = "rmcp";
     let namespace = format!("mcp__{server_name}");
 
-    let original_dimensions = (3000, 2000);
+    let original_dimensions = (6400, 320);
     let image = ImageBuffer::from_pixel(
         original_dimensions.0,
         original_dimensions.1,
@@ -3075,14 +3529,14 @@ async fn stdio_image_responses_resize_large_image() -> anyhow::Result<()> {
     let resized_url = output[1]["image_url"]
         .as_str()
         .expect("MCP image output should contain a data URL");
-    assert_eq!(output[1]["detail"], "high");
+    assert_eq!(output[1]["detail"], "original");
     let (_, resized_base64) = resized_url
         .split_once(',')
         .expect("resized image should contain a data URL prefix");
     let resized_bytes = BASE64_STANDARD.decode(resized_base64)?;
     let resized = image::load_from_memory(&resized_bytes)?;
     let resized_dimensions = resized.dimensions();
-    assert_eq!(resized_dimensions, (1920, 1280));
+    assert_eq!(resized_dimensions, (6000, 300));
 
     server.verify().await;
     Ok(())
@@ -3228,6 +3682,7 @@ async fn stdio_image_responses_are_sanitized_for_text_only_model() -> anyhow::Re
                 availability_nux: None,
                 apply_patch_tool_type: None,
                 web_search_tool_type: Default::default(),
+                web_search_provider: None,
                 truncation_policy: TruncationPolicyConfig::bytes(/*limit*/ 10_000),
                 supports_image_detail_original: false,
                 context_window: Some(272_000),
@@ -3237,7 +3692,6 @@ async fn stdio_image_responses_are_sanitized_for_text_only_model() -> anyhow::Re
                 effective_context_window_percent: 95,
                 experimental_supported_tools: Vec::new(),
                 input_modalities: vec![InputModality::Text],
-                used_fallback_model_metadata: false,
                 supports_search_tool: false,
                 supports_experimental_context: false,
                 use_responses_lite: false,
@@ -3250,6 +3704,7 @@ async fn stdio_image_responses_are_sanitized_for_text_only_model() -> anyhow::Re
                 tool_mode: None,
                 multi_agent_version: None,
                 multi_agent_reasoning_effort: None,
+                multi_agent_tools_in_code_mode: None,
             }],
         },
     )
@@ -4386,6 +4841,7 @@ async fn streamable_http_with_oauth_round_trip_impl() -> anyhow::Result<()> {
         Some("OAuth sign-in is still pending."),
     );
 
+    let current_config = fixture.codex.config().await;
     let mut refreshed_config = fixture.config.clone();
     let mut refreshed_servers = refreshed_config.mcp_servers.get().clone();
     let discovered_server = refreshed_servers
@@ -4398,9 +4854,9 @@ async fn streamable_http_with_oauth_round_trip_impl() -> anyhow::Result<()> {
         .set(refreshed_servers)
         .expect("test MCP servers should accept the discovered OAuth server");
     let discovered_turn = tokio::time::timeout(Duration::from_secs(5), async {
-        fixture
+        let _ = fixture
             .codex
-            .refresh_runtime_config(refreshed_config.clone())
+            .refresh_runtime_config(current_config, refreshed_config.clone())
             .await;
         fixture
             .codex
@@ -4444,7 +4900,11 @@ async fn streamable_http_with_oauth_round_trip_impl() -> anyhow::Result<()> {
         )
         .await?
     );
-    fixture.codex.refresh_runtime_config(refreshed_config).await;
+    let current_config = fixture.codex.config().await;
+    let _ = fixture
+        .codex
+        .refresh_runtime_config(current_config, refreshed_config)
+        .await;
     let logged_out_startup = tokio::time::timeout(
         Duration::from_secs(5),
         wait_for_event(&fixture.codex, |event| {

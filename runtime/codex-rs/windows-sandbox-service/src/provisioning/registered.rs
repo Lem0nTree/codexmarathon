@@ -1,5 +1,7 @@
 //! The registered-Core setup transaction: admit, provision, register, then publish readiness.
 
+use std::os::windows::io::AsRawHandle;
+use std::os::windows::io::OwnedHandle;
 use std::sync::atomic::AtomicBool;
 
 use anyhow::Context;
@@ -20,7 +22,6 @@ use windows_sys::Win32::NetworkManagement::NetManagement::UF_PASSWORD_EXPIRED;
 use crate::installation_record::InstallationRecord;
 use crate::installation_record::RuntimeRegistration;
 use crate::ipc::ClientIdentity;
-use crate::ipc::OwnedHandle;
 
 #[cfg(test)]
 #[path = "registered_tests.rs"]
@@ -98,28 +99,22 @@ pub(super) fn run(
         }
         if setup_complete && !request.refresh_only {
             setup_complete = !credentials_need_repair(
+                &installation,
                 |account| {
-                    crate::package_lifecycle::with_owner_impersonation(identity.token.0, || {
-                        let mut pins = Vec::new();
-                        crate::ipc::pin_existing_ancestors(
-                            &sandbox_secrets_dir(&identity.codex_home),
-                            &mut pins,
-                        )?;
-                        logon_existing_sandbox_account(&identity.codex_home, account).map(drop)
-                    })
+                    crate::package_lifecycle::with_owner_impersonation(
+                        identity.token.as_raw_handle(),
+                        || {
+                            let mut pins = Vec::new();
+                            crate::ipc::pin_existing_ancestors(
+                                &sandbox_secrets_dir(&identity.codex_home),
+                                &mut pins,
+                            )?;
+                            logon_existing_sandbox_account(&identity.codex_home, account)
+                        },
+                    )
                     .with_context(|| format!("check registered sandbox account {account:?}"))
                 },
-                || {
-                    for entry in &installation.runtime()?.accounts {
-                        let sid = codex_windows_sandbox::resolve_sid(entry.account.username())?;
-                        ensure!(
-                            string_from_sid_bytes(&sid).map_err(anyhow::Error::msg)?
-                                == entry.user_sid,
-                            "managed runtime account was replaced"
-                        );
-                    }
-                    Ok(())
-                },
+                crate::registered_runtime::registered_packages,
             )?;
         }
         if !setup_complete {
@@ -170,23 +165,58 @@ pub(super) fn run(
 }
 
 fn credentials_need_repair(
-    mut logon: impl FnMut(SandboxRuntimeAccount) -> Result<()>,
-    validate_ownership: impl FnOnce() -> Result<()>,
+    installation: &InstallationRecord,
+    mut logon: impl FnMut(SandboxRuntimeAccount) -> Result<OwnedHandle>,
+    mut registered_packages: impl FnMut(&str, &str) -> Result<Vec<windows::core::HSTRING>>,
 ) -> Result<bool> {
+    crate::registered_runtime::validate_record(installation)?;
+    let runtime = installation.runtime()?;
     let mut needs_repair = false;
     for account in [
         SandboxRuntimeAccount::Offline,
         SandboxRuntimeAccount::Online,
     ] {
         match logon(account) {
-            Ok(()) => {}
+            Ok(token) => {
+                let expected = runtime
+                    .accounts
+                    .iter()
+                    .find(|entry| entry.account == account);
+                crate::registered_runtime::validate_target(
+                    token.as_raw_handle() as _,
+                    account,
+                    expected.map(|entry| entry.user_sid.as_str()),
+                )?;
+            }
             Err(error) if error.is::<SandboxAccountCredentialMismatch>() => needs_repair = true,
             Err(error) => return Err(error),
         }
     }
     if needs_repair {
-        // Full setup rotates both passwords; never rotate a recreated local account.
-        validate_ownership()?;
+        // Never reset recorded replacement accounts or unrecorded runtime registrations.
+        // An initial migration has no recorded account SIDs yet.
+        for account in [
+            SandboxRuntimeAccount::Offline,
+            SandboxRuntimeAccount::Online,
+        ] {
+            let sid = codex_windows_sandbox::resolve_sid(account.username())?;
+            let sid = string_from_sid_bytes(&sid).map_err(anyhow::Error::msg)?;
+            if let Some(entry) = runtime
+                .accounts
+                .iter()
+                .find(|entry| entry.account == account)
+            {
+                ensure!(
+                    sid == entry.user_sid,
+                    "managed runtime account was replaced"
+                );
+            } else {
+                ensure!(
+                    registered_packages(&sid, &runtime.package_family)?.is_empty(),
+                    "sandbox account has a runtime registration not owned by this service"
+                );
+            }
+        }
     }
     Ok(needs_repair)
 }

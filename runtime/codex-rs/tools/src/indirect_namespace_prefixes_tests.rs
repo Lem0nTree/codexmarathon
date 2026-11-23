@@ -31,15 +31,18 @@ fn plain_tools_join_an_existing_functions_group_only_with_a_prefix() {
     )]);
     let render = |tools: &[ToolDefinition],
                   namespaces: &BTreeMap<String, ToolNamespaceDescription>| {
-        codex_code_mode::build_exec_tool_description(
+        codex_code_mode::build_exec_tool_description_and_definitions(
             tools,
             &[],
             namespaces,
             codex_code_mode::DEFAULT_EXEC_YIELD_TIME_MS,
             /*code_mode_only*/ true,
             codex_code_mode::ImageDetailVisibility::Visible,
+            codex_code_mode::DeferredToolDiscovery::Catalog,
+            /*incremental_exec_enabled*/ false,
             /*messages*/ None,
         )
+        .0
     };
     let original = render(&original_tools, &original_namespaces);
     for messages in [

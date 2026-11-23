@@ -19,6 +19,7 @@ impl WindowsSandboxRequestProcessor {
         config: Arc<Config>,
         config_manager: ConfigManager,
     ) -> Self {
+        codex_core::windows_sandbox::log_windows_sandbox_startup(&config);
         Self {
             outgoing,
             config,
@@ -215,6 +216,9 @@ impl WindowsSandboxRequestProcessor {
                                 permissions.validate_elevated_filesystem_policy(
                                     &service_setup_request.command_cwd,
                                 )?;
+                            }
+                            if codex_windows_sandbox::registered_core_requested() {
+                                codex_windows_sandbox::start_windows_sandbox_service_for_setup()?;
                             }
                             // The shared setup path below handles helper fallback and
                             // refreshes workspace ACLs after provisioning.

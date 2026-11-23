@@ -245,7 +245,7 @@ async fn strict_tool_collisions_do_not_duplicate_unrelated_compaction_errors() -
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn empty_turn_environments_omits_environment_backed_tools() -> Result<()> {
+async fn empty_turn_environments_keeps_environment_backed_tools() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
@@ -278,8 +278,8 @@ async fn empty_turn_environments_omits_environment_backed_tools() -> Result<()> 
     );
     for environment_tool in ["exec_command", "write_stdin", "apply_patch", "view_image"] {
         assert!(
-            !tools.contains(&environment_tool.to_string()),
-            "{environment_tool} should be omitted for explicit empty turn environments; got {tools:?}"
+            tools.contains(&environment_tool.to_string()),
+            "{environment_tool} should remain available for explicit empty turn environments; got {tools:?}"
         );
     }
 
@@ -506,16 +506,11 @@ async fn namespaced_custom_tool_call_preserves_namespace_through_dispatch_and_re
     );
     let expected_escaped_calls = json!([{
         "name": format!("{namespace}__{tool_name}"),
-        "arguments": {
-            "_codex_executed_tool_call_truncated": {
-                "original_bytes": serde_json::to_vec(&escaped_input)?.len(),
-                "max_bytes": 8 * 1024,
-            },
-        },
+        "arguments": escaped_input,
     }]);
     assert_eq!(
         tool_call_metadata(escaped_request.custom_tool_call_output(escaped_call_id)),
-        json!({"executed_tool_calls": expected_escaped_calls}),
+        json!({"executed_tool_calls": expected_escaped_calls, "tool_calls_complete": true}),
     );
 
     let direct_exec_call_id = "custom-direct-exec";
@@ -693,7 +688,7 @@ async fn sandbox_denied_exec_command_returns_original_output() -> Result<()> {
         "printf {sentinel:?} >&2; printf {content:?} > {path:?}",
         sentinel = format!("{sentinel}\n"),
         content = "sandbox denied",
-        path = &target_path
+        path = target_path
     );
     let args = json!({
         "cmd": command,

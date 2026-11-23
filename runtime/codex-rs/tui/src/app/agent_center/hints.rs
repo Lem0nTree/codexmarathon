@@ -29,11 +29,13 @@ impl AgentsOverviewView {
                 &self.agents_keymap.search,
                 &self.agents_keymap.new_task,
                 &self.agents_keymap.new_worktree,
+                &self.agents_keymap.fork,
                 &self.agents_keymap.rename,
                 &self.agents_keymap.stop,
                 &self.agents_keymap.archive,
                 &self.agents_keymap.delete,
                 &self.agents_keymap.hide,
+                &self.agents_keymap.toggle_pin,
                 &self.agents_keymap.toggle_grouping,
             ].into_iter().any(|bindings| bindings.contains(binding)))
         })
@@ -82,13 +84,17 @@ impl AgentsOverviewView {
                 "New worktree",
             ),
             ("resume", &self.agents_keymap.resume, "Resume"),
+            ("fork", &self.agents_keymap.fork, "Fork"),
             ("rename", &self.agents_keymap.rename, "Rename"),
             ("stop", &self.agents_keymap.stop, "Stop"),
             ("archive", &self.agents_keymap.archive, "Archive"),
             ("hide", &self.agents_keymap.hide, "Hide"),
             ("delete", &self.agents_keymap.delete, "Delete"),
+            ("toggle_pin", &self.agents_keymap.toggle_pin, "Pin/unpin"),
         ] {
-            if action != "new_worktree" || self.worktrees_enabled {
+            if (action != "new_worktree" || self.worktrees_enabled)
+                && (action != "toggle_pin" || self.can_toggle_selected_pin())
+            {
                 tasks.push(self.agents_keymap.primary_hint(action, bindings), label);
             }
         }
@@ -123,9 +129,6 @@ impl AgentsOverviewView {
 
     pub(super) fn center_footer_hints(&self) -> Vec<(String, String)> {
         let state = self.state();
-        if let Some(items) = &state.key_chord_hint {
-            return items.clone();
-        }
         let mut hints = Vec::new();
         if !state.help
             && !state.editing_metadata()
@@ -140,8 +143,10 @@ impl AgentsOverviewView {
         }
         let cancel = if state.help {
             self.keymap.primary_hint(ListAction::Cancel)
-        } else {
+        } else if state.editing_metadata() || self.can_return_to_chat {
             self.center_list_hint(ListAction::Cancel)
+        } else {
+            None
         };
         if let Some(hint) = cancel {
             hints.push((hint.display_label(), "back".into()));

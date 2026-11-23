@@ -2,9 +2,12 @@
 //! Stationary link clicks open on release; dragging or scrolling keeps the gesture in selection.
 //! Shift-click extends the existing selection from its original text unit.
 //! Optional automatic copying happens only when a nonempty mouse selection is released.
-//! Automatic copies retain the selection; explicit copies clear it after confirmed delivery.
+//! Automatic copies optionally clear the selection; explicit copies always clear it after
+//! confirmed delivery.
+//! Wheel input accumulates fractional rows and discards the remainder when direction reverses.
 
 use crate::key_hint::KeyBindingListExt;
+use codex_protocol::ThreadId;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use crossterm::event::KeyEventKind;
@@ -15,14 +18,35 @@ use crossterm::event::MouseEventKind;
 use ratatui::layout::Position as ScreenPosition;
 
 use super::*;
+use crate::markdown_render::FileLink;
+use crate::terminal_hyperlinks::ReaderLink;
 
 pub(crate) enum ViewAction {
     Changed,
+    ExitSelectMode,
     Copy(String),
     CopyOnSelect(String),
     PrimarySelection(String),
     CopyAndFollow(String),
+    OpenAgent(ThreadId),
     OpenLink(String),
+    OpenDocument(FileLink),
+}
+
+impl From<ReaderLink> for ViewAction {
+    fn from(link: ReaderLink) -> Self {
+        match link {
+            ReaderLink::Agent(id) => Self::OpenAgent(id),
+            ReaderLink::External(url) => Self::OpenLink(url),
+            ReaderLink::Document(link) => Self::OpenDocument(link),
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MouseMode<'a> {
+    Interactive,
+    Selection(Option<(ThreadId, &'a str)>),
 }
 
 /// Transcript jumps shared with input routing so legacy terminals preserve their Alt modifier.
@@ -81,13 +105,108 @@ impl JumpTarget {
 }
 
 impl TranscriptView {
-    /// Resolve links in the last rendered transcript, sharing geometry with click activation.
+    /// Automatic copies may deselect but still publish PRIMARY, so retain their source.
+    pub(crate) fn selection_copy(&self, action: &ViewAction) -> SelectionCopy {
+        match action {
+            ViewAction::CopyOnSelect(_) => SelectionCopy::on_select(
+                /*clipboard*/ true,
+                self.primary_selection,
+                self.copy_on_select_clear_selection,
+            ),
+            ViewAction::PrimarySelection(_) => SelectionCopy::on_select(
+                /*clipboard*/ false, /*primary*/ true, /*clear_selection*/ false,
+            ),
+            ViewAction::Changed
+            | ViewAction::ExitSelectMode
+            | ViewAction::Copy(_)
+            | ViewAction::CopyAndFollow(_)
+            | ViewAction::OpenAgent(_)
+            | ViewAction::OpenDocument(_)
+            | ViewAction::OpenLink(_) => SelectionCopy::EXPLICIT,
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn link_at(&self, column: u16, row: u16) -> Option<String> {
-        if !self.area.contains(ScreenPosition::new(column, row)) {
+        self.reader_link_at(column, row)
+            .map(ReaderLink::into_destination)
+    }
+
+    /// Resolve links in the last rendered transcript, sharing geometry with click activation.
+    pub(crate) fn reader_link_at(&self, column: u16, row: u16) -> Option<ReaderLink> {
+        let (_, link) = self.raw_link_at(ScreenPosition::new(column, row))?;
+        if self.agent_links.is_some()
+            && let Some(agent) = link.agent_id()
+        {
+            return Some(ReaderLink::Agent(agent));
+        }
+        link.reader_destination(self.document_links)
+    }
+
+    pub(crate) fn cycle_document_link(
+        &mut self,
+        cells: &[Arc<dyn HistoryCell>],
+        selected: Option<usize>,
+        forward: bool,
+    ) -> Option<usize> {
+        let layout = self.layout(cells, /*index*/ 0)?;
+        let links = layout.document_links();
+        let count = links.len();
+        if count == 0 {
             return None;
         }
-        let visible = self.visible.get(usize::from(row - self.area.y))?;
-        visible.layout.link_at(visible.row, column - self.area.x)
+        let index = match selected {
+            Some(index) if forward => (index + 1) % count,
+            Some(index) => (index + count - 1) % count,
+            None if forward => 0,
+            None => count - 1,
+        };
+        let offset = links[index].0.start;
+        let row = layout.row_for_offset(offset);
+        if !self
+            .visible
+            .iter()
+            .any(|visible| visible.index == 0 && visible.row == row)
+        {
+            self.jump_to_offset(cells, offset);
+        }
+        Some(index)
+    }
+
+    pub(crate) fn document_link(
+        &mut self,
+        cells: &[Arc<dyn HistoryCell>],
+        index: usize,
+    ) -> Option<ReaderLink> {
+        self.layout(cells, /*index*/ 0)?
+            .document_links()
+            .into_iter()
+            .nth(index)
+            .map(|(_, link)| link)
+    }
+
+    pub(crate) fn paint_document_link(
+        &mut self,
+        cells: &[Arc<dyn HistoryCell>],
+        index: usize,
+        buf: &mut ratatui::buffer::Buffer,
+    ) {
+        let Some(layout) = self.layout(cells, /*index*/ 0) else {
+            return;
+        };
+        let Some((range, _)) = layout.document_links().into_iter().nth(index) else {
+            return;
+        };
+        for (row, visible) in self.visible.iter().enumerate() {
+            if visible.index == 0 {
+                visible.layout.highlight(
+                    range.clone(),
+                    Rect::new(self.area.x, self.area.y + row as u16, self.area.width, 1),
+                    buf,
+                    visible.row,
+                );
+            }
+        }
     }
 
     pub(crate) fn navigate_pager(
@@ -134,11 +253,14 @@ impl TranscriptView {
         {
             return true;
         }
+        if self.copy_mode.is_some() {
+            return true;
+        }
+        if self.select_mode.is_some() {
+            return true;
+        }
         if self.selection.is_some() {
-            return (code == KeyCode::Char('c')
-                && matches!(modifiers, KeyModifiers::CONTROL | KeyModifiers::SUPER))
-                || (code == KeyCode::Char('c')
-                    && modifiers == (KeyModifiers::CONTROL | KeyModifiers::SHIFT))
+            return crate::text_selection::is_copy_key(key)
                 || code == KeyCode::Esc
                 || (code == KeyCode::Enter && modifiers == KeyModifiers::NONE)
                 || (matches!(modifiers, KeyModifiers::NONE | KeyModifiers::SHIFT)
@@ -149,8 +271,12 @@ impl TranscriptView {
                 || (modifiers == KeyModifiers::NONE
                     && matches!(code, KeyCode::PageUp | KeyCode::PageDown));
         }
-        self.is_search_active()
-            && (matches!(code, KeyCode::Esc | KeyCode::Enter)
+        self.search.is_active()
+            && (code == KeyCode::Esc
+                || (code == KeyCode::Enter
+                    && (self.is_search_editing() || modifiers == KeyModifiers::NONE))
+                || (modifiers == KeyModifiers::NONE
+                    && matches!(code, KeyCode::PageUp | KeyCode::PageDown))
                 || (modifiers == KeyModifiers::CONTROL
                     && matches!(code, KeyCode::Char('c' | 'n' | 'p'))))
     }
@@ -162,6 +288,29 @@ impl TranscriptView {
     ) -> Option<ViewAction> {
         if key.kind == KeyEventKind::Release {
             return None;
+        }
+        if let Some(action) = self.handle_copy_mode_key(key, cells) {
+            return Some(action);
+        }
+        if self.select_mode.is_some() {
+            if self.is_search_editing() {
+                let (code, modifiers) =
+                    crate::key_hint::normalize_key_parts(key.code, key.modifiers);
+                let accepting = code == KeyCode::Enter && modifiers == KeyModifiers::NONE;
+                let cancelling = code == KeyCode::Esc
+                    || (code == KeyCode::Char('c') && modifiers == KeyModifiers::CONTROL);
+                if self.handle_search_key(key, cells) {
+                    if accepting && self.search.is_reading() {
+                        self.accept_search_into_select_mode(cells);
+                    } else if cancelling {
+                        self.restore_select_search_origin(cells);
+                    }
+                    return Some(ViewAction::Changed);
+                }
+            }
+            return self
+                .handle_select_mode_key(key, cells)
+                .or(Some(ViewAction::Changed));
         }
         if let Some(action) = self.handle_disclosure_key(key, cells) {
             return Some(action);
@@ -192,15 +341,86 @@ impl TranscriptView {
         event: MouseEvent,
         cells: &[Arc<dyn HistoryCell>],
     ) -> Option<ViewAction> {
-        if let Some(action) = self.handle_follow_control_mouse(event) {
+        if self.select_mode.is_some() {
+            return self.handle_selection_mouse(event, cells, /*patch_approval*/ None);
+        }
+        self.handle_mouse_with_mode(event, cells, MouseMode::Interactive)
+    }
+
+    /// Modals allow transcript disclosure, while select mode keeps clicks for text selection.
+    pub(crate) fn handle_selection_mouse(
+        &mut self,
+        event: MouseEvent,
+        cells: &[Arc<dyn HistoryCell>],
+        patch_approval: Option<(ThreadId, &str)>,
+    ) -> Option<ViewAction> {
+        let endpoint_changed = matches!(
+            event.kind,
+            MouseEventKind::Down(MouseButton::Left)
+                | MouseEventKind::Drag(MouseButton::Left)
+                | MouseEventKind::Up(MouseButton::Left)
+        );
+        let before = self.selection.as_ref().map(|selection| {
+            (
+                selection.start,
+                selection.end,
+                selection.unit(),
+                selection.has_table_scope(),
+            )
+        });
+        let action =
+            self.handle_mouse_with_mode(event, cells, MouseMode::Selection(patch_approval));
+        let after = self.selection.as_ref().map(|selection| {
+            (
+                selection.start,
+                selection.end,
+                selection.unit(),
+                selection.has_table_scope(),
+            )
+        });
+        if endpoint_changed && before != after {
+            if self.has_selection_range() {
+                self.disclosure.resume_after_approval = None;
+            }
+            self.adopt_select_mouse_range();
+        }
+        action
+    }
+
+    fn handle_mouse_with_mode(
+        &mut self,
+        event: MouseEvent,
+        cells: &[Arc<dyn HistoryCell>],
+        mode: MouseMode<'_>,
+    ) -> Option<ViewAction> {
+        if mode == MouseMode::Interactive
+            && let Some(action) = self.handle_follow_control_mouse(event)
+        {
             return Some(action);
         }
-        if event.kind == MouseEventKind::Down(MouseButton::Left)
+        let point = ScreenPosition::new(event.column, event.row);
+        if mode == MouseMode::Interactive
+            && event.kind == MouseEventKind::Down(MouseButton::Left)
+            && event.modifiers.is_empty()
+            && let Some((area, key)) = self.prompt_header_target
+            && area.contains(point)
+        {
+            self.last_click = None;
+            if let Some(index) = cells.iter().position(|cell| EntryKey::cell(cell) == key) {
+                self.end_selection(cells);
+                self.cancel_search();
+                self.clear_activity_focus();
+                self.jump_to_entry(cells, index);
+            }
+            return Some(ViewAction::Changed);
+        }
+        if mode == MouseMode::Interactive
+            && event.kind == MouseEventKind::Down(MouseButton::Left)
             && event
                 .modifiers
                 .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER)
             && let Some((area, tip)) = &self.composer_tip
-            && area.contains(ScreenPosition::new(event.column, event.row))
+            && area.contains(point)
         {
             let column = usize::from(event.column - area.x);
             return tip
@@ -210,9 +430,7 @@ impl TranscriptView {
                 .terminal_destination()
                 .map(ViewAction::OpenLink);
         }
-        let inside = self
-            .area
-            .contains(ScreenPosition::new(event.column, event.row));
+        let inside = self.area.contains(point);
         let dragging = self
             .selection
             .as_ref()
@@ -229,31 +447,59 @@ impl TranscriptView {
             selection.pointer = None;
         }
         match event.kind {
-            MouseEventKind::ScrollUp => self.scroll(cells, /*rows*/ -3),
-            MouseEventKind::ScrollDown => self.scroll(cells, /*rows*/ 3),
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                let direction = if event.kind == MouseEventKind::ScrollUp {
+                    -1.0
+                } else {
+                    1.0
+                };
+                if self.pending_mouse_scroll.signum() != direction {
+                    self.pending_mouse_scroll = 0.0;
+                }
+                self.pending_mouse_scroll += direction * self.mouse_scroll_speed;
+                // Decimal speeds can land just short of a whole row after repeated addition.
+                let rounded = self.pending_mouse_scroll.round();
+                if rounded != 0.0 && (self.pending_mouse_scroll - rounded).abs() < 1e-9 {
+                    self.pending_mouse_scroll = rounded;
+                }
+                let rows = self.pending_mouse_scroll as isize;
+                self.pending_mouse_scroll = self.pending_mouse_scroll.fract();
+                if rows != 0 {
+                    self.scroll(cells, rows);
+                }
+            }
             MouseEventKind::Down(MouseButton::Right) if inside => {
                 return self
                     .selected_text(cells)
                     .filter(|text| !text.is_empty())
                     .map(ViewAction::Copy);
             }
-            MouseEventKind::Down(MouseButton::Left) => return self.pointer_down(event, cells),
+            MouseEventKind::Down(MouseButton::Left) => {
+                return self.pointer_down(event, cells, mode);
+            }
             MouseEventKind::Drag(MouseButton::Left) if dragging => {
+                // A drag ends the click sequence even when the next press is at the same spot.
+                self.last_click = None;
                 self.extend_selection(event.column, event.row);
             }
             MouseEventKind::Up(MouseButton::Left) if dragging => {
                 // Open only a stationary click. Dragging back to the origin is still selection,
                 // and wheel scrolling clears the pointer even when it cannot move the viewport.
-                let link = self.selection.as_mut().and_then(|selection| {
-                    (inside
-                        && !selection.moved
-                        && selection.pointer == Some(ScreenPosition::new(event.column, event.row))
-                        && event.modifiers.is_empty())
-                    .then(|| selection.pressed_link.take())
-                    .flatten()
-                });
+                let link = if mode == MouseMode::Interactive {
+                    self.selection.as_mut().and_then(|selection| {
+                        (inside
+                            && !selection.moved
+                            && selection.pointer
+                                == Some(ScreenPosition::new(event.column, event.row))
+                            && event.modifiers.is_empty())
+                        .then(|| selection.pressed_link.take())
+                        .flatten()
+                    })
+                } else {
+                    None
+                };
                 let link = link.filter(|destination| {
-                    self.link_at(event.column, event.row).as_ref() == Some(destination)
+                    self.reader_link_at(event.column, event.row).as_ref() == Some(destination)
                 });
                 if self
                     .selection
@@ -268,7 +514,7 @@ impl TranscriptView {
                     self.end_selection(cells);
                 }
                 if let Some(link) = link {
-                    return Some(ViewAction::OpenLink(link));
+                    return Some(link.into());
                 }
                 if let Some(text) = selected.filter(|text| !text.is_empty()) {
                     if self.copy_on_select {
@@ -284,7 +530,7 @@ impl TranscriptView {
         Some(ViewAction::Changed)
     }
 
-    fn handle_selection_key(
+    pub(crate) fn handle_selection_key(
         &mut self,
         key: KeyEvent,
         cells: &[Arc<dyn HistoryCell>],
@@ -316,24 +562,31 @@ impl TranscriptView {
         self.handle_scroll_key(key, cells)
     }
 
-    fn handle_scroll_key(
+    pub(super) fn handle_scroll_key(
         &mut self,
         key: KeyEvent,
         cells: &[Arc<dyn HistoryCell>],
     ) -> Option<ViewAction> {
         let jump = JumpTarget::from_key(key);
         match (key.code, key.modifiers) {
-            (KeyCode::PageUp, KeyModifiers::NONE) => {
-                self.scroll(
-                    cells,
-                    -(self.area.height.saturating_sub(/*rhs*/ 1).max(/*other*/ 1) as isize),
-                );
-            }
-            (KeyCode::PageDown, KeyModifiers::NONE) => {
-                self.scroll(
-                    cells,
-                    self.area.height.saturating_sub(/*rhs*/ 1).max(/*other*/ 1) as isize,
-                );
+            (KeyCode::PageUp | KeyCode::PageDown, KeyModifiers::NONE) => {
+                // Share page-key configuration without taking the pager's typing shortcuts.
+                // Full pages retain the main view's existing one-row overlap.
+                let keymap = &self.disclosure.keymap.pager;
+                let height = self.area.height.max(/*other*/ 1) as isize;
+                let page = (height - 1).max(/*other*/ 1);
+                let half = (height + 1) / 2;
+                let delta = [
+                    (&keymap.scroll_up, -1),
+                    (&keymap.scroll_down, 1),
+                    (&keymap.page_up, -page),
+                    (&keymap.page_down, page),
+                    (&keymap.half_page_up, -half),
+                    (&keymap.half_page_down, half),
+                ]
+                .into_iter()
+                .find_map(|(bindings, delta)| bindings.is_pressed(key).then_some(delta))?;
+                self.scroll(cells, delta);
             }
             (KeyCode::Esc, KeyModifiers::NONE) if self.can_return_to_latest() => {
                 self.jump_to_latest();
@@ -351,21 +604,31 @@ impl TranscriptView {
         &mut self,
         event: MouseEvent,
         cells: &[Arc<dyn HistoryCell>],
+        mode: MouseMode<'_>,
     ) -> Option<ViewAction> {
-        if event.modifiers.is_empty() && self.toggle_disclosure_at(cells, event.column, event.row) {
+        let was_following = self.is_following();
+        if !self.is_select_mode()
+            && event.modifiers.is_empty()
+            && self.toggle_disclosure_at(cells, event.column, event.row)
+        {
+            // Keep the patch anchored for inspection, then follow again when the prompt closes.
+            if was_following && let MouseMode::Selection(Some((thread_id, id))) = mode {
+                self.disclosure.resume_after_approval = Some((thread_id, id.to_owned()));
+            }
             return Some(ViewAction::Changed);
         }
         self.disclosure.focused = None;
         let visible = self
             .visible
             .get(usize::from(event.row.checked_sub(self.area.y)?))?;
-        if event
-            .modifiers
-            .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER)
+        if mode == MouseMode::Interactive
+            && event
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER)
         {
             return self
-                .link_at(event.column, event.row)
-                .map(ViewAction::OpenLink);
+                .reader_link_at(event.column, event.row)
+                .map(ViewAction::from);
         }
         if event.modifiers == KeyModifiers::SHIFT && self.has_selection_range() {
             self.last_click = None;
@@ -378,16 +641,21 @@ impl TranscriptView {
         }
         let clicks =
             crate::text_selection::click_count(&mut self.last_click, event.column, event.row);
-        if clicks >= 2
-            && visible
-                .layout
-                .position_at(visible.row, event.column.saturating_sub(self.area.x))
-                == visible.layout.position_at(visible.row, u16::MAX)
-        {
-            return None;
+        if clicks >= 2 {
+            let column = event.column.saturating_sub(self.area.x);
+            let layout = &visible.layout;
+            let offset = layout.position_at(visible.row, column);
+            let at_row_end = offset == layout.position_at(visible.row, u16::MAX);
+            let can_select_from_padding = at_row_end
+                && clicks == 3
+                && !self.is_select_mode()
+                && layout.table_cell_at(visible.row, column, offset).is_some();
+            if at_row_end && !can_select_from_padding {
+                return None;
+            }
         }
-        let link = (clicks == 1 && event.modifiers.is_empty())
-            .then(|| self.link_at(event.column, event.row))
+        let link = (mode == MouseMode::Interactive && clicks == 1 && event.modifiers.is_empty())
+            .then(|| self.reader_link_at(event.column, event.row))
             .flatten();
         self.begin_selection(cells, event.column, event.row, clicks);
         if let Some(selection) = &mut self.selection {

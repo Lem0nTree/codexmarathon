@@ -60,6 +60,7 @@ async fn lifecycle_metadata_uses_local_prompt_history() -> Result<()> {
                 /*session_start_source*/ None,
                 /*remote_cwd_override*/ None,
                 /*selected_profile*/ None,
+                /*host_project_cwd*/ None,
             )
             .await?;
         assert_eq!(started.session.message_history, expected);
@@ -70,7 +71,7 @@ async fn lifecycle_metadata_uses_local_prompt_history() -> Result<()> {
             mode,
             /*remote_cwd_override*/ None,
             app_server.thread_tool_transport(),
-            /*model_provider_override*/ None,
+            crate::app_server_session::StartupLaunchChoices::default(),
         )
         .await?;
         assert_eq!(startup.session.message_history, expected);

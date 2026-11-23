@@ -7,15 +7,14 @@ source commit, license, and local Marathon additions are recorded in
 
 ## Automated compatibility gate
 
-The scheduled release workflow does not auto-resolve source conflicts. It
+The preparation script does not auto-resolve source conflicts. It
 reconstructs the full CodexMarathon delta from the maintained snapshot and the
 OpenAI baseline recorded in `.github/upstream-base.txt`, then applies that
 delta with Git's three-way merge support. A clean application may proceed to
 platform builds and publication; any conflict stops the run before a binary is
 produced.
 
-Use the manual workflow dispatch with `port_only: true` for a non-publishing
-compatibility check. For a local, reviewable conflict checkout:
+For a local, non-publishing compatibility check and reviewable conflict checkout:
 
 ```bash
 scripts/prepare-upstream-release.sh \
@@ -26,8 +25,7 @@ scripts/prepare-upstream-release.sh \
 
 Exit status 2 means a manual port is required. The destination is intentionally
 preserved with conflict markers, and the evidence directory contains the exact
-generated patches and status report. No release automation may accept the
-checkout until the conflicts are resolved and focused tests pass.
+generated patches and status report. Do not build a release from the checkout until conflicts are resolved and focused tests pass.
 
 ## Manual refresh procedure
 
@@ -42,7 +40,7 @@ checkout until the conflicts are resolved and focused tests pass.
    delta relative to the new recorded baseline.
 4. Recheck AuthManager reload, safe-boundary enforcement, transport
    invalidation, quota events, and recovery ordering against the new APIs.
-5. Run formatting, focused runtime tests, the port-only workflow, and complete
+5. Run formatting, focused runtime tests, the local compatibility check, and complete
    Linux and Windows release builds.
 6. Review the diff for credential leaks and verify that no build cache or local
    account state entered the commit.

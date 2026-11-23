@@ -217,6 +217,7 @@ async fn initialize_caches_client_and_thread_lifecycle_publishes_once_initialize
                         version: "1.0.0".to_string(),
                     },
                     capabilities: Some(InitializeCapabilities {
+                        required_human_approval: false,
                         explicit_gateway_oauth: false,
                         experimental_api: false,
                         request_attestation: false,
@@ -555,6 +556,7 @@ fn subagent_thread_started_review_serializes_expected_shape() {
             ephemeral: false,
             thread_source: Some(ThreadSource::Subagent),
             subagent_source: SubAgentSource::Review,
+            initialization_mode: ThreadInitializationMode::New,
             created_at: 123,
         },
     ));
@@ -614,6 +616,7 @@ fn subagent_thread_started_thread_spawn_serializes_thread_lineage() {
                 agent_nickname: None,
                 agent_role: None,
             },
+            initialization_mode: ThreadInitializationMode::Resumed,
             created_at: 124,
         },
     ));
@@ -621,6 +624,8 @@ fn subagent_thread_started_thread_spawn_serializes_thread_lineage() {
     let payload = serde_json::to_value(&event).expect("serialize thread spawn subagent event");
     assert_eq!(payload["event_params"]["thread_id"], "thread-spawn");
     assert_eq!(payload["event_params"]["thread_source"], "subagent");
+    assert_eq!(payload["event_params"]["initialization_mode"], "resumed");
+    assert_eq!(payload["event_params"]["created_at"], 124);
     assert_eq!(payload["event_params"]["subagent_source"], "thread_spawn");
     assert_eq!(
         payload["event_params"]["parent_thread_id"],
@@ -648,6 +653,7 @@ fn subagent_thread_started_memory_consolidation_serializes_expected_shape() {
             ephemeral: false,
             thread_source: Some(ThreadSource::Subagent),
             subagent_source: SubAgentSource::MemoryConsolidation,
+            initialization_mode: ThreadInitializationMode::New,
             created_at: 125,
         },
     ));
@@ -676,6 +682,7 @@ fn subagent_thread_started_other_serializes_expected_shape() {
             ephemeral: false,
             thread_source: Some(ThreadSource::GuardianReview),
             subagent_source: SubAgentSource::Other("guardian".to_string()),
+            initialization_mode: ThreadInitializationMode::New,
             created_at: 126,
         },
     ));
@@ -704,6 +711,7 @@ fn subagent_thread_started_other_serializes_explicit_parent_thread_id() {
             ephemeral: false,
             thread_source: Some(ThreadSource::GuardianReview),
             subagent_source: SubAgentSource::Other("guardian".to_string()),
+            initialization_mode: ThreadInitializationMode::New,
             created_at: 126,
         },
     ));
@@ -736,6 +744,7 @@ async fn subagent_thread_started_publishes_without_initialize() {
                     ephemeral: false,
                     thread_source: Some(ThreadSource::Subagent),
                     subagent_source: SubAgentSource::Review,
+                    initialization_mode: ThreadInitializationMode::New,
                     created_at: 127,
                 },
             )),
@@ -774,6 +783,7 @@ async fn subagent_tool_items_inherit_parent_connection_metadata() {
                     ephemeral: false,
                     thread_source: Some(ThreadSource::Subagent),
                     subagent_source: SubAgentSource::Review,
+                    initialization_mode: ThreadInitializationMode::New,
                     created_at: 128,
                 },
             )),
@@ -821,16 +831,16 @@ async fn subagent_tool_items_inherit_parent_connection_metadata() {
     reducer
         .ingest(
             AnalyticsFact::Notification(Box::new(ServerNotification::ItemStarted(
-                ItemStartedNotification {
-                    thread_id: "thread-subagent".to_string(),
-                    turn_id: "turn-subagent".to_string(),
-                    started_at_ms: 1_000,
-                    item: sample_command_execution_item(
+                ItemStartedNotification::new(
+                    "thread-subagent".to_string(),
+                    "turn-subagent".to_string(),
+                    sample_command_execution_item(
                         CommandExecutionStatus::InProgress,
                         /*exit_code*/ None,
                         /*duration_ms*/ None,
                     ),
-                },
+                    /*started_at_ms*/ 1_000,
+                ),
             ))),
             &mut events,
         )
@@ -838,16 +848,17 @@ async fn subagent_tool_items_inherit_parent_connection_metadata() {
     reducer
         .ingest(
             AnalyticsFact::Notification(Box::new(ServerNotification::ItemCompleted(
-                ItemCompletedNotification {
-                    thread_id: "thread-subagent".to_string(),
-                    turn_id: "turn-subagent".to_string(),
-                    completed_at_ms: 1_042,
-                    item: sample_command_execution_item(
+                ItemCompletedNotification::new(
+                    "thread-subagent".to_string(),
+                    "turn-subagent".to_string(),
+                    sample_command_execution_item(
                         CommandExecutionStatus::Completed,
                         Some(0),
                         Some(42),
                     ),
-                },
+                    /*started_at_ms*/ None,
+                    /*completed_at_ms*/ 1_042,
+                ),
             ))),
             &mut events,
         )

@@ -20,15 +20,15 @@ use codex_code_mode::CellId;
 use codex_features::Feature;
 use codex_features::Features;
 use codex_history::InitialHistory;
+use codex_protocol::ResponseItemId;
 use codex_protocol::mcp::McpAttribution;
 use codex_protocol::mcp::McpAttributionSource;
 use codex_protocol::models::ExecutedToolCall;
 use codex_protocol::models::ExecutedToolCallArguments;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::models::ToolResultMetadata;
-use codex_protocol::models::bound_executed_tool_calls_for_prompt;
-use codex_protocol::models::bound_executed_tool_calls_for_prompt_prioritizing_recent;
 use codex_protocol::models::executed_tool_call_metadata_bytes;
+use codex_protocol::models::normalize_executed_tool_call_completeness;
 use codex_protocol::openai_models::ToolMode;
 use indexmap::IndexMap;
 use serde_json::Value as JsonValue;
@@ -39,14 +39,12 @@ use crate::tools::context::ToolOutput;
 use crate::tools::context::ToolPayload;
 use crate::tools::metadata_metrics;
 use crate::tools::router::ToolCall;
-use crate::utils::json::serialized_json_bytes;
+use codex_utils_string::serialized_json_bytes;
 
 mod seen_ids;
 
 use seen_ids::SeenIds;
 
-const MAX_EXECUTED_TOOL_CALL_ARGUMENT_BYTES: usize = 8 * 1024;
-const MAX_EXECUTED_TOOL_CALL_FULL_ARGUMENT_BYTES_PER_OUTPUT: usize = 32 * 1024;
 const MAX_PENDING_EXECUTED_TOOL_CALLS: usize = 256;
 // Limits new Direct metadata retained in history and the append-only rollout
 // during one recorder lifetime. A new process cannot recover the exact prior
@@ -97,6 +95,8 @@ impl Drop for DirectCallPermit {
 struct ExecutedToolCallRecorderState {
     // Disabling drops this lifetime, permanently invalidating prepared Direct records.
     recording: Arc<()>,
+    // Full live Direct observations; persisted outputs keep their bounded projection.
+    direct_calls: HashMap<ResponseItemId, ExecutedToolCall>,
     cells: HashMap<CellId, RecordedCell>,
     output_cells: HashMap<String, CellId>,
     retained_calls: HashMap<(std::mem::Discriminant<ResponseItem>, String), RetainedToolCalls>,
@@ -147,7 +147,6 @@ enum CellCompletion {
 #[derive(Default)]
 struct RecordedCell {
     pending_calls: IndexMap<String, ExecutedToolCall>,
-    pending_full_argument_bytes: usize,
     completion: CellCompletion,
     originating_call_id: Option<String>,
     truncated_metadata_binding_valid: bool,
@@ -284,6 +283,36 @@ impl ExecutedToolCalls {
         self.mcp_attribution.mark_persisted(revision);
     }
 
+    /// Consult the inventory attached to this exact exec output during actor sampling.
+    /// Pending cells can still produce other outputs and have no per-output inventory yet.
+    pub(crate) fn exec_output_matches(
+        &self,
+        output: &ResponseItem,
+        nested_tool_names: &[String],
+    ) -> bool {
+        let ResponseItem::CustomToolCallOutput { call_id, .. } = output else {
+            return false;
+        };
+        let state = self.lock_state();
+        state
+            .as_ref()
+            .and_then(|state| {
+                state
+                    .retained_calls
+                    .get(&(std::mem::discriminant(output), call_id.clone()))
+            })
+            .is_some_and(|record| {
+                record.complete
+                    && record.cell_id.as_deref() == Some(call_id.as_str())
+                    && record.calls.iter().any(|call| {
+                        nested_tool_names.contains(&call.name)
+                            || nested_tool_names.contains(
+                                &codex_code_mode::normalize_code_mode_identifier(&call.name),
+                            )
+                    })
+            })
+    }
+
     fn lock_state(&self) -> MutexGuard<'_, Option<ExecutedToolCallRecorderState>> {
         self.state
             .lock()
@@ -291,7 +320,7 @@ impl ExecutedToolCalls {
     }
 
     /// A later wait cannot claim a complete inventory if an earlier wire copy
-    /// lost recorded calls or arguments from the same Code Mode cell.
+    /// lost recorded calls or tool names from the same Code Mode cell.
     pub(crate) fn invalidate_wire_inventory_loss(
         &self,
         original: &[ResponseItem],
@@ -318,7 +347,7 @@ impl ExecutedToolCalls {
             };
             if bounded
                 .executed_tool_call_metadata()
-                .is_none_or(|bounded| !bounded.has_same_tool_calls(calls))
+                .is_none_or(|bounded| !bounded.has_same_tool_call_inventory(calls))
             {
                 state.invalidate_origin(origin);
             }
@@ -362,24 +391,14 @@ impl ExecutedToolCalls {
             return None;
         }
         let permit = self.reserve_direct_call()?;
-        let (mut recorded, _) = recorded_call(call);
-        let argument_bytes = serialized_json_bytes(recorded.arguments()).unwrap_or(usize::MAX);
-        if matches!(recorded.arguments(), ExecutedToolCallArguments::Raw(_))
-            && argument_bytes > MAX_EXECUTED_TOOL_CALL_ARGUMENT_BYTES
-        {
-            recorded = ExecutedToolCall::truncated(
-                recorded.name,
-                argument_bytes,
-                MAX_EXECUTED_TOOL_CALL_ARGUMENT_BYTES,
-            );
-        }
+        let (recorded, _) = recorded_call(call);
         Some((recorded, permit))
     }
 
     fn reserve_direct_call(&self) -> Option<DirectCallPermit> {
         let recording = Arc::downgrade(&self.lock_state().as_ref()?.recording);
         self.pending_direct_calls
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |pending| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |pending| {
                 (pending < MAX_PENDING_EXECUTED_TOOL_CALLS).then_some(pending + 1)
             })
             .ok()?;
@@ -395,18 +414,23 @@ impl ExecutedToolCalls {
         &self,
         item: &mut ResponseItem,
         prepared: Option<(ExecutedToolCall, DirectCallPermit)>,
+        item_id_generator: &codex_protocol::ItemIdGenerator,
     ) {
         let Some((call, permit)) = prepared else {
             return;
         };
-        let state = self.lock_state();
-        let Some(state) = state.as_ref() else {
+        let mut state = self.lock_state();
+        let Some(state) = state.as_mut() else {
             return;
         };
         if !permit.recording.ptr_eq(&Arc::downgrade(&state.recording)) {
             return;
         }
-        let complete = matches!(call.arguments(), ExecutedToolCallArguments::Raw(_));
+        crate::session::assign_missing_item_id(item, item_id_generator);
+        if let Some(id) = item.id() {
+            state.direct_calls.insert(id.clone(), call.clone());
+        }
+        let complete = call.has_complete_inventory();
         item.append_executed_tool_calls(vec![call]);
         if complete {
             item.mark_tool_calls_complete();
@@ -552,31 +576,24 @@ impl ExecutedToolCalls {
         if !unique_nested_id || duplicate_call_id {
             cell.truncated_metadata_binding_valid = false;
         }
-        let max_bytes = MAX_EXECUTED_TOOL_CALL_ARGUMENT_BYTES.min(
-            MAX_EXECUTED_TOOL_CALL_FULL_ARGUMENT_BYTES_PER_OUTPUT
-                .saturating_sub(cell.pending_full_argument_bytes),
-        );
         let call = if at_pending_call_limit {
             ExecutedToolCall::truncated(call.name, original_bytes, /*max_bytes*/ 0)
-        } else if original_bytes <= max_bytes {
-            cell.pending_full_argument_bytes = cell
-                .pending_full_argument_bytes
-                .saturating_add(original_bytes);
-            call
         } else {
-            ExecutedToolCall::truncated(call.name, original_bytes, max_bytes)
+            call
         };
         let truncated = matches!(
             call.arguments(),
             ExecutedToolCallArguments::Truncated { .. }
         );
         cell.observed_truncated_call |= truncated;
-        cell.completion =
-            if cell.completion == CellCompletion::Recording && !duplicate_call_id && !truncated {
-                CellCompletion::Recording
-            } else {
-                CellCompletion::Incomplete
-            };
+        cell.completion = if cell.completion == CellCompletion::Recording
+            && !duplicate_call_id
+            && call.has_complete_inventory()
+        {
+            CellCompletion::Recording
+        } else {
+            CellCompletion::Incomplete
+        };
         cell.pending_calls.insert(call_id, call);
         if !duplicate_call_id {
             state.pending_nested_calls += 1;
@@ -737,23 +754,19 @@ fn recorded_call(call: &ToolCall) -> (ExecutedToolCall, usize) {
         }
     };
     let name = codex_tools::code_mode_name_for_tool_name(&call.tool_name);
-    let recorded_call = if original_bytes > MAX_EXECUTED_TOOL_CALL_ARGUMENT_BYTES {
-        ExecutedToolCall::truncated(name, original_bytes, MAX_EXECUTED_TOOL_CALL_ARGUMENT_BYTES)
-    } else {
-        let arguments = match &call.payload {
-            ToolPayload::Function { arguments } => serde_json::from_str(arguments)
-                .unwrap_or_else(|_| JsonValue::String(arguments.clone())),
-            ToolPayload::Custom { input } => JsonValue::String(input.clone()),
-            ToolPayload::ToolSearch { arguments } => {
-                serde_json::to_value(arguments).unwrap_or_default()
-            }
-        };
-        ExecutedToolCall::new(name, arguments)
+    let arguments = match &call.payload {
+        ToolPayload::Function { arguments } => {
+            serde_json::from_str(arguments).unwrap_or_else(|_| JsonValue::String(arguments.clone()))
+        }
+        ToolPayload::Custom { input } => JsonValue::String(input.clone()),
+        ToolPayload::ToolSearch { arguments } => {
+            serde_json::to_value(arguments).unwrap_or_default()
+        }
     };
-    (recorded_call, original_bytes)
+    (ExecutedToolCall::new(name, arguments), original_bytes)
 }
 
-fn input_call_id(item: &ResponseItem) -> Option<&str> {
+pub(crate) fn input_call_id(item: &ResponseItem) -> Option<&str> {
     match item {
         ResponseItem::FunctionCall { call_id, .. }
         | ResponseItem::CustomToolCall { call_id, .. } => Some(call_id),
@@ -763,11 +776,31 @@ fn input_call_id(item: &ResponseItem) -> Option<&str> {
     }
 }
 
-fn output_call_id(item: &ResponseItem) -> Option<&str> {
+pub(crate) fn output_call_id(item: &ResponseItem) -> Option<&str> {
     match item {
         ResponseItem::FunctionCallOutput { call_id, .. }
         | ResponseItem::ToolSearchOutput { call_id, .. } => call_id.as_deref(),
         ResponseItem::CustomToolCallOutput { call_id, .. } => Some(call_id),
         _ => None,
     }
+}
+
+pub(crate) fn is_matching_tool_output(call: &ResponseItem, output: &ResponseItem) -> bool {
+    let Some(call_id) = input_call_id(call) else {
+        return false;
+    };
+    output_call_id(output) == Some(call_id)
+        && matches!(
+            (call, output),
+            (
+                ResponseItem::FunctionCall { .. } | ResponseItem::LocalShellCall { .. },
+                ResponseItem::FunctionCallOutput { .. }
+            ) | (
+                ResponseItem::CustomToolCall { .. },
+                ResponseItem::CustomToolCallOutput { .. }
+            ) | (
+                ResponseItem::ToolSearchCall { .. },
+                ResponseItem::ToolSearchOutput { .. }
+            )
+        )
 }

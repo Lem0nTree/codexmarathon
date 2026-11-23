@@ -7,6 +7,7 @@ use serde_json::Value;
 use std::sync::OnceLock;
 
 const GUARDIAN_INSTRUCTIONS_PREFIX: &str = "You are judging one planned coding-agent action.";
+const GUARDIAN_PROVENANCE_PREFIX: &str = "# Transcript provenance\n";
 
 #[derive(Clone, Copy)]
 pub(super) enum TextSource<'a> {
@@ -62,6 +63,7 @@ impl Normalizer {
         let text = self.normalize_values(&text);
         if options.rewrite_known_segments
             && let Some(segment) = segment
+            && !(options.preserve_environment_context && segment == "ENVIRONMENT_CONTEXT")
         {
             let marker = format!("<{segment}>");
             if segment == "COMPACTION_SUMMARY"
@@ -153,7 +155,7 @@ impl Normalizer {
             Regex::new(r"(<(cwd|root|path|glob)>)([^<]*)").expect("environment path regex")
         });
         let host = HOST.get_or_init(|| {
-            Regex::new(r"(<(shell|shell_version|current_date|timezone)>)[^<]*")
+            Regex::new(r"(<(shell|shell_version|current_date|current_date_utc|timezone)>)[^<]*")
                 .expect("host context regex")
         });
         for captures in cwd.captures_iter(text) {
@@ -196,7 +198,7 @@ impl Normalizer {
             let label = match &captures[2] {
                 "shell" => "HOST_SHELL",
                 "shell_version" => "HOST_SHELL_VERSION",
-                "current_date" => "CURRENT_DATE",
+                "current_date" | "current_date_utc" => "CURRENT_DATE",
                 "timezone" => "HOST_TIMEZONE",
                 _ => unreachable!(),
             };
@@ -297,11 +299,13 @@ fn known_segment_name(text: &str, source: TextSource<'_>) -> Option<String> {
     let prefixes: &[(&str, &str)] = match source {
         TextSource::ModelInstructions => &[
             (GUARDIAN_INSTRUCTIONS_PREFIX, "GUARDIAN_INSTRUCTIONS"),
+            (GUARDIAN_PROVENANCE_PREFIX, "GUARDIAN_INSTRUCTIONS"),
             ("", "MODEL_INSTRUCTIONS"),
         ],
-        TextSource::Message("developer") => {
-            &[(GUARDIAN_INSTRUCTIONS_PREFIX, "GUARDIAN_INSTRUCTIONS")]
-        }
+        TextSource::Message("developer") => &[
+            (GUARDIAN_INSTRUCTIONS_PREFIX, "GUARDIAN_INSTRUCTIONS"),
+            (GUARDIAN_PROVENANCE_PREFIX, "GUARDIAN_INSTRUCTIONS"),
+        ],
         TextSource::Message("user") => &[
             ("# AGENTS.md instructions", "AGENTS_MD"),
             (
@@ -330,6 +334,7 @@ fn known_segment_name(text: &str, source: TextSource<'_>) -> Option<String> {
                 | "collaboration_mode"
                 | "multi_agent_role"
                 | "multi_agent_mode"
+                | "model_catalog"
                 | "apps_instructions"
                 | "skills_instructions"
                 | "plugins_instructions"
@@ -455,6 +460,8 @@ pub(super) fn portable_tool_schema(tool: &Value) -> Value {
         "Runs a command in a PTY, returning output or a session ID for ongoing interaction.";
     // Exact current Windows-only suffix. A change to its wording must be reviewed explicitly.
     const WINDOWS_SAFETY_SUFFIX_HASH: u64 = 0x6de3_23e4_7060_6128;
+    const UNIX_LOGIN: &str = "Request login-shell startup. Omit to inherit.";
+    const POWERSHELL_LOGIN: &str = "Login-shell startup. In PowerShell, false skips profiles. Keep them enabled for profile-defined commands, even unattended. Omit to inherit.";
     const UNIX_WAIT: &str =
         "Wait before yielding output. Defaults to 10000 ms; effective range is 250-30000 ms.";
     const WINDOWS_WAIT: &str = "Maximum time to wait before returning a session ID for a still-running command. Commands that finish sooner return immediately. For ordinary commands, omit this parameter to use the 10000 ms default. Effective range on Windows is 10000-30000 ms.";
@@ -484,6 +491,10 @@ pub(super) fn portable_tool_schema(tool: &Value) -> Value {
                 *description =
                     format!("{start}### `exec_command`\n{BASE}{}", &rest[suffix.len()..]);
             }
+            *description = description.replace(
+                &format!("  // {POWERSHELL_LOGIN}\n  login?: boolean;"),
+                &format!("  // {UNIX_LOGIN}\n  login?: boolean;"),
+            );
             for platform_wait in [UNIX_WAIT, WINDOWS_WAIT] {
                 *description = description.replace(
                     &format!("  // {platform_wait}"),
@@ -496,13 +507,31 @@ pub(super) fn portable_tool_schema(tool: &Value) -> Value {
     if definition.get("name").and_then(Value::as_str) != Some("exec_command") {
         return stable;
     }
-    if let Some(Value::String(description)) = definition.get_mut("description")
-        && description.strip_prefix(BASE).is_some_and(|rest| {
-            rest.starts_with("\n\nWindows safety rules:")
-                && fnv1a(normalize_line_endings(rest).as_bytes()) == WINDOWS_SAFETY_SUFFIX_HASH
-        })
+    if let Some(Value::String(description)) = definition.get_mut("description") {
+        if let Some(rest) = description.strip_prefix(BASE) {
+            let suffix = rest
+                .split_once("\n\nexec tool declaration:")
+                .map_or(rest, |(suffix, _)| suffix);
+            if suffix.starts_with("\n\nWindows safety rules:")
+                && fnv1a(normalize_line_endings(suffix).as_bytes()) == WINDOWS_SAFETY_SUFFIX_HASH
+            {
+                *description = format!("{BASE}{}", &rest[suffix.len()..]);
+            }
+        }
+        *description = description.replace(
+            &format!("  // {WINDOWS_WAIT}"),
+            &format!("  // {UNIX_WAIT}"),
+        );
+        *description = description.replace(
+            &format!("  // {POWERSHELL_LOGIN}\n  login?: boolean;"),
+            &format!("  // {UNIX_LOGIN}\n  login?: boolean;"),
+        );
+    }
+    if let Some(Value::String(login)) =
+        definition.pointer_mut("/parameters/properties/login/description")
+        && login == POWERSHELL_LOGIN
     {
-        *description = BASE.to_string();
+        *login = UNIX_LOGIN.to_string();
     }
     if let Some(Value::String(wait)) =
         definition.pointer_mut("/parameters/properties/yield_time_ms/description")

@@ -1,8 +1,10 @@
 //! Guardian sees root windows delivered along a nested delegation chain.
 use super::*;
 
+#[test_case::test_case(false; "text_history")]
+#[test_case::test_case(true; "native_history")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn guardian_handoff_delegation_request_history() -> Result<()> {
+async fn guardian_handoff_delegation_request_history(native_history: bool) -> Result<()> {
     skip_if_no_network!(Ok(()));
     skip_if_wine_exec!(
         Ok(()),
@@ -10,11 +12,13 @@ async fn guardian_handoff_delegation_request_history() -> Result<()> {
     );
     let requests = tokio::time::timeout(
         Duration::from_secs(/*secs*/ 30),
-        super::super::guardian_subagent_authorization::root_handoff::handoff_scenario(),
+        super::super::guardian_subagent_authorization::root_handoff::handoff_scenario(
+            native_history,
+        ),
     )
     .await??;
     let mut snapshot = context_snapshot::format_request_history_snapshot(
-        "Complete Guardian request history: root delegates through alpha to leaf and separately to beta. Root handoffs to alpha update leaf immediately. Every branch also sees the latest three root messages, including cancellation before another handoff. If compaction removes the handoff calls, the existing root context is used instead. The assessment is mocked.",
+        "Complete Guardian request history: root delegates through alpha to leaf and separately to beta. Root handoffs to alpha update leaf immediately. Every branch keeps genuine root user messages, including cancellation followed by unrelated status questions. Handoff windows and the latest three root messages select assistant context. If compaction removes the handoff calls, the existing root context is used instead. The assessment is mocked.",
         &requests,
         &ContextSnapshotOptions::default().rewrite_known_segments(),
     );
@@ -37,6 +41,11 @@ async fn guardian_handoff_delegation_request_history() -> Result<()> {
             .replace_all(&snapshot, replacement)
             .into_owned();
     }
-    insta::assert_snapshot!("guardian_handoff_delegation", snapshot);
+    let snapshot_name = if native_history {
+        "guardian_handoff_delegation_native"
+    } else {
+        "guardian_handoff_delegation"
+    };
+    insta::assert_snapshot!(snapshot_name, snapshot);
     Ok(())
 }

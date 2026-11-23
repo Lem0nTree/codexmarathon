@@ -4,8 +4,8 @@ set -eu
 # Linux ARM64 cannot build Codex's V8-backed code-mode host locally because
 # rusty_v8 does not publish the required archive for this target. Keep this
 # fallback pinned to the exact upstream release that this source tree embeds.
-asset_url='https://github.com/openai/codex/releases/download/rust-v0.160.0/codex-code-mode-host-aarch64-unknown-linux-musl.tar.gz'
-asset_sha256='94066fdf13ffecd2f58776ec5cb8fc3040283a642e3d6ff25c5d82048c41038e'
+asset_url='https://github.com/openai/codex/releases/download/rust-v0.171.0/codex-code-mode-host-aarch64-unknown-linux-musl.tar.gz'
+asset_sha256='7669c881b78669b5f13ddb99996b5cef3fb10dab5b69f43be31d19e82e9cd62b'
 asset_member='codex-code-mode-host-aarch64-unknown-linux-musl'
 
 die() {

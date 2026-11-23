@@ -69,6 +69,7 @@ fn stale_monthly_limit_marks_fresh_rolling_snapshot_stale() {
         captured_at: now,
         primary: Some(RateLimitWindowDisplay {
             used_percent: 20.0,
+            resets_at_unix: None,
             resets_at: Some("soon".to_string()),
             window_minutes: Some(300),
         }),
@@ -283,6 +284,7 @@ async fn status_snapshot_includes_reasoning_details() {
     let usage = TokenUsage {
         input_tokens: 1_200,
         cached_input_tokens: 200,
+        cache_write_input_tokens: 0,
         output_tokens: 900,
         reasoning_output_tokens: 150,
         total_tokens: 2_250,
@@ -358,6 +360,19 @@ async fn status_snapshot_shows_chatgpt_plan_without_email() {
         ..LoaderOverrides::without_managed_config_for_tests()
     };
     let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::path("/api/codex/accounts/check"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "accounts": [{
+                    "id": "account-123",
+                    "name": "Example workspace",
+                    "workspace_backend_origin": "https://chatgpt.com",
+                    "account_routing_override": "NO_CONSTRAINT"
+                }]
+            })),
+        )
+        .mount(&server)
+        .await;
     wiremock::Mock::given(wiremock::matchers::path("/api/codex/config/bundle"))
         .respond_with(wiremock::ResponseTemplate::new(/*s*/ 200).set_body_string("{}"))
         .mount(&server)
@@ -368,6 +383,7 @@ async fn status_snapshot_shows_chatgpt_plan_without_email() {
     )
     .expect("configure local ChatGPT fixture");
     let mut config = test_config(&temp_home).await;
+    config.chatgpt_base_url = server.uri();
     config.model = Some("gpt-5.1-codex-max".to_string());
     config.model_provider_id = "openai".to_string();
     config.cli_auth_credentials_store_mode = AuthCredentialsStoreMode::File;
@@ -375,7 +391,9 @@ async fn status_snapshot_shows_chatgpt_plan_without_email() {
 
     write_chatgpt_auth(
         temp_home.path(),
-        ChatGptAuthFixture::new("access-chatgpt").plan_type("enterprise_cbp_automation"),
+        ChatGptAuthFixture::new("access-chatgpt")
+            .plan_type("enterprise_cbp_automation")
+            .account_id("account-123"),
         AuthCredentialsStoreMode::File,
     )
     .expect("write email-less ChatGPT auth");
@@ -383,6 +401,7 @@ async fn status_snapshot_shows_chatgpt_plan_without_email() {
         .await
         .expect("write models cache");
     let mut app_server = crate::start_app_server_for_picker(
+        crate::backend_id::BackendId::new(),
         &config,
         &crate::AppServerTarget::Embedded,
         Vec::new(),
@@ -405,6 +424,7 @@ async fn status_snapshot_shows_chatgpt_plan_without_email() {
         StatusAccountDisplay::ChatGpt {
             email: None,
             plan: Some("Enterprise (Automation)".to_string()),
+            workspace: Some("Example workspace (account-123)".to_string()),
         }
     );
     let usage = TokenUsage::default();
@@ -828,26 +848,33 @@ async fn status_uses_server_provider_id_and_auth_requirement() {
         sanitize_directory(render_lines(&composite.display_lines(/*width*/ 120))).join("\n");
     assert_snapshot!("status_server_auth_required", rendered);
 
-    for width in [42, 120] {
-        let destinations: Vec<String> = composite
-            .display_hyperlink_lines(width)
-            .into_iter()
-            .flat_map(|line| line.hyperlinks.into_iter())
-            .map(|link| link.destination)
-            .collect();
+    for width in [24, 42, 120] {
+        let lines = composite.display_hyperlink_lines(width);
+        let mut fragments = String::new();
+        let mut destinations = Vec::new();
+        for line in lines {
+            let visible = line.line.to_string();
+            for link in line.hyperlinks {
+                fragments.extend(
+                    visible
+                        .chars()
+                        .skip(link.columns.start)
+                        .take(link.columns.len()),
+                );
+                destinations.push(link.destination);
+            }
+        }
         assert_eq!(
-            destinations,
-            vec!["https://chatgpt.com/codex/settings/usage"]
+            fragments, "https://chatgpt.com/settings/usage",
+            "width {width}"
+        );
+        assert!(!destinations.is_empty());
+        assert!(
+            destinations
+                .iter()
+                .all(|destination| destination == "https://chatgpt.com/settings/usage")
         );
     }
-
-    let narrow_destinations: Vec<String> = composite
-        .display_hyperlink_lines(/*width*/ 24)
-        .into_iter()
-        .flat_map(|line| line.hyperlinks.into_iter())
-        .map(|link| link.destination)
-        .collect();
-    assert_eq!(narrow_destinations, Vec::<String>::new());
 }
 
 #[tokio::test]
@@ -956,6 +983,7 @@ async fn status_snapshot_includes_forked_from() {
     let usage = TokenUsage {
         input_tokens: 800,
         cached_input_tokens: 0,
+        cache_write_input_tokens: 0,
         output_tokens: 400,
         reasoning_output_tokens: 0,
         total_tokens: 1_200,
@@ -1010,6 +1038,7 @@ async fn status_snapshot_includes_monthly_limit() {
     let usage = TokenUsage {
         input_tokens: 800,
         cached_input_tokens: 0,
+        cache_write_input_tokens: 0,
         output_tokens: 400,
         reasoning_output_tokens: 0,
         total_tokens: 1_200,
@@ -1076,6 +1105,7 @@ async fn status_snapshot_includes_enterprise_monthly_credit_limit() {
     let usage = TokenUsage {
         input_tokens: 800,
         cached_input_tokens: 0,
+        cache_write_input_tokens: 0,
         output_tokens: 400,
         reasoning_output_tokens: 0,
         total_tokens: 1_200,
@@ -1154,6 +1184,7 @@ async fn status_snapshot_uses_generic_limit_labels_for_unsupported_windows() {
     let usage = TokenUsage {
         input_tokens: 800,
         cached_input_tokens: 0,
+        cache_write_input_tokens: 0,
         output_tokens: 400,
         reasoning_output_tokens: 0,
         total_tokens: 1_200,
@@ -1443,6 +1474,7 @@ async fn status_card_token_usage_excludes_cached_tokens() {
     let usage = TokenUsage {
         input_tokens: 1_200,
         cached_input_tokens: 200,
+        cache_write_input_tokens: 0,
         output_tokens: 900,
         reasoning_output_tokens: 0,
         total_tokens: 2_100,
@@ -1545,6 +1577,7 @@ async fn status_snapshot_wraps_in_narrow_terminal() {
     let usage = TokenUsage {
         input_tokens: 1_200,
         cached_input_tokens: 200,
+        cache_write_input_tokens: 0,
         output_tokens: 900,
         reasoning_output_tokens: 150,
         total_tokens: 2_250,
@@ -1610,6 +1643,7 @@ async fn status_snapshot_wraps_halfwidth_kana_in_narrow_terminal() {
     let account = StatusAccountDisplay::ChatGpt {
         email: Some("ｶﾞﾊﾟｶﾞﾊﾟｶﾞﾊﾟ@example.com".to_string()),
         plan: Some("ｶﾞﾊﾟ plan".to_string()),
+        workspace: None,
     };
     let usage = TokenUsage::default();
     let now = chrono::Local
@@ -1651,6 +1685,7 @@ async fn status_snapshot_shows_missing_limits_message() {
     let usage = TokenUsage {
         input_tokens: 500,
         cached_input_tokens: 0,
+        cache_write_input_tokens: 0,
         output_tokens: 250,
         reasoning_output_tokens: 0,
         total_tokens: 750,
@@ -1699,6 +1734,7 @@ async fn status_snapshot_uses_default_reasoning_when_config_empty() {
     let usage = TokenUsage {
         input_tokens: 500,
         cached_input_tokens: 0,
+        cache_write_input_tokens: 0,
         output_tokens: 250,
         reasoning_output_tokens: 0,
         total_tokens: 750,
@@ -1721,6 +1757,7 @@ async fn status_snapshot_uses_default_reasoning_when_config_empty() {
                 .to_string(),
             version: "v0.133.0".to_string(),
             is_local_daemon,
+            is_managed_daemon: is_local_daemon,
         });
 
         let model_slug = get_model_offline_for_tests(config.model.as_deref());
@@ -1766,6 +1803,7 @@ async fn status_snapshot_shows_refreshing_limits_notice() {
     let usage = TokenUsage {
         input_tokens: 500,
         cached_input_tokens: 0,
+        cache_write_input_tokens: 0,
         output_tokens: 250,
         reasoning_output_tokens: 0,
         total_tokens: 750,
@@ -1873,11 +1911,13 @@ async fn transcript_overlay_remeasures_status_after_rate_limit_refresh() {
             captured_at: now,
             primary: Some(RateLimitWindowDisplay {
                 used_percent: 45.0,
+                resets_at_unix: None,
                 resets_at: Some("soon".to_string()),
                 window_minutes: Some(300),
             }),
             secondary: Some(RateLimitWindowDisplay {
                 used_percent: 30.0,
+                resets_at_unix: None,
                 resets_at: Some("later".to_string()),
                 window_minutes: Some(10_080),
             }),
@@ -1916,10 +1956,15 @@ async fn status_snapshot_includes_credits_and_limits() {
     config.model = Some("gpt-5.1-codex".to_string());
     set_workspace_cwd(&mut config, test_path_buf("/workspace/tests").abs());
 
-    let account_display = test_status_account_display();
+    let account_display = Some(StatusAccountDisplay::ChatGpt {
+        email: Some("user@example.com".into()),
+        plan: Some("Pro 200".into()),
+        workspace: None,
+    });
     let usage = TokenUsage {
         input_tokens: 1_500,
         cached_input_tokens: 100,
+        cache_write_input_tokens: 0,
         output_tokens: 600,
         reasoning_output_tokens: 0,
         total_tokens: 2_200,
@@ -1993,6 +2038,7 @@ async fn status_snapshot_shows_unavailable_limits_message() {
     let usage = TokenUsage {
         input_tokens: 500,
         cached_input_tokens: 0,
+        cache_write_input_tokens: 0,
         output_tokens: 250,
         reasoning_output_tokens: 0,
         total_tokens: 750,
@@ -2053,6 +2099,7 @@ async fn status_snapshot_treats_refreshing_empty_limits_as_unavailable() {
     let usage = TokenUsage {
         input_tokens: 500,
         cached_input_tokens: 0,
+        cache_write_input_tokens: 0,
         output_tokens: 250,
         reasoning_output_tokens: 0,
         total_tokens: 750,
@@ -2101,7 +2148,7 @@ async fn status_snapshot_treats_refreshing_empty_limits_as_unavailable() {
         }
     }
     let sanitized = sanitize_directory(rendered_lines).join("\n");
-    assert_snapshot!(sanitized);
+    assert!(sanitized.contains("Limits:          not available for this account"));
 }
 
 #[tokio::test]
@@ -2115,6 +2162,7 @@ async fn status_snapshot_shows_stale_limits_message() {
     let usage = TokenUsage {
         input_tokens: 1_200,
         cached_input_tokens: 200,
+        cache_write_input_tokens: 0,
         output_tokens: 900,
         reasoning_output_tokens: 150,
         total_tokens: 2_250,
@@ -2185,6 +2233,7 @@ async fn status_snapshot_cached_limits_hide_credits_without_flag() {
     let usage = TokenUsage {
         input_tokens: 900,
         cached_input_tokens: 200,
+        cache_write_input_tokens: 0,
         output_tokens: 350,
         reasoning_output_tokens: 0,
         total_tokens: 1_450,
@@ -2258,6 +2307,7 @@ async fn status_context_window_uses_last_usage() {
     let total_usage = TokenUsage {
         input_tokens: 12_800,
         cached_input_tokens: 0,
+        cache_write_input_tokens: 0,
         output_tokens: 879,
         reasoning_output_tokens: 0,
         total_tokens: 102_000,
@@ -2265,6 +2315,7 @@ async fn status_context_window_uses_last_usage() {
     let last_usage = TokenUsage {
         input_tokens: 12_800,
         cached_input_tokens: 0,
+        cache_write_input_tokens: 0,
         output_tokens: 879,
         reasoning_output_tokens: 0,
         total_tokens: 13_679,

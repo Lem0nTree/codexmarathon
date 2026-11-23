@@ -1,7 +1,8 @@
 //! Carry one startup submission intent across draft handoff without consuming editable text early.
 //!
-//! Confirmation applies to the visible draft only. Editing, cancellation, or disconnect removes
-//! the intent; normal submission parsing runs once the session and protected-input gates are ready.
+//! Confirmation applies to the visible draft only. Editing, cancellation, or an uncertain disconnect
+//! removes the intent; a refused initial start can preserve it while reconnecting. Normal submission
+//! parsing runs once the session and protected-input gates are ready.
 
 use super::*;
 use crate::bottom_pane::ComposerDraftSnapshot;
@@ -51,7 +52,7 @@ impl ChatWidget {
             || self.startup_submission_has_protected_input()
             || self.is_plan_streaming_in_tui()
             || self.is_user_turn_pending_or_running()
-            || self.input_queue.suppress_queue_autosend
+            || self.input_queue.submissions_paused()
             || self.input_queue.rate_limit_recovery_pending
             || self.input_queue.recovered_queue
             || self.input_queue.has_unconfirmed_messages()

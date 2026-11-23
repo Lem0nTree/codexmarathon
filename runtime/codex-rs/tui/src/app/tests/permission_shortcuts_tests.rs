@@ -43,6 +43,7 @@ async fn permission_shortcut_rejections_leave_state_unchanged() -> Result<()> {
         )
         .await?;
         let mut app_server = AppServerSession::new(
+            crate::backend_id::BackendId::new(),
             codex_app_server_client::AppServerClient::InProcess(client),
             crate::app_server_session::ThreadParamsMode::Embedded,
         );
@@ -105,7 +106,11 @@ async fn permission_shortcut_confirms_without_persisting() -> Result<()> {
         RuntimePermissionProfileOverride::from_config(app.chat_widget.config_ref()),
         before
     );
-    assert!(app.pending_server_profiles.contains_key(&thread_id));
+    assert!(
+        app.agents_overview
+            .requested_permission_profiles
+            .contains_key(&thread_id)
+    );
     insta::assert_snapshot!(
         next_history_message(&mut events),
         @"• Permission selection requested: Read Only"

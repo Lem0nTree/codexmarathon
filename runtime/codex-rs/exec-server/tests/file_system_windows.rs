@@ -30,15 +30,16 @@ use codex_protocol::permissions::FileSystemSandboxEntry;
 use codex_protocol::permissions::FileSystemSandboxPolicy;
 use codex_protocol::permissions::FileSystemSpecialPath;
 use codex_protocol::permissions::NetworkSandboxPolicy;
-use codex_protocol::protocol::SandboxPolicy;
 use codex_sandboxing::SandboxType;
 use codex_utils_path_uri::PathUri;
+use codex_windows_sandbox_test_support::WindowsSandboxAccountTestGuard;
 use futures::TryStreamExt;
 use pretty_assertions::assert_eq;
 use test_case::test_case;
 use tokio::net::windows::named_pipe::ServerOptions;
 use tokio::time::timeout;
 use uuid::Uuid;
+use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
 use crate::support::FileSystemImplementation;
@@ -101,6 +102,9 @@ async fn file_system_operations_can_reject_junctions_in_any_path_component(
     std::fs::write(&removable, "keep")?;
     let directory_junction = tmp.path().join("directory-junction");
     create_directory_junction(&real, &directory_junction)?;
+    assert!(
+        codex_exec_server::BoundOutput::open(&directory_junction.join("existing.txt")).is_err()
+    );
 
     let no_follow_read = ReadFileOptions {
         follow_symlinks: false,
@@ -445,6 +449,19 @@ async fn file_system_remote_fs_helper_respects_windows_sandbox_write_policy(
         "sandboxed fs helper must not create blocked file after error: {error}"
     );
 
+    let mut writable_sandbox = workspace_write_sandbox(readonly_dir.clone());
+    writable_sandbox.windows_sandbox_selection = sandbox.windows_sandbox_selection;
+    let allowed_file = readonly_dir.join("allowed.txt");
+    file_system
+        .write_file(
+            &PathUri::from_host_native_path(&allowed_file)?,
+            b"allowed".to_vec(),
+            WriteFileOptions::default(),
+            Some(&writable_sandbox),
+        )
+        .await?;
+    assert_eq!(std::fs::read(&allowed_file)?, b"allowed");
+
     Ok(())
 }
 
@@ -456,6 +473,7 @@ async fn file_system_remote_fs_helper_respects_windows_sandbox_write_policy(
 async fn file_system_elevated_relative_read_denial_uses_policy_cwd(
     implementation: FileSystemImplementation,
 ) -> Result<()> {
+    let _account_guard = WindowsSandboxAccountTestGuard::acquire()?;
     // Both implementations re-enter this test binary; the elevated backend finds its helpers
     // next to that binary, while Cargo and Bazel provide them separately.
     let test_exe = std::env::current_exe()?;
@@ -471,7 +489,7 @@ async fn file_system_elevated_relative_read_denial_uses_policy_cwd(
     for name in ["codex-windows-sandbox-setup", "codex-command-runner"] {
         let source = codex_utils_cargo_bin::cargo_bin(name)?;
         let destination = resources.join(Path::new(name).with_extension("exe"));
-        if let Err(error) = std::fs::copy(&source, &destination)
+        if let Err(error) = codex_utils_cargo_bin::copy_executable(&source, &destination)
             && !(error.kind() == std::io::ErrorKind::PermissionDenied && destination.is_file())
         {
             return Err(error).with_context(|| format!("stage Windows sandbox helper {name}"));
@@ -651,7 +669,7 @@ fn process_private_desktops() -> Result<BTreeSet<String>> {
     // Native layout: https://github.com/winsiderss/phnt/blob/master/ntpsapi.h
     #[repr(C)]
     struct HandleEntry {
-        handle: isize,
+        handle: HANDLE,
         _handle_count: usize,
         _pointer_count: usize,
         _granted_access: u32,
@@ -662,7 +680,7 @@ fn process_private_desktops() -> Result<BTreeSet<String>> {
     #[link(name = "ntdll")]
     unsafe extern "system" {
         fn NtQueryInformationProcess(
-            process: isize,
+            process: HANDLE,
             class: u32,
             information: *mut c_void,
             length: u32,
@@ -672,7 +690,7 @@ fn process_private_desktops() -> Result<BTreeSet<String>> {
     #[link(name = "user32")]
     unsafe extern "system" {
         fn GetUserObjectInformationW(
-            object: isize,
+            object: HANDLE,
             index: i32,
             information: *mut c_void,
             length: u32,
@@ -727,8 +745,8 @@ fn process_private_desktops() -> Result<BTreeSet<String>> {
 }
 
 fn read_only_sandbox_for_cwd(cwd: std::path::PathBuf) -> Result<FileSystemSandboxContext> {
-    Ok(FileSystemSandboxContext::from_legacy_sandbox_policy(
-        SandboxPolicy::new_read_only_policy(),
+    Ok(FileSystemSandboxContext::from_permission_profile(
+        PermissionProfile::read_only(),
         PathUri::from_host_native_path(cwd)?,
-    )?)
+    ))
 }

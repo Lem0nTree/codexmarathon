@@ -1,21 +1,28 @@
-//! Server RPCs own lifecycle outcomes; successful actions invalidate dashboard group caches.
-//! A modal keeps rendering during RPCs while deferring navigation and task notifications.
+//! Server RPCs own lifecycle outcomes; cache cleanup follows the backend's removal scope.
+//! Keep the dashboard browsable during RPCs while deferring task notifications.
 //! Removing the current root leaves an unattached dashboard, even when it is empty.
 
 use super::App;
+use super::agents_overview::AGENTS_OVERVIEW_VIEW_ID;
 use crate::app_event::AgentsOverviewAction;
 use crate::app_event::AppEvent;
 use crate::app_server_session::AppServerSession;
+use crate::backend_id::BackendId;
 use crate::bottom_pane::SelectionItem;
 use crate::bottom_pane::SelectionViewParams;
 use crate::chatwidget::ChatWidget;
 use crate::render::renderable::Renderable;
 use crate::tui;
 use crate::wrapping::word_wrap_lines;
+use codex_app_server_protocol::ClientRequest;
+use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::SessionSource;
 use codex_app_server_protocol::ThreadLoadedListParams;
+use codex_app_server_protocol::ThreadSectionMoveParams;
+use codex_app_server_protocol::ThreadSectionMoveResponse;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::SubAgentSource;
+use codex_state::PINNED_THREAD_SECTION_ID;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::Stylize;
@@ -25,6 +32,7 @@ use std::collections::HashSet;
 use std::future::Future;
 use tokio_stream::Stream;
 use tokio_stream::StreamExt;
+use uuid::Uuid;
 
 struct LifecycleHeader(Vec<Line<'static>>);
 
@@ -42,44 +50,16 @@ impl Renderable for LifecycleHeader {
     }
 }
 
-struct LifecycleProgress(AgentsOverviewAction);
-
-impl LifecycleProgress {
-    fn header(&self) -> LifecycleHeader {
-        let title = match self.0 {
-            AgentsOverviewAction::Archive => "Archiving task…",
-            AgentsOverviewAction::Delete => "Deleting task…",
-        };
-        LifecycleHeader(vec![
-            title.bold().into(),
-            "Please wait. Task switching is unavailable until this finishes."
-                .dim()
-                .into(),
-        ])
-    }
-}
-
-impl Renderable for LifecycleProgress {
-    fn render(&self, area: Rect, buf: &mut Buffer) {
-        self.header().render(area, buf);
-    }
-
-    fn desired_height(&self, width: u16) -> u16 {
-        self.header().desired_height(width)
-    }
-}
-
-/// Keep the terminal responsive without dispatching navigation or queued task events.
+/// Keep browsing responsive without queuing actions against a locked server.
 async fn run_lifecycle_modal<T>(
     tui: &mut tui::Tui,
-    action: AgentsOverviewAction,
+    app: &mut App,
     operation: impl Future<Output = T>,
     events: impl Stream<Item = tui::TuiEvent> + Unpin,
 ) -> color_eyre::Result<T> {
-    let progress = LifecycleProgress(action);
-    tui.draw(u16::MAX, |frame| {
-        progress.render(frame.area(), frame.buffer_mut());
-    })?;
+    let screen_size = tui.prepare_draw_size()?;
+    app.handle_draw_pre_render(tui, screen_size)?;
+    app.render_chat_widget_frame(tui, screen_size)?;
     let mut events = events.fuse();
     tokio::pin!(operation);
     let result = loop {
@@ -87,13 +67,28 @@ async fn run_lifecycle_modal<T>(
             biased;
             result = &mut operation => break result,
             Some(event) = events.next() => {
-                tui.screen_size_for_event(&event)?;
+                let screen_size = tui.screen_size_for_event(&event)?;
+                if matches!(&event, tui::TuiEvent::Paste(_) | tui::TuiEvent::FocusLost) {
+                    app.cancel_pending_key_chord();
+                }
+                let dashboard_active = app.chat_widget
+                    .selected_index_for_active_view(AGENTS_OVERVIEW_VIEW_ID)
+                    .is_some();
                 match event {
+                    tui::TuiEvent::Key(key) if dashboard_active => {
+                        if let Some(key) = app.route_key_chord_event(tui, key) {
+                            app.chat_widget.handle_key_event_with_activation_key(key, app.routed_key_activation);
+                        }
+                        tui.frame_requester().schedule_frame();
+                    }
+                    tui::TuiEvent::Paste(text) if dashboard_active => {
+                        app.chat_widget.handle_paste(text);
+                        tui.frame_requester().schedule_frame();
+                    }
                     tui::TuiEvent::Key(_) | tui::TuiEvent::Paste(_) | tui::TuiEvent::FocusLost | tui::TuiEvent::Mouse(_) => {}
                     tui::TuiEvent::Draw | tui::TuiEvent::Resize(_) | tui::TuiEvent::Resume | tui::TuiEvent::FocusGained => {
-                        tui.draw(u16::MAX, |frame| {
-                            progress.render(frame.area(), frame.buffer_mut());
-                        })?;
+                        app.expire_pending_key_chord(tui);
+                        app.render_chat_widget_frame(tui, screen_size)?;
                     }
                 }
             }
@@ -104,6 +99,89 @@ async fn run_lifecycle_modal<T>(
 }
 
 impl App {
+    pub(super) fn toggle_agents_overview_pin(
+        &mut self,
+        app_server: &AppServerSession,
+        thread_id: ThreadId,
+        pinned: bool,
+    ) {
+        if self.agents_overview.pending_pin_change.is_some() {
+            return;
+        }
+        let request_id = Uuid::new_v4();
+        self.agents_overview.pending_pin_change = Some((request_id, app_server.backend_id()));
+        let backend_id = app_server.backend_id();
+        let request_handle = app_server.request_handle();
+        let app_event_tx = self.app_event_tx.clone();
+        tokio::spawn(async move {
+            let result = request_handle
+                .request_typed::<ThreadSectionMoveResponse>(ClientRequest::ThreadSectionMove {
+                    request_id: RequestId::String(Uuid::new_v4().to_string()),
+                    params: ThreadSectionMoveParams {
+                        thread_id: thread_id.to_string(),
+                        section_id: pinned.then(|| PINNED_THREAD_SECTION_ID.to_string()),
+                        before_thread_id: None,
+                    },
+                })
+                .await
+                .map(|_| ())
+                .map_err(|error| error.to_string());
+            app_event_tx.send(AppEvent::AgentsOverviewPinToggled {
+                backend_id,
+                request_id,
+                thread_id,
+                pinned,
+                result,
+            });
+        });
+    }
+
+    pub(super) fn complete_agents_overview_pin(
+        &mut self,
+        app_server: &AppServerSession,
+        backend_id: BackendId,
+        request_id: Uuid,
+        thread_id: ThreadId,
+        pinned: bool,
+        result: Result<(), String>,
+    ) {
+        let Some((_, owner)) = self
+            .agents_overview
+            .pending_pin_change
+            .filter(|(id, owner)| *id == request_id && *owner == backend_id)
+        else {
+            return;
+        };
+        self.agents_overview.pending_pin_change = None;
+        match result {
+            Ok(()) => {
+                if let Some(Some(pinned_thread_ids)) =
+                    self.agents_overview.pins_by_backend.get_mut(&owner)
+                {
+                    if pinned {
+                        if !pinned_thread_ids.contains(&thread_id) {
+                            pinned_thread_ids.push(thread_id);
+                        }
+                    } else {
+                        pinned_thread_ids.retain(|id| *id != thread_id);
+                    }
+                }
+            }
+            Err(error) => {
+                self.add_agents_overview_error(format!(
+                    "Failed to {} task: {error}",
+                    if pinned { "pin" } else { "unpin" }
+                ));
+            }
+        }
+        self.cancel_agents_overview_refresh(backend_id);
+        if backend_id == app_server.backend_id() {
+            self.refresh_agents_overview_threads(app_server);
+        }
+
+        self.repaint_agents_overview();
+    }
+
     pub(super) fn confirm_agents_overview_action(
         &mut self,
         thread_id: ThreadId,
@@ -114,6 +192,7 @@ impl App {
             .threads
             .get(&thread_id)
             .and_then(Option::as_ref)
+            .or_else(|| self.agents_overview.search_matches.get(&thread_id))
         else {
             return;
         };
@@ -125,6 +204,15 @@ impl App {
             .filter(|name| !name.is_empty())
             .unwrap_or("Untitled task");
         let (title, description, label) = match action {
+            AgentsOverviewAction::Archive
+                if self.app_server_target == crate::AppServerTarget::Cloud =>
+            {
+                (
+                    format!("Archive “{name}”?"),
+                    "This stops any running work in this task and archives it. Child agents stay unchanged. Its history can be restored from the resume picker.",
+                    "Archive task",
+                )
+            }
             AgentsOverviewAction::Archive => (
                 format!("Archive “{name}”?"),
                 "This stops any running work in this task and its child agents, then archives them. Their history can be restored from the resume picker.",
@@ -132,7 +220,7 @@ impl App {
             ),
             AgentsOverviewAction::Delete => (
                 format!("Permanently delete “{name}”?"),
-                "This stops any running work in this task and its child agents, then permanently deletes their history. This cannot be undone.",
+                "Tasks with saved side chats stay intact. Otherwise, deleting this task stops its running work and permanently deletes its history and its child agents’ history.",
                 "Permanently delete task and child agents",
             ),
         };
@@ -157,8 +245,38 @@ impl App {
                     ..Default::default()
                 },
             ],
-            ..SelectionViewParams::picker()
+            ..SelectionViewParams::confirmation()
         });
+    }
+
+    pub(super) fn known_thread_subtree(&self, thread_id: ThreadId) -> HashSet<ThreadId> {
+        let mut removed = HashSet::from([thread_id]);
+        loop {
+            let previous_len = removed.len();
+            for (id, thread) in &self.agents_overview.threads {
+                let Some(thread) = thread else { continue };
+                let parent = thread
+                    .parent_thread_id
+                    .as_deref()
+                    .and_then(|id| ThreadId::from_string(id).ok())
+                    .or(match &thread.source {
+                        SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                            parent_thread_id,
+                            ..
+                        }) => Some(*parent_thread_id),
+                        _ => None,
+                    });
+                if thread.session_id == thread_id.to_string()
+                    || parent.is_some_and(|parent| removed.contains(&parent))
+                {
+                    removed.insert(*id);
+                }
+            }
+            if removed.len() == previous_len {
+                break;
+            }
+        }
+        removed
     }
 
     pub(super) async fn run_agents_overview_action(
@@ -171,16 +289,39 @@ impl App {
         if self.windows_sandbox_blocks_thread_switch() {
             return Ok(());
         }
+        // Cloud archives only the selected thread; Local lifecycle actions include descendants.
+        let removes_subtree = action != AgentsOverviewAction::Archive
+            || app_server.thread_params_mode()
+                != crate::app_server_session::ThreadParamsMode::Cloud;
         // The overview may lack intermediate ancestors, or even the primary's metadata.
         let mut removes_primary = self.primary_thread_id == Some(thread_id);
         let mut attempted = false;
         let primary_thread_id = self.primary_thread_id;
         let events = tui.event_stream();
+        self.prepare_agents_overview_removal(&HashSet::from([thread_id]));
+        let hidden = self.agents_overview.hidden_threads.insert(thread_id);
+        {
+            let mut state = self
+                .agents_overview
+                .view_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.removal = Some(action);
+            // Confirmation may have been opened from the rename editor.
+            state.rename_target = None;
+        }
+        self.repaint_agents_overview();
+        let voice_result = if removes_subtree || self.voice_owner_thread_id() == Some(thread_id) {
+            self.stop_voice_for_removed_thread(app_server, thread_id)
+                .await
+        } else {
+            Ok(())
+        };
         let operation = async {
             let result = async {
-                self.stop_voice_for_removed_thread(app_server, thread_id)
-                    .await?;
-                if let Some(primary) = primary_thread_id
+                voice_result?;
+                if removes_subtree
+                    && let Some(primary) = primary_thread_id
                     && primary != thread_id
                 {
                     removes_primary = app_server
@@ -220,54 +361,29 @@ impl App {
             }
             (result, detach_primary)
         };
-        let (result, detach_primary) = run_lifecycle_modal(tui, action, operation, events).await?;
-        if attempted {
-            // A read started before the RPC can contain stale task and approval state.
-            if let Some(refresh) = self.agents_overview.refresh_task.take() {
-                refresh.abort();
-            }
-            self.agents_overview.request_id = None;
-            self.agents_overview
-                .view_state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .loading = false;
-            self.agents_overview.refresh_pending = false;
-            self.agents_overview.refresh_notifications.clear();
+        let outcome = run_lifecycle_modal(tui, self, operation, events).await;
+        if hidden {
+            self.agents_overview.hidden_threads.remove(&thread_id);
         }
+        self.agents_overview
+            .view_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .removal = None;
+        let (result, detach_primary) = outcome?;
+
         if result.is_ok() {
-            // Invalidate cached details for the displayed group, without inferring child outcomes.
-            let mut removed = HashSet::from([thread_id]);
-            loop {
-                let previous_len = removed.len();
-                for (id, thread) in &self.agents_overview.threads {
-                    let Some(thread) = thread else { continue };
-                    let parent = thread
-                        .parent_thread_id
-                        .as_deref()
-                        .and_then(|id| ThreadId::from_string(id).ok())
-                        .or(match &thread.source {
-                            SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
-                                parent_thread_id,
-                                ..
-                            }) => Some(*parent_thread_id),
-                            _ => None,
-                        });
-                    if thread.session_id == thread_id.to_string()
-                        || parent.is_some_and(|parent| removed.contains(&parent))
-                    {
-                        removed.insert(*id);
-                    }
-                }
-                if removed.len() == previous_len {
-                    break;
-                }
-            }
+            let mut removed = if removes_subtree {
+                self.known_thread_subtree(thread_id)
+            } else {
+                HashSet::from([thread_id])
+            };
             if let Some(primary) = self.primary_thread_id
                 && removes_primary
             {
                 removed.insert(primary);
             }
+            self.prepare_agents_overview_removal(&removed);
             for removed_id in removed {
                 self.remove_agents_overview_thread(removed_id);
                 self.agents_overview.activity.remove(&removed_id);
@@ -278,7 +394,19 @@ impl App {
                 self.agents_overview.dispatched_requests.remove(&removed_id);
             }
         }
+        if attempted {
+            // Discard reads started before the mutation after recording the removed threads.
+            self.cancel_agents_overview_refresh(app_server.backend_id());
+        }
         if detach_primary {
+            self.agents_overview.selection_after_removal =
+                self.agents_overview.selection_after_removal.or_else(|| {
+                    self.chat_widget
+                        .selected_index_for_present_view(AGENTS_OVERVIEW_VIEW_ID)
+                        .and_then(|index| {
+                            self.agents_overview.visible_thread_ids.get(index).copied()
+                        })
+                });
             self.reset_for_thread_switch(tui)?;
             self.pending_thread_switch_resets += 1;
             self.app_event_tx

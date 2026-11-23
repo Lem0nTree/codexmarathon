@@ -1,19 +1,22 @@
 //! Session-wide mutable state.
 
-use codex_protocol::models::AdditionalPermissionProfile;
+use codex_protocol::dynamic_tools::DynamicToolSpec;
 use codex_protocol::models::BaseInstructionsProvenance;
 #[cfg(test)]
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ReasoningEffort;
-use codex_sandboxing::policy_transforms::merge_permission_profiles;
-use std::collections::HashMap;
+use std::collections::BTreeSet;
 use std::collections::HashSet;
 use std::collections::VecDeque;
+use std::sync::Arc;
 
 use super::AdditionalContextStore;
 use super::auto_compact_window::AutoCompactWindow;
 use super::auto_compact_window::AutoCompactWindowIds;
 use super::auto_compact_window::AutoCompactWindowSnapshot;
+use super::auto_compact_window::ContextWindowIdGenerator;
+use crate::TurnStartOptions;
+use crate::agent::host::ServiceTierAcceptance;
 use crate::context_manager::ContextManager;
 use crate::context_manager::HistoryReplacement;
 use crate::session::PreviousTurnSettings;
@@ -21,6 +24,7 @@ use crate::session::session::SessionConfiguration;
 use crate::session::startup_prewarm::SessionStartupPrewarmHandle;
 use crate::session::time_reminder::CurrentTimeReminderState;
 use codex_history::ResponseItemEnvelope;
+use codex_history::TurnAttribution;
 use codex_protocol::SessionId;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::RateLimitSnapshot;
@@ -31,8 +35,9 @@ use codex_protocol::protocol::TurnContextItem;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
 
-/// Runtime request effort, initially unset and established by prewarm or sampling.
+/// Runtime request effort, inherited from a parent or established by prewarm or sampling.
 /// Successful compaction allows a fresh baseline without an override.
+#[derive(Clone)]
 pub(crate) enum ReasoningEffortPin {
     Unset,
     Compacted,
@@ -68,16 +73,23 @@ impl ReasoningEffortPin {
 /// Persistent, session-scoped state previously stored directly on `Session`.
 pub(crate) struct SessionState {
     pub(crate) session_configuration: SessionConfiguration,
+    /// Shared root tier publication starts when the runtime wins registration.
+    pub(crate) shared_service_tier_pending: bool,
+    /// Receipt for the current host root tier, retained for callers retrying that commit.
+    pub(crate) service_tier_acceptance: Option<ServiceTierAcceptance>,
+    /// Catalog to carry across compaction, independent of an explicit resume override.
+    pub(crate) persisted_dynamic_tools: Arc<[DynamicToolSpec]>,
     /// Plugin selection of the last admitted task; settings updates take effect on the next task.
     pub(crate) active_disabled_plugin_ids: Vec<String>,
     /// Persisted origin of the session base instructions, when known.
     pub(crate) base_instructions_provenance: Option<BaseInstructionsProvenance>,
     pub(crate) history: ContextManager,
+    /// Newly recorded files awaiting best-effort lookup after the input batch is durable.
+    pub(crate) pending_audio_duration_ids: BTreeSet<String>,
     /// Cancels work bound to discarded history or a superseded Guardian evidence policy.
     pub(crate) history_reset: CancellationToken,
     pub(crate) latest_rate_limits: Option<RateLimitSnapshot>,
     pub(crate) latest_token_usage_record: Option<TokenUsageRecord>,
-    pub(crate) server_reasoning_included: bool,
     pub(crate) mcp_dependency_prompted: HashSet<String>,
     pub(crate) additional_context: AdditionalContextStore,
     /// Settings used by the latest regular user turn, used for turn-to-turn
@@ -87,8 +99,14 @@ pub(crate) struct SessionState {
     /// Latest task admitted in this runtime, retained across completion and history edits.
     /// Cleared by standalone settings changes to invalidate pending continuation.
     pub(crate) last_started_turn_id: Option<String>,
+    /// Latest regular turn, retained across completion, settings changes, and compaction.
+    pub(crate) turn_attribution: Option<TurnAttribution>,
+    /// Explicit namespaces from the recovered turn's own rollout record.
+    pub(crate) restored_turn_routing: Option<(String, Vec<String>)>,
     /// Runtime accounting state for the active auto-compaction window.
     auto_compact_window: AutoCompactWindow,
+    context_window_id_generator: ContextWindowIdGenerator,
+    pub(crate) async_compaction: crate::session::async_compaction::AsyncCompactionState,
     /// Original request effort for the current model while configuration updates remain active.
     pub(crate) reasoning_effort_pin: ReasoningEffortPin,
     /// Set under the state lock before shutdown takes the last warmup handle.
@@ -100,40 +118,51 @@ pub(crate) struct SessionState {
     pub(crate) current_time_reminder: CurrentTimeReminderState,
     pub(crate) active_connector_selection: HashSet<String>,
     pub(crate) pending_session_start_sources: VecDeque<codex_hooks::SessionStartSource>,
-    granted_permissions_by_environment_id: HashMap<String, AdditionalPermissionProfile>,
     next_turn_is_first: bool,
+    initial_settings_pending: bool,
 }
 
 impl SessionState {
     /// Create a new session state mirroring previous `State::default()` semantics.
     #[cfg(test)]
     pub(crate) fn new(session_configuration: SessionConfiguration) -> Self {
+        let context_window_id_generator: ContextWindowIdGenerator =
+            Arc::new(codex_protocol::ContextWindowId::new_uuid_v7);
         Self::new_with_auto_compact_window_ids(
             session_configuration,
-            AutoCompactWindowIds::new_initial(),
-            ContextManager::new(),
+            AutoCompactWindowIds::new_initial(context_window_id_generator()),
+            context_window_id_generator,
+            ContextManager::default(),
         )
     }
 
     pub(crate) fn new_with_auto_compact_window_ids(
         session_configuration: SessionConfiguration,
         auto_compact_window_ids: AutoCompactWindowIds,
+        context_window_id_generator: ContextWindowIdGenerator,
         history: ContextManager,
     ) -> Self {
         Self {
             active_disabled_plugin_ids: Vec::new(),
+            persisted_dynamic_tools: Arc::clone(&session_configuration.dynamic_tools),
             session_configuration,
+            shared_service_tier_pending: false,
+            service_tier_acceptance: None,
             base_instructions_provenance: None,
             history,
+            pending_audio_duration_ids: BTreeSet::new(),
             history_reset: CancellationToken::new(),
             latest_rate_limits: None,
             latest_token_usage_record: None,
-            server_reasoning_included: false,
             mcp_dependency_prompted: HashSet::new(),
             additional_context: AdditionalContextStore::default(),
             previous_turn_settings: None,
             last_started_turn_id: None,
+            turn_attribution: None,
+            restored_turn_routing: None,
             auto_compact_window: AutoCompactWindow::new_with_ids(auto_compact_window_ids),
+            context_window_id_generator,
+            async_compaction: crate::session::async_compaction::AsyncCompactionState::default(),
             reasoning_effort_pin: ReasoningEffortPin::Unset,
             shutting_down: false,
             startup_prewarm: None,
@@ -141,8 +170,8 @@ impl SessionState {
             current_time_reminder: CurrentTimeReminderState::default(),
             active_connector_selection: HashSet::new(),
             pending_session_start_sources: VecDeque::new(),
-            granted_permissions_by_environment_id: HashMap::new(),
             next_turn_is_first: true,
+            initial_settings_pending: true,
         }
     }
 
@@ -158,12 +187,19 @@ impl SessionState {
 
     pub(crate) fn set_next_turn_is_first(&mut self, value: bool) {
         self.next_turn_is_first = value;
+        self.initial_settings_pending = value;
     }
 
     pub(crate) fn take_next_turn_is_first(&mut self) -> bool {
         let is_first_turn = self.next_turn_is_first;
         self.next_turn_is_first = false;
         is_first_turn
+    }
+
+    pub(crate) fn take_initial_settings_pending(&mut self) -> bool {
+        let pending = self.initial_settings_pending;
+        self.initial_settings_pending = false;
+        pending
     }
 
     pub(crate) fn clone_history(&self) -> ContextManager {
@@ -196,6 +232,8 @@ impl SessionState {
                 .history
                 .replace_compacted(items, reviewer_compaction_hash.as_deref()),
             HistoryReplacement::Reset => {
+                self.turn_attribution = None;
+                self.restored_turn_routing = None;
                 self.history.replace_annotated(items);
                 true
             }
@@ -258,13 +296,42 @@ impl SessionState {
         self.history.reference_context_item()
     }
 
+    pub(crate) fn recovered_turn_start_options(&self, turn_id: &str) -> TurnStartOptions {
+        let mut options = self
+            .turn_attribution
+            .as_ref()
+            .filter(|attribution| attribution.turn_id == turn_id)
+            .map(TurnAttribution::start_options)
+            .unwrap_or_default();
+        if let Some(context) = self
+            .reference_context_item()
+            .filter(|context| context.turn_id.as_deref() == Some(turn_id))
+        {
+            // Older rollouts only persisted the root on the model-context record.
+            options.root_turn_id = options.root_turn_id.or(context.root_turn_id);
+            options.direct_only_tool_namespaces = context.direct_only_tool_namespaces;
+        } else if let Some((id, namespaces)) = &self.restored_turn_routing
+            && id == turn_id
+        {
+            options.direct_only_tool_namespaces = Some(namespaces.clone());
+        }
+        options
+    }
+
     // Token/rate limit helpers
     pub(crate) fn update_token_info_from_usage(
         &mut self,
         usage: &TokenUsage,
         model_context_window: Option<i64>,
+        includes_reasoning: bool,
+        input_item_count: usize,
     ) {
-        self.history.update_token_info(usage, model_context_window);
+        self.history.update_token_info(
+            usage,
+            model_context_window,
+            includes_reasoning,
+            input_item_count,
+        );
     }
 
     pub(crate) fn ensure_auto_compact_window_server_prefill_from_usage(
@@ -295,7 +362,7 @@ impl SessionState {
         self.auto_compact_window.window_number()
     }
 
-    pub(crate) fn auto_compact_window_ids(&self) -> AutoCompactWindowIds {
+    pub(crate) fn auto_compact_window_ids(&self) -> &AutoCompactWindowIds {
         self.auto_compact_window.ids()
     }
 
@@ -308,7 +375,8 @@ impl SessionState {
     }
 
     pub(crate) fn advance_auto_compact_window(&mut self) -> (u64, AutoCompactWindowIds) {
-        self.auto_compact_window.advance()
+        self.auto_compact_window
+            .advance((self.context_window_id_generator)())
     }
 
     pub(crate) fn request_new_context_window(&mut self) {
@@ -320,7 +388,7 @@ impl SessionState {
     }
 
     pub(crate) fn start_new_context_window(&mut self) -> (u64, AutoCompactWindowIds) {
-        let window = self.auto_compact_window.advance();
+        let window = self.advance_auto_compact_window();
         self.auto_compact_window.clear_prefill();
         window
     }
@@ -346,17 +414,8 @@ impl SessionState {
         self.history.set_token_usage_full(context_window);
     }
 
-    pub(crate) fn get_total_token_usage(&self, server_reasoning_included: bool) -> i64 {
-        self.history
-            .get_total_token_usage(server_reasoning_included)
-    }
-
-    pub(crate) fn set_server_reasoning_included(&mut self, included: bool) {
-        self.server_reasoning_included = included;
-    }
-
-    pub(crate) fn server_reasoning_included(&self) -> bool {
-        self.server_reasoning_included
+    pub(crate) fn get_total_token_usage(&self) -> i64 {
+        self.history.get_total_token_usage()
     }
 
     pub(crate) fn record_mcp_dependency_prompted<I>(&mut self, names: I)
@@ -411,31 +470,6 @@ impl SessionState {
         &mut self,
     ) -> Option<codex_hooks::SessionStartSource> {
         self.pending_session_start_sources.pop_front()
-    }
-
-    pub(crate) fn record_granted_permissions(
-        &mut self,
-        environment_id: &str,
-        permissions: AdditionalPermissionProfile,
-    ) {
-        let granted_permissions = merge_permission_profiles(
-            self.granted_permissions_by_environment_id
-                .get(environment_id),
-            Some(&permissions),
-        );
-        if let Some(granted_permissions) = granted_permissions {
-            self.granted_permissions_by_environment_id
-                .insert(environment_id.to_string(), granted_permissions);
-        }
-    }
-
-    pub(crate) fn granted_permissions(
-        &self,
-        environment_id: &str,
-    ) -> Option<AdditionalPermissionProfile> {
-        self.granted_permissions_by_environment_id
-            .get(environment_id)
-            .cloned()
     }
 }
 

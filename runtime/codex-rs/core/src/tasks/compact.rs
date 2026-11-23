@@ -9,9 +9,8 @@ use crate::session::turn_context::TurnContext;
 use crate::state::TaskKind;
 use codex_features::Feature;
 use codex_model_provider::RemoteCompactionSupport;
-use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::protocol::CodexErrorInfo;
-use codex_protocol::user_input::UserInput;
+use codex_user_input::ResolvedUserInput;
 use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Copy, Default)]
@@ -31,11 +30,35 @@ impl SessionTask for CompactTask {
         session: Arc<Session>,
         ctx: Arc<TurnContext>,
         _input: Vec<TurnInput>,
-        _cancellation_token: CancellationToken,
+        cancellation_token: CancellationToken,
     ) -> SessionTaskResult {
         let _profile_guard = ctx.turn_timing_state.begin_compaction();
+        let _compaction_span = tracing::trace_span!(
+            "codex.compaction",
+            codex.turn.phase = "compaction",
+            conversation.id = %session.thread_id,
+            turn.id = %ctx.sub_id,
+        );
+        // Preparation errors must reach the task runner, which reports them to the client.
+        session.emit_turn_started(&ctx, TaskKind::Compact).await;
+        session.check_rollout_budget()?;
+        let step_context = session
+            .capture_step_context(Arc::clone(&ctx), &cancellation_token)
+            .await?;
+        let world_state = Arc::new(
+            session
+                .build_world_state_for_step(&step_context, /*new_window*/ true)
+                .await?,
+        );
         if ctx.config.features.enabled(Feature::TokenBudget) {
-            crate::compact_token_budget::run_manual_compact_task(session, ctx).await?;
+            // Preparing the context may wait; this reset never sends a model request.
+            session.check_rollout_budget()?;
+            crate::compact_token_budget::run_manual_compact_task(
+                session,
+                step_context,
+                world_state,
+            )
+            .await?;
             return Ok(None);
         }
 
@@ -46,8 +69,12 @@ impl SessionTask for CompactTask {
                     "remote_v2",
                     /*manual*/ true,
                 );
-                crate::compact_remote_v2::run_remote_compact_task(session.clone(), Arc::clone(&ctx))
-                    .await
+                crate::compact_remote_v2::run_remote_compact_task(
+                    session.clone(),
+                    step_context,
+                    world_state,
+                )
+                .await
             }
             RemoteCompactionSupport::Unsupported => {
                 emit_compact_metric(
@@ -55,21 +82,19 @@ impl SessionTask for CompactTask {
                     "local",
                     /*manual*/ true,
                 );
-                let input = vec![UserInput::Text {
-                    text: ctx
-                        .config
+                let input = vec![ResolvedUserInput::text(
+                    ctx.config
                         .compact_prompt
                         .as_deref()
                         .unwrap_or(crate::compact::SUMMARIZATION_PROMPT)
                         .to_string(),
-                    // Compaction prompt is synthesized; no UI element ranges to preserve.
-                    text_elements: Vec::new(),
-                }];
-                crate::compact::run_compact_task(session.clone(), Arc::clone(&ctx), input).await
+                )];
+                crate::compact::run_compact_task(session.clone(), step_context, world_state, input)
+                    .await
             }
         };
         if let Err(err) = result {
-            if matches!(err.details(), CodexErrorDetails::TurnAborted) {
+            if super::ends_turn_as_interrupted(&err) {
                 return Err(err);
             }
             let error = err.to_codex_protocol_error();

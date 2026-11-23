@@ -4,8 +4,10 @@ use anyhow::Context;
 use anyhow::Result;
 use anyhow::bail;
 use codex_protocol::models::AgentMessageInputContent;
-use codex_protocol::models::ResponseItem;
+use serde::Deserialize;
 use serde_json::Value;
+use sha2::Digest;
+use sha2::Sha256;
 
 use crate::model::AgentMessageMetadata;
 use crate::model::ConversationBody;
@@ -23,6 +25,7 @@ use crate::payload::RawPayloadRef;
 /// single reducer decision instead of something the parser has to know about.
 #[derive(Clone)]
 pub(super) struct NormalizedConversationItem {
+    pub(super) responses_item_id: Option<String>,
     pub(super) role: ConversationRole,
     pub(super) channel: Option<ConversationChannel>,
     pub(super) kind: ConversationItemKind,
@@ -31,13 +34,29 @@ pub(super) struct NormalizedConversationItem {
     pub(super) call_id: Option<String>,
 }
 
+impl NormalizedConversationItem {
+    pub(super) fn is_delivery_or_tool_output(&self) -> bool {
+        self.agent_message.is_some()
+            || matches!(
+                self.kind,
+                ConversationItemKind::FunctionCallOutput
+                    | ConversationItemKind::CustomToolCallOutput
+            )
+    }
+}
+
 pub(super) fn normalize_model_items(
     items: &[Value],
     raw_payload: &RawPayloadRef,
 ) -> Result<Vec<NormalizedConversationItem>> {
     let mut normalized_items = Vec::new();
     for item in items {
-        if item.get("type").and_then(Value::as_str) == Some("additional_tools") {
+        // Tools and reasoning settings configure inference. Their raw payload retains the control.
+        if matches!(
+            item.get("type").and_then(Value::as_str),
+            Some("additional_tools" | "configuration_update")
+        ) || unavailable_ref(item, raw_payload).is_some()
+        {
             continue;
         }
 
@@ -60,7 +79,7 @@ pub(super) fn token_usage_from_value(value: &Value) -> Option<TokenUsage> {
     })
 }
 
-fn normalize_model_item(
+pub(super) fn normalize_model_item(
     item: &Value,
     raw_payload: &RawPayloadRef,
 ) -> Result<NormalizedConversationItem> {
@@ -70,11 +89,12 @@ fn normalize_model_item(
             raw_payload.raw_payload_id
         );
     };
-    match item_type {
+    let mut normalized = match item_type {
         "message" => normalize_message_item(item, raw_payload),
         "agent_message" => normalize_agent_message_item(item, raw_payload),
         "reasoning" => normalize_reasoning_item(item, raw_payload),
         "function_call" => Ok(NormalizedConversationItem {
+            responses_item_id: None,
             role: ConversationRole::Assistant,
             channel: Some(ConversationChannel::Commentary),
             kind: ConversationItemKind::FunctionCall,
@@ -86,17 +106,19 @@ fn normalize_model_item(
                 .map(ToString::to_string),
         }),
         "function_call_output" => Ok(NormalizedConversationItem {
+            responses_item_id: None,
             role: ConversationRole::Tool,
             channel: Some(ConversationChannel::Commentary),
             kind: ConversationItemKind::FunctionCallOutput,
             agent_message: None,
-            body: tool_output_body(item.get("output"), raw_payload),
+            body: tool_output_body(item.get("output"), raw_payload)?,
             call_id: item
                 .get("call_id")
                 .and_then(Value::as_str)
                 .map(ToString::to_string),
         }),
         "custom_tool_call" => Ok(NormalizedConversationItem {
+            responses_item_id: None,
             role: ConversationRole::Assistant,
             channel: Some(ConversationChannel::Commentary),
             kind: ConversationItemKind::CustomToolCall,
@@ -108,11 +130,12 @@ fn normalize_model_item(
                 .map(ToString::to_string),
         }),
         "custom_tool_call_output" => Ok(NormalizedConversationItem {
+            responses_item_id: None,
             role: ConversationRole::Tool,
             channel: Some(ConversationChannel::Commentary),
             kind: ConversationItemKind::CustomToolCallOutput,
             agent_message: None,
-            body: tool_output_body(item.get("output"), raw_payload),
+            body: tool_output_body(item.get("output"), raw_payload)?,
             call_id: item
                 .get("call_id")
                 .and_then(Value::as_str)
@@ -120,6 +143,7 @@ fn normalize_model_item(
         }),
         "tool_search_call" | "web_search_call" | "image_generation_call" | "local_shell_call" => {
             Ok(NormalizedConversationItem {
+                responses_item_id: None,
                 role: ConversationRole::Assistant,
                 channel: Some(ConversationChannel::Commentary),
                 kind: ConversationItemKind::FunctionCall,
@@ -132,6 +156,7 @@ fn normalize_model_item(
             })
         }
         "tool_search_output" | "mcp_tool_call_output" => Ok(NormalizedConversationItem {
+            responses_item_id: None,
             role: ConversationRole::Tool,
             channel: Some(ConversationChannel::Commentary),
             kind: ConversationItemKind::FunctionCallOutput,
@@ -144,6 +169,7 @@ fn normalize_model_item(
         }),
         "compaction" | "compaction_summary" | "context_compaction" => {
             Ok(NormalizedConversationItem {
+                responses_item_id: None,
                 role: ConversationRole::Assistant,
                 channel: Some(ConversationChannel::Summary),
                 kind: ConversationItemKind::Message,
@@ -156,7 +182,9 @@ fn normalize_model_item(
             "unsupported model item type {item_type} in payload {}",
             raw_payload.raw_payload_id
         ),
-    }
+    }?;
+    normalized.responses_item_id = item.get("id").and_then(Value::as_str).map(str::to_string);
+    Ok(normalized)
 }
 
 fn normalize_message_item(
@@ -176,6 +204,7 @@ fn normalize_message_item(
         );
     };
     Ok(NormalizedConversationItem {
+        responses_item_id: None,
         role,
         channel: item
             .get("phase")
@@ -184,7 +213,7 @@ fn normalize_message_item(
         kind: ConversationItemKind::Message,
         agent_message: None,
         body: ConversationBody {
-            parts: content_parts(item.get("content"), raw_payload),
+            parts: content_parts(item.get("content"), raw_payload)?,
         },
         call_id: None,
     })
@@ -195,22 +224,19 @@ fn normalize_agent_message_item(
     raw_payload: &RawPayloadRef,
 ) -> Result<NormalizedConversationItem> {
     let raw_payload_id = &raw_payload.raw_payload_id;
-    let response_item =
-        serde_json::from_value::<ResponseItem>(item.clone()).with_context(|| {
-            format!("failed to parse agent_message item in payload {raw_payload_id}")
-        })?;
-    let ResponseItem::AgentMessage {
-        author,
-        recipient,
-        content,
-        ..
-    } = response_item
-    else {
-        bail!("item in payload {raw_payload_id} was not an agent_message");
-    };
-    let parts = content
-        .into_iter()
-        .map(|content| match content {
+    let routing = AgentMessageMetadata::deserialize(item).with_context(|| {
+        format!("failed to parse agent_message routing in payload {raw_payload_id}")
+    })?;
+    let mut parts = Vec::new();
+    for part in item["content"]
+        .as_array()
+        .context("expected agent_message content array")?
+    {
+        if let Some(missing) = unavailable_ref(&part["text"], raw_payload) {
+            parts.push(payload_ref_part("text", missing));
+            continue;
+        }
+        parts.push(match AgentMessageInputContent::deserialize(part)? {
             AgentMessageInputContent::InputText { text } => ConversationPart::Text { text },
             AgentMessageInputContent::EncryptedContent { encrypted_content } => {
                 ConversationPart::Encoded {
@@ -218,17 +244,18 @@ fn normalize_agent_message_item(
                     value: encrypted_content,
                 }
             }
-        })
-        .collect::<Vec<_>>();
+        });
+    }
     if parts.is_empty() {
         bail!("agent_message item in payload {raw_payload_id} contained no content");
     }
 
     Ok(NormalizedConversationItem {
+        responses_item_id: None,
         role: ConversationRole::Assistant,
         channel: Some(ConversationChannel::Analysis),
         kind: ConversationItemKind::Message,
-        agent_message: Some(AgentMessageMetadata { author, recipient }),
+        agent_message: Some(routing),
         body: ConversationBody { parts },
         call_id: None,
     })
@@ -281,6 +308,7 @@ fn normalize_reasoning_item(
     }
 
     Ok(NormalizedConversationItem {
+        responses_item_id: None,
         role: ConversationRole::Assistant,
         channel: Some(ConversationChannel::Analysis),
         kind: ConversationItemKind::Reasoning,
@@ -344,6 +372,10 @@ fn append_reasoning_parts(
             }
         };
 
+        if let Some(missing) = unavailable_ref(&content_item["text"], raw_payload) {
+            parts.push(payload_ref_part(expected_type, missing));
+            continue;
+        }
         let Some(text) = content_item.get("text").and_then(Value::as_str) else {
             bail!(
                 "reasoning item in payload {} had {expected_type} entry without string text",
@@ -377,15 +409,28 @@ fn role_from_str(role: &str) -> Option<ConversationRole> {
 fn channel_from_phase(phase: &str) -> Option<ConversationChannel> {
     match phase {
         "commentary" => Some(ConversationChannel::Commentary),
-        "final_answer" => Some(ConversationChannel::Final),
+        // Both answer phases are Harmony final-channel text; only the latter
+        // declares a terminal answer.
+        "partial_answer" | "final_answer" => Some(ConversationChannel::Final),
         "summary" => Some(ConversationChannel::Summary),
         _ => None,
     }
 }
 
-fn content_parts(content: Option<&Value>, raw_payload: &RawPayloadRef) -> Vec<ConversationPart> {
+/// Only interpret recorder-produced gaps backed by a partial reference in this payload.
+fn unavailable_ref<'a>(value: &Value, root: &'a RawPayloadRef) -> Option<&'a RawPayloadRef> {
+    let marker = value.as_object().filter(|obj| obj.len() == 1)?;
+    let id = marker.get("$trace_unavailable")?.as_str()?;
+    root.references()
+        .find(|r| r.raw_payload_id == id && !r.capture.is_complete())
+}
+
+fn content_parts(
+    content: Option<&Value>,
+    raw_payload: &RawPayloadRef,
+) -> Result<Vec<ConversationPart>> {
     let Some(content) = content.and_then(Value::as_array) else {
-        return vec![payload_ref_part("content", raw_payload)];
+        return Ok(vec![payload_ref_part("content", raw_payload)]);
     };
 
     let mut parts = Vec::new();
@@ -396,18 +441,30 @@ fn content_parts(content: Option<&Value>, raw_payload: &RawPayloadRef) -> Vec<Co
                     parts.push(ConversationPart::Text {
                         text: text.to_string(),
                     });
+                } else if let Some(missing) = unavailable_ref(&part["text"], raw_payload) {
+                    parts.push(payload_ref_part("text", missing));
                 }
             }
-            Some("input_image") => parts.push(payload_ref_part("input_image", raw_payload)),
-            Some(other) => parts.push(payload_ref_part(other, raw_payload)),
-            None => parts.push(payload_ref_part("content", raw_payload)),
+            other => {
+                // Repeated images live in different request payloads. Compare their
+                // content without copying large image bodies into the reduced graph.
+                let mut canonical = part.clone();
+                canonical.sort_all_objects();
+                let mut digest = Sha256::new();
+                serde_json::to_writer(&mut digest, &canonical)?;
+                parts.push(ConversationPart::PayloadRef {
+                    label: other.unwrap_or("content").to_string(),
+                    raw_payload_id: unavailable_ref(&part["image_url"], raw_payload)
+                        .unwrap_or(raw_payload)
+                        .raw_payload_id
+                        .clone(),
+                    content_sha256: Some(format!("{:x}", digest.finalize())),
+                });
+            }
         }
     }
 
-    if parts.is_empty() {
-        parts.push(payload_ref_part("empty_content", raw_payload));
-    }
-    parts
+    Ok(parts)
 }
 
 fn custom_tool_call_body(item: &Value, raw_payload: &RawPayloadRef) -> ConversationBody {
@@ -448,19 +505,22 @@ fn raw_text_or_json_body(value: Option<&Value>, raw_payload: &RawPayloadRef) -> 
     }
 }
 
-fn tool_output_body(output: Option<&Value>, raw_payload: &RawPayloadRef) -> ConversationBody {
-    match output {
+fn tool_output_body(
+    output: Option<&Value>,
+    raw_payload: &RawPayloadRef,
+) -> Result<ConversationBody> {
+    Ok(match output {
         Some(Value::String(text)) => ConversationBody {
             parts: vec![ConversationPart::Text { text: text.clone() }],
         },
         Some(Value::Array(_)) => ConversationBody {
-            parts: content_parts(output, raw_payload),
+            parts: content_parts(output, raw_payload)?,
         },
         Some(value) => json_body(value, raw_payload),
         None => ConversationBody {
             parts: vec![payload_ref_part("tool_output", raw_payload)],
         },
-    }
+    })
 }
 
 fn compaction_body(item: &Value, raw_payload: &RawPayloadRef) -> Result<ConversationBody> {
@@ -494,6 +554,7 @@ fn payload_ref_part(label: &str, raw_payload: &RawPayloadRef) -> ConversationPar
     ConversationPart::PayloadRef {
         label: label.to_string(),
         raw_payload_id: raw_payload.raw_payload_id.clone(),
+        content_sha256: None,
     }
 }
 
@@ -502,7 +563,7 @@ fn summarize_json(value: &Value) -> String {
     let mut summary =
         serde_json::to_string(value).unwrap_or_else(|_| "<unserializable json>".to_string());
     if summary.len() > MAX_JSON_SUMMARY_LEN {
-        summary.truncate(MAX_JSON_SUMMARY_LEN);
+        summary.truncate(summary.floor_char_boundary(MAX_JSON_SUMMARY_LEN));
         summary.push_str("...");
     }
     summary

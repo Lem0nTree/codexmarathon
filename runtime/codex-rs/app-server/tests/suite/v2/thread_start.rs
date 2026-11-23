@@ -115,7 +115,7 @@ model = "gpt-5.4-mini"
         })
         .await?;
 
-    assert_eq!(response.model, "openai.gpt-6.1-sol");
+    assert_eq!(response.model, "openai.gpt-6.2-sol");
     Ok(())
 }
 
@@ -246,6 +246,9 @@ async fn thread_start_provider_model_fallback_uses_bedrock_static_catalog() -> R
     .await?;
     for model in [
         "openai.gpt-6.1-sol",
+        "openai.gpt-6.2-astra",
+        "openai.gpt-6.2-sol",
+        "openai.gpt-6.1-terra",
         "openai.gpt-6-sol",
         "openai.gpt-6-luna",
         "openai.gpt-5.6-sol",
@@ -274,7 +277,7 @@ async fn thread_start_provider_model_fallback_uses_bedrock_static_catalog() -> R
             supported_with_fallback.model,
             unsupported_without_fallback.model,
         ],
-        vec!["openai.gpt-6.1-sol", "openai.gpt-5.5", "gpt-5.4-mini"]
+        vec!["openai.gpt-6.2-sol", "openai.gpt-5.5", "gpt-5.4-mini"]
     );
     Ok(())
 }
@@ -295,6 +298,12 @@ async fn thread_start_bedrock_runtime_prefers_global_cross_region_models() -> Re
     for model in [
         "global.openai.gpt-6.1-sol",
         "us.openai.gpt-6.1-sol",
+        "global.openai.gpt-6.2-astra",
+        "us.openai.gpt-6.2-astra",
+        "global.openai.gpt-6.2-sol",
+        "us.openai.gpt-6.2-sol",
+        "global.openai.gpt-6.1-terra",
+        "us.openai.gpt-6.1-terra",
         "global.openai.gpt-6-sol",
         "us.openai.gpt-6-sol",
         "global.openai.gpt-6-luna",
@@ -314,7 +323,7 @@ async fn thread_start_bedrock_runtime_prefers_global_cross_region_models() -> Re
         /*allow_provider_model_fallback*/ true,
     )
     .await?;
-    assert_eq!(response.model, "global.openai.gpt-6.1-sol");
+    assert_eq!(response.model, "global.openai.gpt-6.2-sol");
 
     Ok(())
 }
@@ -1342,6 +1351,7 @@ async fn thread_start_emits_mcp_server_status_updated_notifications() -> Result<
         McpServerStatusUpdatedNotification {
             thread_id: Some(start_response.thread.id.clone()),
             name: "optional_broken".to_string(),
+            environment_id: None,
             status: McpServerStartupState::Starting,
             error: None,
             failure_reason: None,
@@ -1654,6 +1664,7 @@ required = true
         .request(|request_id| ClientRequest::McpServerStatusList {
             request_id,
             params: ListMcpServerStatusParams {
+                environment_id: None,
                 server_name: None,
                 cursor: None,
                 limit: None,

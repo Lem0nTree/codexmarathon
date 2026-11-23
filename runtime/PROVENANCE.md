@@ -7,10 +7,10 @@ pinned snapshot of the public
 `openai/codex` repository:
 
 - Repository: <https://github.com/openai/codex>
-- Source tag: `rust-v0.160.0`
-- Source commit: `a956835d020762cb2b570053af06f643a11c0ecc`
+- Source tag: `rust-v0.171.0`
+- Source commit: `ccf9be8cc458bd6b8336fe84d68d8893f2691a5e`
 - Imported tree: `runtime/codex-rs/`
-- Import date: 2026-10-02
+- Import date: 2026-11-23
 - Refresh rule: update the pinned commit, copy the complete `codex-rs/`
   workspace, rerun the focused runtime build/tests, and record the new commit
   and any local patch in this file and `PATCH_LEDGER.md`.

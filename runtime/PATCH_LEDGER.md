@@ -1,7 +1,7 @@
 # Runtime patch ledger
 
-The embedded upstream workspace was refreshed from `rust-v0.154.0` to
-`rust-v0.160.0` on 2026-10-02. The native Marathon CLI, TUI, app-server,
+The embedded upstream workspace was refreshed from `rust-v0.160.0` to
+`rust-v0.171.0` on 2026-11-23. The native Marathon CLI, TUI, app-server,
 account and transfer hooks were merged with the corresponding upstream changes.
 
 This ledger records the local runtime integration over the pinned Codext
@@ -11,7 +11,7 @@ the product builds from the tracked copy under `runtime/codex-rs`.
 | ID | Implemented in this patch | Deliberately delegated to Codext |
 | --- | --- | --- |
 | M01 | `JsonLineCodec`, JSON-RPC request/response/notification types, first-request version negotiation, and `runtime_ready` | Existing app-server transport and connection lifecycle |
-| M02 | Monotonic in-memory Marathon auth generation incremented only after a native changed reload | AuthManager token refresh, auth storage format, and persistence across runtime restart |
+| M02 | Monotonic in-memory Marathon auth generation synchronized with native owner, source, and login revisions | AuthManager token refresh, auth storage format, and persistence across runtime restart |
 | M03 | Pending transition ID/target/generation checks, typed rejected results, and one safe-boundary event at authoritative count zero | Existing `auth_transition_lock` and running-turn guard |
 | M04 | Runtime identity/status result types and full/sparse rate-limit event forwarding with connection account identity | Existing account rate-limit provider/read implementation and controller-side sparse attribution |
 | M05 | Auth reload/success/failure, post-invalidation identity change, turn, and deduplicated recovery event translation | Existing AuthManager reload, model-transport invalidation/config refresh, recovery queue, and conversation/session manager |
@@ -19,6 +19,7 @@ the product builds from the tracked copy under `runtime/codex-rs`.
 | M07 | Native `CodexNativeRuntime`: shared AuthManager/turn-watch/auth-transition-lock composition, isolated native login/refresh handlers, active opaque snapshot read for Account A synchronization, atomic reload-plus-transport invalidation, and exact target-identity validation | Account rate-limit reads still come from the native app-server account processor; the listener/launcher remains Agent 6 work |
 | M08 | `codexmarathon-accountd` and its typed client: owner-only local metadata/quota API, durable event cursors, automatic user-systemd installation, and shared persisted Codex-home resolution | Native AuthManager remains the credential authority; accountd never reads or transports credential snapshots |
 | M09 | `codexmarathon-transfer`: password-encrypted selected-account export, bounded authenticated archive validation, fresh identity-bound vault references, cross-process locking, and atomic batch import | Native app-server checkpointing supplies the current saved identity without exposing credentials on an RPC or daemon API |
+| M11 | Shared turn admission, owner-fenced auth transitions, routing/config and cache reconciliation, and recovery-ID-bound notifications across native and Marathon account switches | Native AuthManager, account routing and session admission remain authoritative |
 | M10 | Opt-in banked-reset expiry scheduling, durable credit claims and retries, typed daemon/app-server controls, and a separate native reset executor service | Native backend reset-credit inventory/redemption APIs and AuthManager remain the provider and credential authorities |
 
 ## Integration limitations

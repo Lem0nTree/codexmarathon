@@ -47,7 +47,7 @@ async fn config_requirements_read_preserves_unrestricted_default(config: &str) -
     let (_home, mut server) = start_server(config, /*requirements*/ None).await?;
     assert_eq!(
         read_requirements(&mut server).await?,
-        json!({"requirements": null})
+        json!({"requirements": null, "supportsIndependentSpeedModes": true})
     );
     Ok(())
 }
@@ -159,6 +159,7 @@ command = "print-token"
     );
     let id = server
         .send_get_account_request(GetAccountParams {
+            reload_auth_from_storage: false,
             refresh_token: false,
         })
         .await?;
@@ -166,6 +167,7 @@ command = "print-token"
     assert_eq!(
         account,
         GetAccountResponse {
+            user_id: None,
             account: Some(Account::AmazonBedrock {
                 uses_codex_managed_credentials: false
             }),

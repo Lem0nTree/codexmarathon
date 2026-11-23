@@ -41,6 +41,7 @@ struct LifecycleEventState {
     /// Replayed app-server notifications are harmless. Keep one key per
     /// lifecycle stage so a reconnect cannot enqueue a second observation.
     seen: HashSet<(String, String)>,
+    parked: HashMap<String, (String, u64)>,
 }
 
 struct PendingRelease {
@@ -134,6 +135,15 @@ impl CodexMarathonRecoveryBridge {
         if !lifecycle.seen.insert((event_type, recovery_id)) {
             return;
         }
+        match &event {
+            RecoveryLifecycleEvent::Parked(_) => {}
+            RecoveryLifecycleEvent::Started(started) => {
+                lifecycle.parked.remove(&started.recovery_id);
+            }
+            RecoveryLifecycleEvent::Completed(completed) => {
+                lifecycle.parked.remove(&completed.recovery_id);
+            }
+        }
         // Lifecycle events are finite and only metadata. Bound the queue so
         // a disconnected controller cannot grow app-server memory forever.
         const MAX_LIFECYCLE_EVENTS: usize = 1024;
@@ -149,6 +159,62 @@ impl CodexMarathonRecoveryBridge {
             .lock()
             .expect("CodexMarathon lifecycle mutex poisoned");
         lifecycle.events.drain(..).collect()
+    }
+
+    /// Record the server-observed failed turn before it can reach an idle boundary.
+    /// A late client lifecycle message alone cannot authorize recovery.
+    pub(crate) fn record_usage_limit(&self, thread_id: &str, turn_id: &str, owner_generation: u64) {
+        if let Ok(mut state) = self.lifecycle.lock() {
+            if state.parked.len() >= 1024 {
+                state.parked.clear();
+            }
+            state.parked.insert(
+                format!("usage-limit:{thread_id}:{turn_id}"),
+                (thread_id.to_string(), owner_generation),
+            );
+        }
+    }
+
+    pub(crate) fn parked_at_transition_start(
+        &self,
+        source_owner: u64,
+    ) -> Vec<(String, Option<String>)> {
+        self.lifecycle
+            .lock()
+            .map(|state| {
+                state
+                    .parked
+                    .iter()
+                    .filter_map(|(id, (thread, owner))| {
+                        (*owner == source_owner).then(|| (id.clone(), Some(thread.clone())))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub(crate) async fn notify_committed_recoveries(
+        &self,
+        parked: Vec<(String, Option<String>)>,
+        changes: &tokio::sync::watch::Receiver<codex_login::AuthChangeState>,
+        expected: codex_login::AuthChangeState,
+        auth_generation: u64,
+    ) {
+        for (recovery_id, thread_id) in parked {
+            self.outgoing
+                .send_account_notification(
+                    None,
+                    changes,
+                    expected.owner_generation,
+                    crate::outgoing_message::AccountNotification::RecoveryAuthChanged {
+                        payload: codex_app_server_protocol::CodexMarathonRecoveryAuthChangedNotification {
+                            recovery_id, thread_id, auth_generation,
+                        },
+                        expected,
+                    },
+                )
+                .await;
+        }
     }
 
     async fn release_async(
@@ -311,5 +377,159 @@ impl CodexMarathonRecoveryBridge {
             state: Arc::clone(&self.state),
             lifecycle: Arc::clone(&self.lifecycle),
         }
+    }
+}
+
+/// Coordinates legacy adapter reloads with all admitted app-server work.
+pub(crate) struct CodexMarathonTransitionBridge {
+    pub(crate) admission: crate::turn_admission::TurnAdmission,
+    pub(crate) transition_lock: Arc<Mutex<()>>,
+    pub(crate) auth: Arc<codex_login::AuthManager>,
+    pub(crate) threads: Arc<codex_core::ThreadManager>,
+    pub(crate) running: tokio::sync::watch::Receiver<usize>,
+    pub(crate) account: Arc<crate::request_processors::account_processor::AccountRequestProcessor>,
+}
+
+impl codexmarathon_runtime::NativeTransitionBridge for CodexMarathonTransitionBridge {
+    fn reload(
+        &self,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<
+                        codexmarathon_runtime_adapter::BackendReload,
+                        codexmarathon_runtime_adapter::BackendError,
+                    >,
+                > + Send,
+        >,
+    > {
+        let admission = self.admission.clone();
+        let lock = Arc::clone(&self.transition_lock);
+        let auth = Arc::clone(&self.auth);
+        let running = self.running.clone();
+        let account = Arc::clone(&self.account);
+        Box::pin(async move {
+            use codexmarathon_runtime_adapter::{BackendError, BackendIdentity, BackendReload};
+            let _pause = admission.pause().await.map_err(|_| {
+                BackendError::new(
+                    "admission_busy",
+                    "Work is starting; auth reload remains pending",
+                )
+            })?;
+            let _lock = lock.lock().await;
+            if *running.borrow() != 0 {
+                return Err(BackendError::new(
+                    "active_turns",
+                    "Codex has a running turn; auth reload remains pending",
+                ));
+            }
+            let changed = match auth.reload_with_status().await {
+                codex_login::AuthReloadStatus::Reloaded { changed } => changed,
+                codex_login::AuthReloadStatus::Failed => {
+                    return Err(BackendError::new(
+                        "auth_reload_failed",
+                        "Codex AuthManager could not reload auth storage",
+                    ));
+                }
+            };
+            let owner = *auth.auth_change_state_receiver().borrow();
+            if changed
+                && (account.marathon_validate_owner(owner).await.is_err()
+                    || account.marathon_owner_changed(owner).await.is_err())
+            {
+                // The external writer owns rollback. Reject new work until a restart
+                // if the newly loaded account cannot satisfy native routing policy.
+                admission.begin_drain();
+                return Err(BackendError::new(
+                    "account_validation_failed",
+                    "Account validation failed; restart the app server after restoring auth",
+                ));
+            }
+            drop(_lock);
+            drop(_pause);
+            let current = auth.auth_cached();
+            Ok(BackendReload {
+                identity: BackendIdentity {
+                    account_id: current.as_ref().and_then(|a| a.get_account_id()),
+                    auth_mode: current.as_ref().map(|a| a.api_auth_mode().to_string()),
+                },
+                changed,
+            })
+        })
+    }
+    fn invalidate(
+        &self,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<(), codexmarathon_runtime_adapter::BackendError>,
+                > + Send,
+        >,
+    > {
+        let admission = self.admission.clone();
+        let lock = Arc::clone(&self.transition_lock);
+        let running = self.running.clone();
+        let threads = Arc::clone(&self.threads);
+        Box::pin(async move {
+            use codexmarathon_runtime_adapter::BackendError;
+            let _pause = admission.pause().await.map_err(|_| {
+                BackendError::new(
+                    "admission_busy",
+                    "Work is starting; invalidation remains pending",
+                )
+            })?;
+            let _lock = lock.lock().await;
+            if *running.borrow() != 0 {
+                return Err(BackendError::new(
+                    "active_turns",
+                    "Codex has a running turn; invalidation remains pending",
+                ));
+            }
+            threads.invalidate_model_transport_caches().await;
+            Ok(())
+        })
+    }
+}
+
+#[cfg(test)]
+mod recovery_commit_tests {
+    use super::*;
+    use codex_analytics::AnalyticsEventsClient;
+
+    #[test]
+    fn server_error_is_captured_before_late_client_park_and_fenced_to_source_owner() {
+        let (sender, _receiver) = tokio::sync::mpsc::channel(8);
+        let outgoing = Arc::new(OutgoingMessageSender::new(
+            sender,
+            AnalyticsEventsClient::disabled(),
+        ));
+        let bridge = CodexMarathonRecoveryBridge::new(outgoing);
+        bridge.record_usage_limit("thread-a", "turn-a", 7);
+        let captured = bridge.parked_at_transition_start(7);
+        assert_eq!(
+            captured,
+            vec![(
+                "usage-limit:thread-a:turn-a".into(),
+                Some("thread-a".into())
+            )]
+        );
+        assert!(bridge.parked_at_transition_start(8).is_empty());
+        bridge.observe_lifecycle_event(CodexMarathonRecoveryLifecycleNotification {
+            event_type: "recovery_parked".into(),
+            recovery_id: "usage-limit:thread-a:turn-a".into(),
+            thread_id: Some("thread-a".into()),
+            turn_id: Some("turn-a".into()),
+            source_account_id: None,
+            reason: Some("usage_limit_exceeded".into()),
+            outcome: None,
+            error_code: None,
+        });
+        bridge.record_usage_limit("thread-b", "turn-b", 8);
+        assert_eq!(
+            captured.len(),
+            1,
+            "late or newer errors cannot alter the committed snapshot"
+        );
+        assert_eq!(bridge.parked_at_transition_start(8).len(), 1);
     }
 }

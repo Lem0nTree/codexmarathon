@@ -34,6 +34,9 @@ pub const OPENAI_STANDARD_FORM_INPUT_EXTENSION_ID: &str = "openai/standard-form-
 pub const MCP_APP_UI_EXTENSION_ID: &str = "io.modelcontextprotocol/ui";
 /// Host-supplied confirmation-policy documents for Node REPL-backed actor calls.
 pub const CONFIRMATION_POLICIES_META_KEY: &str = "openai/confirmation_policies";
+/// Extension ID for enterprise-managed MCP authorization via ID-JAG.
+pub const ENTERPRISE_MANAGED_AUTHORIZATION_EXTENSION_ID: &str =
+    "io.modelcontextprotocol/enterprise-managed-authorization";
 
 /// Returns whether a raw MCP server name identifies a Node REPL-backed server.
 pub fn is_node_repl_backed_server(server: &str) -> bool {
@@ -356,6 +359,21 @@ pub struct CallToolResult {
     #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub meta: Option<serde_json::Value>,
+}
+
+/// Returns display text from an unannotated MCP text block. Some tools encode
+/// sources and UI data as JSON or fenced text, which history must keep inline.
+pub fn plain_output_text(block: &serde_json::Value) -> Option<&str> {
+    let fields = block.as_object()?;
+    if fields.len() != 2 || fields.get("type")?.as_str()? != "text" {
+        return None;
+    }
+    let text = fields.get("text")?.as_str()?;
+    let trimmed = text.trim_start_matches(|ch: char| ch.is_whitespace() || ch == '\u{feff}');
+    if trimmed.starts_with(['{', '[']) || trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+        return None;
+    }
+    Some(text)
 }
 
 // === Adapter helpers ===

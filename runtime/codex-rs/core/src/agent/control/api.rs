@@ -26,6 +26,7 @@ use codex_protocol::ThreadId;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result;
 use codex_protocol::protocol::MultiAgentVersion;
+use codex_protocol::protocol::Op;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::TokenUsage;
 use codex_rollout_trace::ThreadTraceContext;
@@ -33,6 +34,10 @@ use futures::future::BoxFuture;
 use std::collections::HashSet;
 
 impl AgentControl for LocalAgentControl {
+    fn native_rollout_budget(&self) -> Option<std::sync::Arc<crate::RolloutBudget>> {
+        Some(std::sync::Arc::clone(&self.runtime.rollout_budget))
+    }
+
     fn identity(&self) -> SessionId {
         self.session_id()
     }
@@ -110,10 +115,12 @@ impl AgentControl for LocalAgentControl {
             let (metadata, submission_id) = match input {
                 AgentInput::UserInput(input) => {
                     let receiver = self.get_agent_metadata(target);
-                    if receiver.is_some() {
+                    let _residency_pin = if receiver.is_some() {
                         self.ensure_v2_agent_loaded(resume_config, target, /*parent*/ None)
-                            .await?;
-                    }
+                            .await?
+                    } else {
+                        None
+                    };
                     let submission_id = self.send_input(target, input, start_options).await?;
                     (receiver.unwrap_or_default(), submission_id)
                 }
@@ -136,8 +143,19 @@ impl AgentControl for LocalAgentControl {
                             "target agent is missing an agent_path".to_string(),
                         )
                     })?;
-                    self.ensure_v2_agent_loaded(resume_config, target, /*parent*/ None)
-                        .await?;
+                    // Cold-restored children still reload lazily on any message. Only
+                    // locally evicted recipients can retain mail without reloading.
+                    // Loaded recipients go straight to delivery, which rejects sends
+                    // racing an in-progress eviction when it acquires the residency pin.
+                    let _residency_pin = if mode == MessageDeliveryMode::TriggerTurn
+                        || (self.runtime.upgrade()?.get_thread(target).await.is_err()
+                            && self.runtime.registry.evicted_environments(target).is_none())
+                    {
+                        self.ensure_v2_agent_loaded(resume_config, target, /*parent*/ None)
+                            .await?
+                    } else {
+                        None
+                    };
                     let communication = message.into_communication(author, receiver_path, mode);
                     let kind = match mode {
                         MessageDeliveryMode::QueueOnly => {
@@ -165,12 +183,21 @@ impl AgentControl for LocalAgentControl {
         })
     }
 
+    fn take_mailbox(&self, agent: ThreadId) -> Vec<crate::PendingAgentMessage> {
+        self.runtime.mailboxes.take(agent, |_| true)
+    }
+
+    fn watch_mailbox(&self, agent: ThreadId) -> tokio::sync::watch::Receiver<bool> {
+        self.runtime.mailboxes.watch(agent)
+    }
+
     fn ensure_child_loaded(&self, parent: ThreadId, child: ThreadId) -> BoxFuture<'_, Result<()>> {
         Box::pin(async move {
             let parent = self.runtime.upgrade()?.get_thread(parent).await?;
             let config = parent.session.get_config().await.as_ref().clone();
             self.ensure_v2_agent_loaded(config, child, Some(parent))
                 .await
+                .map(drop)
         })
     }
 
@@ -185,7 +212,7 @@ impl AgentControl for LocalAgentControl {
             match version {
                 MultiAgentVersion::Disabled | MultiAgentVersion::V1 => {
                     let snapshot = self.inspect_agent(target).await?;
-                    self.interrupt_agent(target).await?;
+                    self.interrupt_agent(target, Op::Interrupt).await?;
                     Ok(snapshot)
                 }
                 MultiAgentVersion::V2 => self.interrupt_spawned_agent(caller, target).await,
@@ -260,8 +287,12 @@ impl AgentControl for LocalAgentControl {
         self.execution_guard(version, source)
     }
 
-    fn record_usage(&self, usage: TokenUsage) -> BoxFuture<'_, Result<()>> {
-        Box::pin(async move { self.record_rollout_budget_usage(&usage) })
+    fn record_usage(
+        &self,
+        usage: Option<TokenUsage>,
+        hook_charge: codex_hooks::HookCharge,
+    ) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async move { self.record_rollout_budget_usage(usage.as_ref(), hook_charge) })
     }
 
     fn turn_finished<'a>(

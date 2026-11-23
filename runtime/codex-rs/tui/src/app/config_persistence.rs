@@ -96,23 +96,45 @@ impl App {
     }
 
     pub(super) async fn rebuild_config_for_cwd(&self, cwd: PathBuf) -> Result<Config> {
+        self.rebuild_config_for_cwd_from(
+            &self.config,
+            &self.local_settings,
+            &self.app_server_target,
+            cwd,
+        )
+        .await
+    }
+
+    pub(super) fn rebuild_config_for_cwd_from(
+        &self,
+        base: &Config,
+        local: &crate::local_settings::LocalSettings,
+        target: &AppServerTarget,
+        cwd: PathBuf,
+    ) -> impl std::future::Future<Output = Result<Config>> + use<> {
         let mut overrides = self.harness_overrides.clone();
         overrides.cwd = Some(cwd.clone());
         let cwd_display = cwd.display().to_string();
+        // A remote app server's execution config can name a home on another machine.
+        let codex_home = if target.uses_remote_workspace() {
+            &local.codex_home
+        } else {
+            &base.codex_home
+        };
         let builder = ConfigBuilder::default()
-            .codex_home(self.config.codex_home.to_path_buf())
+            .codex_home(codex_home.to_path_buf())
             .cli_overrides(self.cli_kv_overrides.clone())
             .harness_overrides(overrides)
             .loader_overrides(self.loader_overrides.clone())
             .cloud_config_bundle(self.cloud_config_bundle.clone());
         build_config_on_runtime_worker(
             builder,
-            self.config.application_network_policy.clone(),
+            base.application_network_policy.clone(),
             format!("Failed to rebuild config for cwd {cwd_display}"),
         )
-        .await
     }
 
+    #[cfg(test)]
     pub(super) async fn rebuild_config_for_permission_profile(
         &self,
         profile_id: &str,
@@ -136,6 +158,8 @@ impl App {
         .await
     }
 
+    // Local setup for startup fixtures; connected selections always use the server below.
+    #[cfg(test)]
     pub(super) async fn apply_permission_profile_selection(
         &mut self,
         selection: PermissionProfileSelection,
@@ -252,7 +276,6 @@ impl App {
                 /*summary*/ None,
                 /*service_tier*/ None,
                 /*collaboration_mode*/ None,
-                /*personality*/ None,
             )));
         self.app_event_tx.send(AppEvent::InsertHistoryCell(Box::new(
             history_cell::new_info_event(
@@ -266,23 +289,11 @@ impl App {
     pub(super) async fn select_permission_profile(
         &mut self,
         app_server: &mut AppServerSession,
-        selection: PermissionProfileSelection,
+        mut selection: PermissionProfileSelection,
     ) {
         if self.reject_pending_permission_change() {
-            return;
-        }
-        if (self.chat_widget.thread_id().is_none() && selection.profile_id.starts_with(':'))
-            || (app_server.thread_params_mode()
-                == crate::app_server_session::ThreadParamsMode::Embedded
-                && self
-                    .config
-                    .custom_permission_profiles
-                    .iter()
-                    .any(|profile| profile.id == selection.profile_id))
-        {
-            if self.apply_permission_profile_selection(selection).await {
-                self.chat_widget.submit_initial_user_message_if_pending();
-            }
+            self.chat_widget
+                .retain_input_after_failed_permission_selection();
             return;
         }
         let Some(thread_id) = self.chat_widget.thread_id() else {
@@ -293,28 +304,22 @@ impl App {
             );
             return;
         };
-        if !selection.profile_id.starts_with(':')
-            && self.chat_widget.is_user_turn_pending_or_running()
-        {
-            self.chat_widget
-                .retain_input_after_failed_permission_selection();
-            self.chat_widget.add_error_message(
-                "Wait for the current turn to finish before changing permissions.".into(),
-            );
-            return;
-        }
         let config = self.chat_widget.config_ref();
-        if config
-            .permissions
-            .active_permission_profile()
-            .is_some_and(|profile| profile.id == selection.profile_id)
-            && selection
-                .approval_policy
-                .is_none_or(|policy| config.permissions.approval_policy.value() == policy.to_core())
+        let already_selected = !self
+            .agents_overview
+            .requested_permission_profiles
+            .contains_key(&thread_id)
+            && config
+                .permissions
+                .active_permission_profile()
+                .is_some_and(|profile| profile.id == selection.profile_id)
+            && selection.approval_policy.is_none_or(|policy| {
+                config.permissions.approval_policy.value() == policy.to_core()
+            })
             && selection
                 .approvals_reviewer
-                .is_none_or(|reviewer| config.approvals_reviewer == reviewer)
-        {
+                .is_none_or(|reviewer| config.approvals_reviewer == reviewer);
+        if already_selected && selection.profile_id.starts_with(':') {
             self.agents_overview
                 .selected_permission_profiles
                 .insert(thread_id, selection.profile_id);
@@ -330,11 +335,30 @@ impl App {
         };
         match app_server.thread_settings_update(params).await {
             Ok(true) => {
+                // Omission preserves the active value on update, but uses defaults on start.
+                // Retain effective intent across consecutive requests before confirmation.
+                let previous = self
+                    .agents_overview
+                    .requested_permission_profiles
+                    .get(&thread_id);
+                selection.approval_policy = selection
+                    .approval_policy
+                    .or_else(|| previous.and_then(|profile| profile.approval_policy))
+                    .or(Some(config.permissions.approval_policy.value().into()));
+                selection.approvals_reviewer = selection
+                    .approvals_reviewer
+                    .or_else(|| previous.and_then(|profile| profile.approvals_reviewer))
+                    .or(Some(config.approvals_reviewer));
                 self.agents_overview
                     .selected_permission_profiles
                     .insert(thread_id, selection.profile_id.clone());
-                self.pending_server_profiles
-                    .insert(thread_id, selection.clone());
+                // Custom profiles still go to the server so edited definitions are reloaded.
+                // An unchanged selection may not emit a settings notification.
+                if !already_selected {
+                    self.agents_overview
+                        .requested_permission_profiles
+                        .insert(thread_id, selection.clone());
+                }
                 self.chat_widget.add_info_message(
                     format!(
                         "Permission selection requested: {}",
@@ -386,18 +410,33 @@ impl App {
         true
     }
 
-    pub(super) fn confirmed_server_profile(
+    pub(super) fn selected_server_profile(
         &self,
         thread_id: ThreadId,
     ) -> Option<PermissionProfileSelection> {
         if self.chat_widget.thread_id() != Some(thread_id) {
             return None;
         }
+        if let Some(selection) = self
+            .agents_overview
+            .requested_permission_profiles
+            .get(&thread_id)
+        {
+            return Some(selection.clone());
+        }
+        if self.app_server_target.thread_params_mode()
+            == crate::app_server_session::ThreadParamsMode::Remote
+        {
+            return None;
+        }
         let config = self.chat_widget.config_ref();
         let active = config.permissions.active_permission_profile()?;
         if active.id.starts_with(':')
-            || (self.app_server_target.thread_params_mode()
-                == crate::app_server_session::ThreadParamsMode::Embedded
+            || (self
+                .agents_overview
+                .selected_permission_profiles
+                .get(&thread_id)
+                != Some(&active.id)
                 && self
                     .config
                     .custom_permission_profiles
@@ -414,6 +453,44 @@ impl App {
         })
     }
 
+    /// Adopt authoritative widget settings before deriving overrides for subsequent turns.
+    pub(super) fn adopt_server_permissions(&mut self) {
+        self.chat_widget.set_permission_network(/*network*/ None);
+        self.config.permissions = self.chat_widget.config_ref().permissions.clone();
+        self.config.approvals_reviewer = self.chat_widget.config_ref().approvals_reviewer;
+        self.runtime_approval_policy_override = Some(RuntimeApprovalPolicyOverride::Explicit(
+            self.config.permissions.approval_policy.value().into(),
+        ));
+        self.runtime_approvals_reviewer_override = if self
+            .config
+            .permissions
+            .active_permission_profile()
+            .is_some_and(|profile| profile.id.starts_with(':'))
+        {
+            Some(self.config.approvals_reviewer)
+        } else {
+            self.runtime_approvals_reviewer_override
+                .filter(|reviewer| *reviewer == self.config.approvals_reviewer)
+        };
+        self.runtime_permission_profile_override =
+            Some(RuntimePermissionProfileOverride::from_config(&self.config));
+    }
+
+    pub(super) fn adopt_inherited_server_selection(&mut self) {
+        if let Some(thread_id) = self.chat_widget.thread_id()
+            && let Some(active) = self
+                .chat_widget
+                .config_ref()
+                .permissions
+                .active_permission_profile()
+        {
+            self.agents_overview
+                .selected_permission_profiles
+                .insert(thread_id, active.id);
+        }
+        self.adopt_server_permissions();
+    }
+
     pub(super) async fn refresh_in_memory_config_from_disk(&mut self) -> Result<()> {
         let mut config = self
             .rebuild_config_for_cwd(self.chat_widget.config_ref().cwd.to_path_buf())
@@ -421,14 +498,22 @@ impl App {
         self.apply_runtime_policy_overrides(&mut config, RuntimePolicyOverrideScope::All)?;
         self.local_settings = self.local_settings.reloaded(&config);
         self.refresh_server_version_overview_notice(CODEX_CLI_VERSION);
-        // Other preferences have runtime caches and are adopted when the widget is replaced.
+        // Copy preferences read directly by the live widget. Other preferences have runtime
+        // caches and are adopted when the widget is replaced.
         self.chat_widget
             .local_settings
             .tui
             .terminal_resize_reflow_max_rows =
             self.local_settings.tui.terminal_resize_reflow_max_rows;
+        self.chat_widget.local_settings.tui.session_picker_view =
+            self.local_settings.tui.session_picker_view;
+        self.chat_widget.local_settings.tui.resume_cwd = self.local_settings.tui.resume_cwd;
+        self.chat_widget.local_settings.tui.status_line_provider =
+            self.local_settings.tui.status_line_provider.clone();
         self.config = config;
+        self.refresh_transcript_document_links();
         self.chat_widget.sync_plugin_mentions_config(&self.config);
+        self.chat_widget.refresh_status_line();
         Ok(())
     }
 
@@ -465,13 +550,18 @@ impl App {
     }
 
     pub(super) async fn rebuild_config_for_resume_or_fallback(
-        &mut self,
+        &self,
         current_cwd: &Path,
         resume_cwd: PathBuf,
+        fallback: (&Config, &crate::local_settings::LocalSettings),
+        target: &AppServerTarget,
     ) -> Result<(Config, crate::local_settings::LocalSettings)> {
-        match self.rebuild_config_for_cwd(resume_cwd.clone()).await {
+        match self
+            .rebuild_config_for_cwd_from(fallback.0, fallback.1, target, resume_cwd.clone())
+            .await
+        {
             Ok(config) => {
-                let local_settings = self.local_settings.reloaded(&config);
+                let local_settings = fallback.1.reloaded(&config);
                 Ok((config, local_settings))
             }
             Err(err) => {
@@ -484,7 +574,7 @@ impl App {
                         cwd = %resume_cwd_display,
                         "failed to rebuild config for same-cwd resume; using current in-memory config"
                     );
-                    Ok((self.config.clone(), self.local_settings.clone()))
+                    Ok((fallback.0.clone(), fallback.1.clone()))
                 }
             }
         }
@@ -494,6 +584,19 @@ impl App {
         &mut self,
         config: &mut Config,
         scope: RuntimePolicyOverrideScope,
+    ) -> Result<()> {
+        self.apply_runtime_policy_overrides_with_reviewer(
+            config,
+            scope,
+            self.config.approvals_reviewer,
+        )
+    }
+
+    pub(super) fn apply_runtime_policy_overrides_with_reviewer(
+        &mut self,
+        config: &mut Config,
+        scope: RuntimePolicyOverrideScope,
+        restored_reviewer: ApprovalsReviewer,
     ) -> Result<()> {
         if let Some(policy) = self.runtime_approval_policy_override
             && (scope == RuntimePolicyOverrideScope::All
@@ -524,7 +627,7 @@ impl App {
                 .filter(|profile| {
                     profile.turn_override == RuntimePermissionProfileTurnOverride::Preserve
                 })
-                .map(|_| self.config.approvals_reviewer)
+                .map(|_| restored_reviewer)
         }) {
             config
                 .config_layer_stack
@@ -851,7 +954,6 @@ impl App {
                 /*summary*/ None,
                 /*service_tier*/ None,
                 /*collaboration_mode*/ None,
-                /*personality*/ None,
             );
             let replay_state_op =
                 ThreadEventStore::op_can_change_pending_replay_state(&op).then(|| op.clone());
@@ -1078,10 +1180,12 @@ impl App {
         resume_model_settings_for_overrides(&self.config, &self.harness_overrides)
     }
 
-    pub(super) fn reject_remote_resume_permission_override(&mut self, config: &Config) -> bool {
-        if self.app_server_target.thread_params_mode()
-            != crate::app_server_session::ThreadParamsMode::Remote
-        {
+    pub(super) fn reject_remote_resume_permission_override(
+        &mut self,
+        config: &Config,
+        target: &AppServerTarget,
+    ) -> bool {
+        if target.thread_params_mode() != crate::app_server_session::ThreadParamsMode::Remote {
             return false;
         }
         let explicitly_selected =
@@ -1254,7 +1358,6 @@ impl App {
             /*summary*/ None,
             /*service_tier*/ None,
             /*collaboration_mode*/ None,
-            /*personality*/ None,
         );
         let replay_state_op =
             ThreadEventStore::op_can_change_pending_replay_state(&op).then(|| op.clone());
@@ -1775,7 +1878,7 @@ enabled = false
             .await;
 
         app.refresh_in_memory_config_from_disk().await?;
-        let new_config = app.load_new_session_config(&app_server).await?;
+        let (new_config, _) = app.load_new_session_config(&app_server).await?;
         let permission_config = app
             .rebuild_config_for_permission_profile(":workspace")
             .await?;
@@ -1841,6 +1944,10 @@ enabled = false
 
         app.chat_widget
             .handle_thread_session(crate::session_state::ThreadSessionState {
+                read_only_history: false,
+                thread_settings_confirmed: true,
+                primary_environment_cwd: None,
+                daybreak_enabled: false,
                 windows_sandbox_host: crate::app::WindowsSandboxHost::Local,
                 thread_id: ThreadId::new(),
                 forked_from_id: None,
@@ -1858,7 +1965,6 @@ enabled = false
                 instruction_source_paths: Vec::new(),
                 reasoning_effort: None,
                 collaboration_mode: None,
-                personality: None,
                 message_history: None,
                 network_proxy: None,
                 rollout_path: Some(PathBuf::new()),
@@ -1867,6 +1973,35 @@ enabled = false
         assert_eq!(app.chat_widget.config_ref().cwd.to_path_buf(), next_cwd);
         assert_eq!(app.config.cwd, original_cwd);
 
+        std::fs::write(app.config.codex_home.join("config.toml"), "")?;
+        crate::legacy_core::config::set_project_trust_level(
+            &app.config.codex_home,
+            &next_cwd,
+            codex_protocol::config_types::TrustLevel::Trusted,
+        )
+        .map_err(std::io::Error::other)?;
+        let mut server = crate::start_embedded_app_server_for_picker(&app.config).await?;
+        let target = SessionTarget {
+            backend_id: server.backend_id(),
+            thread_id: ThreadId::new(),
+            path: None,
+            cwd: None,
+            history_mode: None,
+        };
+        let mut tui = crate::tui::test_support::make_test_tui()?;
+        let candidate = app
+            .resume_config_for_target(
+                &mut tui,
+                &mut server,
+                &target,
+                super::resume_preparation::ResumeSource::Active,
+            )
+            .await
+            .map_err(|_| color_eyre::eyre::eyre!("resume configuration should succeed"))?;
+        assert_eq!(candidate.0.cwd.to_path_buf(), next_cwd);
+        assert_eq!(app.config.cwd.to_path_buf(), next_cwd);
+        server.shutdown().await?;
+
         app.refresh_in_memory_config_from_disk().await?;
 
         assert_eq!(app.config.cwd, app.chat_widget.config_ref().cwd);
@@ -1874,10 +2009,17 @@ enabled = false
     }
 
     #[tokio::test]
-    async fn refresh_in_memory_config_from_disk_updates_resize_reflow_config() -> Result<()> {
+    async fn refresh_in_memory_config_from_disk_updates_live_widget_preferences() -> Result<()> {
         let mut app = make_test_app().await;
         let mut expected_widget_settings = app.chat_widget.local_settings.clone();
         expected_widget_settings.tui.terminal_resize_reflow_max_rows = Some(9000);
+        expected_widget_settings.tui.session_picker_view =
+            Some(codex_config::types::SessionPickerViewMode::Comfortable);
+        expected_widget_settings.tui.resume_cwd = Some(codex_config::types::ResumeCwdMode::Current);
+        expected_widget_settings.tui.status_line_provider =
+            Some(Box::new(codex_config::types::StatusLineSelection::Builtin(
+                codex_config::types::BuiltinStatusLine::Default,
+            )));
         let codex_home = tempdir()?;
         app.config.codex_home = codex_home.path().to_path_buf().abs();
         std::fs::write(
@@ -1885,6 +2027,9 @@ enabled = false
             r#"
 [tui]
 terminal_resize_reflow_max_rows = 9000
+session_picker_view = "comfortable"
+resume_cwd = "current"
+status_line_provider = "default"
 theme = "dracula"
 "#,
         )?;
@@ -1894,6 +2039,10 @@ theme = "dracula"
         assert_eq!(
             app.local_settings.terminal_resize_reflow().max_rows,
             crate::legacy_core::config::TerminalResizeReflowMaxRows::Limit(9000)
+        );
+        assert_eq!(
+            app.local_settings.tui.session_picker_view,
+            Some(codex_config::types::SessionPickerViewMode::Comfortable)
         );
         assert_eq!(app.local_settings.tui.theme.as_deref(), Some("dracula"));
         assert_eq!(app.chat_widget.local_settings, expected_widget_settings);
@@ -1941,6 +2090,25 @@ theme = "dracula"
     }
 
     #[tokio::test]
+    async fn new_thread_keeps_live_settings_after_failed_reload() -> Result<()> {
+        let mut app = make_test_app().await;
+        let server = crate::start_embedded_app_server_for_picker(&app.config).await?;
+        let home = tempdir()?;
+        app.config.codex_home = home.path().to_path_buf().abs();
+        let config_path = home.path().join("config.toml");
+        std::fs::write(&config_path, "[tui]\ntheme = 'dracula'\n")?;
+        app.refresh_in_memory_config_from_disk().await?;
+        // A live setting can be newer than the last successful disk load.
+        app.local_settings.tui.rendering.math = false;
+        std::fs::write(config_path, "[broken")?;
+
+        let (_, settings) = app.load_new_session_config(&server).await?;
+        assert_eq!(settings, app.local_settings);
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn rebuild_config_for_resume_or_fallback_uses_current_config_on_same_cwd_error()
     -> Result<()> {
         let mut app = make_test_app().await;
@@ -1952,7 +2120,12 @@ theme = "dracula"
         let current_cwd = current_config.cwd.clone();
 
         let resume_config = app
-            .rebuild_config_for_resume_or_fallback(&current_cwd, current_cwd.to_path_buf())
+            .rebuild_config_for_resume_or_fallback(
+                &current_cwd,
+                current_cwd.to_path_buf(),
+                (&app.config, &app.local_settings),
+                &app.app_server_target,
+            )
             .await?;
 
         assert_eq!(resume_config, (current_config, app.local_settings.clone()));
@@ -1970,7 +2143,12 @@ theme = "dracula"
         let next_cwd = next_cwd_tmp.path().to_path_buf();
 
         let result = app
-            .rebuild_config_for_resume_or_fallback(&current_cwd, next_cwd)
+            .rebuild_config_for_resume_or_fallback(
+                &current_cwd,
+                next_cwd,
+                (&app.config, &app.local_settings),
+                &app.app_server_target,
+            )
             .await;
 
         assert!(result.is_err());
@@ -1986,6 +2164,10 @@ theme = "dracula"
         assert_eq!(app.local_settings.tui.theme.as_deref(), Some("dracula"));
         assert_eq!(
             app.chat_widget.local_settings.tui.theme.as_deref(),
+            Some("dracula")
+        );
+        assert_eq!(
+            app.chat_widget.config_panel_tui.theme.as_deref(),
             Some("dracula")
         );
     }

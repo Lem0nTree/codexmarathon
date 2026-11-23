@@ -101,7 +101,7 @@ pub fn collect_code_mode_tool_definitions<'a>(
                 if !namespace_description.is_empty() {
                     for definition in &mut definitions {
                         definition.description =
-                            format!("{namespace_description}\n\n{}", definition.description);
+                            format!("{}\n\n{namespace_description}", definition.description);
                     }
                 }
             }
@@ -223,7 +223,38 @@ fn code_mode_tool_definitions_for_spec(
                 }
             })
             .collect(),
-        ToolSpec::ToolSearch { .. } | ToolSpec::WebSearch { .. } => Vec::new(),
+        ToolSpec::ToolSearch { parameters, .. } => {
+            let name = spec.name().to_string();
+            vec![CodeModeToolDefinition {
+                tool_name: ToolName::plain(name.clone()),
+                name,
+                description: codex_code_mode::TOOL_SEARCH_GUIDANCE.to_string(),
+                kind: CodeModeToolKind::Function,
+                input_schema: serde_json::to_value(parameters).ok(),
+                input_schema_max_bytes: Some(effective_input_schema_max_bytes(
+                    parameters.mcp_input_schema_max_bytes,
+                    code_mode_input_schema_max_bytes,
+                )),
+                output_schema: Some(serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "tools": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "name": { "type": "string" },
+                                    "description": { "type": "string" }
+                                },
+                                "required": ["name", "description"]
+                            }
+                        }
+                    },
+                    "required": ["tools"]
+                })),
+            }]
+        }
+        ToolSpec::WebSearch { .. } => Vec::new(),
     }
 }
 

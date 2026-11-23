@@ -31,6 +31,17 @@ pub struct CodexMarathonRecoveryReleaseNotification {
     pub expected_generation: u64,
 }
 
+/// A committed identity transition applies to this already-parked recovery.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct CodexMarathonRecoveryAuthChangedNotification {
+    pub recovery_id: String,
+    pub thread_id: Option<String>,
+    #[ts(type = "number")]
+    pub auth_generation: u64,
+}
+
 /// Result sent by the TUI after applying a Marathon release command to the
 /// session-owned pending recovery state.
 ///

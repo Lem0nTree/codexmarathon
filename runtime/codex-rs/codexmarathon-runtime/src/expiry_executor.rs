@@ -647,12 +647,18 @@ mod tests {
             expires_at: Some(provider_expiry),
         };
         let now = job.expires_at - chrono::Duration::minutes(1);
-        assert_eq!(credit_action(&[credit.clone()], &job, now), Ok(CreditAction::Submit));
+        assert_eq!(
+            credit_action(&[credit.clone()], &job, now),
+            Ok(CreditAction::Submit)
+        );
         let changed = ExpiryCredit {
             expires_at: Some(provider_expiry + chrono::Duration::milliseconds(1)),
             ..credit
         };
-        assert_eq!(credit_action(&[changed], &job, now), Err("credit_ineligible"));
+        assert_eq!(
+            credit_action(&[changed], &job, now),
+            Err("credit_ineligible")
+        );
     }
     fn block_on<F: std::future::Future>(future: F) -> F::Output {
         tokio::runtime::Builder::new_current_thread()

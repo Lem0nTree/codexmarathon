@@ -50,6 +50,8 @@ impl AgentsOverviewView {
             line(
                 if state.connection_notice.is_some() {
                     "Reconnecting…"
+                } else if state.history.is_some() {
+                    "No matching tasks"
                 } else if state.loading && self.rows.is_empty() {
                     "Loading tasks…"
                 } else if state.refresh_failed {
@@ -121,7 +123,15 @@ impl AgentsOverviewView {
                         },
                         style,
                     );
-                    let label = if state.loading {
+                    let label = if let Some(search) = &state.history {
+                        if search.loading {
+                            "Searching history…"
+                        } else if search.failed {
+                            "Show more (retry)"
+                        } else {
+                            "Show more matches"
+                        }
+                    } else if state.loading {
                         "Loading more…"
                     } else if state.refresh_failed {
                         "Show more (retry)"
@@ -141,13 +151,16 @@ impl AgentsOverviewView {
             let rect = row(viewport, offset as u16, /*height*/ 1);
             if matches!(entry, CenterRow::Group(_)) {
                 let group = match state.grouping {
-                    AgentsOverviewGrouping::Project => {
-                        format_directory_display(
-                            &self.project_groups[index].heading,
-                            /*max_width*/ None,
-                        )
-                    }
                     AgentsOverviewGrouping::Status => task.group.label().to_owned(),
+                    _ if self.is_pinned(index) => "Pinned".to_owned(),
+                    AgentsOverviewGrouping::Project => format_directory_display(
+                        &self.project_groups[index].heading,
+                        /*max_width*/ None,
+                    ),
+                    AgentsOverviewGrouping::Directory => format_directory_display(
+                        self.rows[index].thread.cwd.as_path(),
+                        /*max_width*/ None,
+                    ),
                     AgentsOverviewGrouping::Model => model_name(&task.thread).to_owned(),
                 };
                 let count = indices
@@ -157,6 +170,7 @@ impl AgentsOverviewView {
                     })
                     .count();
                 let total = (0..self.rows.len())
+                    .filter(|&i| state.includes_row(&self.rows[i]))
                     .filter(|&candidate| self.same_group(state.grouping, candidate, index))
                     .count();
                 let count = if count == total {
@@ -164,7 +178,11 @@ impl AgentsOverviewView {
                 } else {
                     format!("{count} of {total}")
                 };
-                let group = if state.grouping == AgentsOverviewGrouping::Project {
+                let group = if matches!(
+                    state.grouping,
+                    AgentsOverviewGrouping::Project | AgentsOverviewGrouping::Directory
+                ) && !self.is_pinned(index)
+                {
                     crate::text_formatting::center_truncate_path(
                         &group,
                         usize::from(rect.width)
@@ -190,7 +208,13 @@ impl AgentsOverviewView {
                 style,
             );
             let (status, mut dot) = Self::status(task);
-            if index == self.selected {
+            let idle = matches!(
+                task.group,
+                AgentsOverviewGroup::Ready | AgentsOverviewGroup::Finished
+            );
+            if task.unread || idle {
+                dot = crate::style::task_marker(task.unread, style);
+            } else if index == self.selected {
                 dot.style = style;
             }
             line(
@@ -224,11 +248,25 @@ impl AgentsOverviewView {
             } else {
                 self.title_style(task.thread_id)
             };
-            line(
-                Line::from(display_title(&task.thread).to_owned()).style(title_style),
-                title,
-                buf,
+            let mut prefix = String::new();
+            if state.grouping == AgentsOverviewGrouping::Status && self.is_pinned(index) {
+                prefix.push_str("📌 ");
+            }
+            // On narrow rows the result dot shares the only slot for the working or alert icon.
+            if task.unread && !idle && status_area.is_empty() {
+                prefix.push_str(status);
+                prefix.push_str(": ");
+            }
+            let prefix = Span::from(prefix);
+            let task_title = Line::from(display_title(&task.thread).to_owned()).style(title_style);
+            let mut task_title = task.label_style.render(
+                task_title,
+                usize::from(title.width).saturating_sub(prefix.width()),
             );
+            if !prefix.content.is_empty() {
+                task_title.spans.insert(0, prefix);
+            }
+            line(task_title, title, buf);
             line(Line::from(status).style(style), status_area, buf);
             if !updated.is_empty() {
                 let age = format_relative_time(

@@ -16,6 +16,9 @@ use crate::key_hint::KeyBindingListExt;
 use crate::keymap::KeymapContext;
 use crate::keymap::ListAction;
 use crate::keymap::RuntimeKeymap;
+use crate::markdown::render_markdown_for_viewport;
+use crate::terminal_hyperlinks::HyperlinkLine;
+use crate::terminal_hyperlinks::prefix_hyperlink_lines;
 use codex_protocol::items::AsyncUserInputQuestion;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
@@ -150,14 +153,9 @@ impl AsyncQuestions {
             .and_then(|answer| answer.options_state.selected_idx)
     }
 
-    pub(super) fn wrapped_question_lines(&self, width: u16) -> Vec<String> {
+    pub(super) fn wrapped_question_lines(&self, width: u16) -> Vec<HyperlinkLine> {
         self.current_question()
-            .map(|q| {
-                textwrap::wrap(&q.title, width.max(1) as usize)
-                    .into_iter()
-                    .map(|line| line.to_string())
-                    .collect::<Vec<_>>()
-            })
+            .map(|question| render_markdown_for_viewport(&question.title, width))
             .unwrap_or_default()
     }
 
@@ -165,7 +163,7 @@ impl AsyncQuestions {
         !self.has_options() || self.other_selected()
     }
 
-    pub(super) fn option_rows(&self) -> Vec<GenericDisplayRow> {
+    pub(super) fn option_rows(&self, width: u16) -> Vec<GenericDisplayRow> {
         if !self.has_options() {
             return Vec::new();
         };
@@ -182,14 +180,20 @@ impl AsyncQuestions {
                 };
                 let number = index + 1;
                 let prefix = format!("{prefix} {number}. ");
-                GenericDisplayRow {
-                    // Other stays an inline editor with foreground-only focus.
-                    selection_style: (index < self.options().len())
-                        .then(super::picker_style::selection_style),
+                let indent = prefix.width();
+                let is_choice = index < self.options().len();
+                let mut row = GenericDisplayRow {
                     name: format!("{prefix}{label}"),
-                    wrap_indent: Some(prefix.width()),
+                    wrap_indent: Some(indent),
+                    selection_style: is_choice.then(super::picker_style::selection_style),
                     ..Default::default()
+                };
+                if is_choice && usize::from(width) > indent {
+                    let lines = render_markdown_for_viewport(label, width - indent as u16);
+                    row.wrapped_name =
+                        prefix_hyperlink_lines(lines, prefix.into(), " ".repeat(indent).into());
                 }
+                row
             })
             .collect()
     }
@@ -198,7 +202,7 @@ impl AsyncQuestions {
         if !self.has_options() {
             return 0;
         }
-        let rows = self.option_rows();
+        let rows = self.option_rows(width);
         if self.other_selected() {
             let prefix = self.other_prefix_width(width);
             measure_rows_height(

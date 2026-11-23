@@ -40,7 +40,7 @@ use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::start_mock_server;
 use core_test_support::skip_if_no_network;
 use core_test_support::stdio_server_bin;
-use core_test_support::test_codex::local_selections;
+use core_test_support::test_codex::local_requests;
 use core_test_support::test_codex::test_codex;
 use core_test_support::test_codex::turn_permission_fields;
 use core_test_support::wait_for_event;
@@ -557,6 +557,8 @@ async fn backfill_scans_existing_rollouts() -> Result<()> {
             fs::create_dir_all(parent).expect("should create rollout directory");
             let session_meta_line = SessionMetaLine {
                 meta: SessionMeta {
+                    account_scoped: false,
+                    attached_thread: false,
                     creator_user_id: None,
                     creator_account_id: None,
                     session_id: thread_id.into(),
@@ -592,7 +594,7 @@ async fn backfill_scans_existing_rollouts() -> Result<()> {
                 RolloutLine {
                     timestamp: "2026-01-27T12:00:00Z".to_string(),
                     ordinal: None,
-                    item: RolloutItem::SessionMeta(session_meta_line),
+                    item: RolloutItem::SessionMeta(Box::new(session_meta_line)),
                 },
                 RolloutLine {
                     timestamp: "2026-01-27T12:00:01Z".to_string(),
@@ -918,7 +920,7 @@ async fn mcp_call_marks_thread_memory_mode_polluted_when_configured() -> Result<
                 text_elements: Vec::new(),
             }])
             .with_thread_settings(ThreadSettingsOverrides {
-                environments: Some(local_selections(cwd)),
+                environments: Some(local_requests(cwd)),
                 approval_policy: Some(AskForApproval::Never),
                 sandbox_policy: Some(sandbox_policy),
                 permission_profile,
@@ -1003,6 +1005,10 @@ async fn tool_call_logs_include_thread_id() -> Result<()> {
         tracing::info!("ToolCall: exec_command {{\"cmd\":\"echo hello\"}}");
     });
     log_db_layer.flush().await;
+
+    let logs_path = test.config.sqlite.home().join("logs_2.sqlite");
+    assert_eq!(db.sqlite().logs_db_path(), logs_path);
+    assert!(logs_path.is_file());
 
     let mut found = None;
     for _ in 0..80 {

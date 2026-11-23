@@ -63,12 +63,13 @@ impl Renderable for OwnedStartupLayout<'_> {
         };
         paragraph.render(header, buf);
         let message = match self.pump.session_action {
-            StartupDraftSessionAction::New | StartupDraftSessionAction::NewFromCommandCenter => {
+            StartupDraftSessionAction::New | StartupDraftSessionAction::NewWhileRunning => {
                 let composer = (!self.pump.submission_pending)
                     .then(|| self.pump.bottom_pane.empty_state_composer())
                     .flatten();
                 self.next_frame
                     .set(self.pump.blossom.borrow_mut().render_first_screen(
+                        area,
                         Rect {
                             y: header.bottom(),
                             height: bottom.y.saturating_sub(header.bottom()),

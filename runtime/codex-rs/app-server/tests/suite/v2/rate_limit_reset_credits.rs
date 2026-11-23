@@ -260,6 +260,7 @@ async fn consume_timeout_releases_account_auth_queue() -> Result<()> {
     let consume_id = send_consume_reset_credit(&mut mcp, "request-timeout").await?;
     let account_id = mcp
         .send_get_account_request(GetAccountParams {
+            reload_auth_from_storage: false,
             refresh_token: false,
         })
         .await?;

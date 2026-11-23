@@ -94,6 +94,12 @@ pub trait NativeRecoveryBridge: Send + Sync {
     }
 }
 
+/// App-server-owned admission and account reconciliation for native reloads.
+pub trait NativeTransitionBridge: Send + Sync {
+    fn reload(&self) -> Pin<Box<dyn Future<Output = Result<BackendReload, BackendError>> + Send>>;
+    fn invalidate(&self) -> Pin<Box<dyn Future<Output = Result<(), BackendError>> + Send>>;
+}
+
 /// The native authorities that the embedded Codex runtime already owns.
 ///
 /// Implementations should forward each method to the corresponding Codex

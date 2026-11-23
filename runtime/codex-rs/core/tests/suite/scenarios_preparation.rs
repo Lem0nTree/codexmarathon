@@ -1,9 +1,78 @@
 //! Verifies prepared context reaches both the first model request and a follow-up.
 
 use super::*;
+use anyhow::Context as _;
+use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::protocol::ThreadHistoryMode;
+use codex_protocol::turn_input::AnnotatedResponseItem;
 use pretty_assertions::assert_eq;
 use test_case::test_case;
+
+#[test_case("message")]
+#[test_case("function_call_output")]
+#[test_case("custom_tool_call_output")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn raw_injection_rejects_uploaded_audio_before_modifying_history(kind: &str) -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    let server = start_mock_server().await;
+    let test = test_codex().build_with_auto_env(&server).await?;
+    let before = test.codex.conversation_history_snapshot().await;
+    let parts = json!([{"type": "input_audio", "file_id": "file_injected"}]);
+    let audio: ResponseItem = serde_json::from_value(if kind == "message" {
+        json!({"type": kind, "role": "developer", "content": parts})
+    } else {
+        json!({"type": kind, "call_id": "untrusted", "output": parts})
+    })?;
+    let batch = vec![
+        core_test_support::responses::user_message_item("must not be partially written"),
+        audio.clone(),
+    ];
+
+    let history_error = test
+        .codex
+        .inject_response_items(batch.clone())
+        .await
+        .err()
+        .context("raw history accepted a caller-supplied audio file")?;
+    let preparation_error = test
+        .codex
+        .inject_response_items_for_turn(batch)
+        .await
+        .err()
+        .context("prepared history accepted a caller-supplied audio file")?;
+    for error in [history_error, preparation_error] {
+        assert!(matches!(
+            error.details(),
+            CodexErrorDetails::InvalidRequest(_)
+        ));
+    }
+    for input in [
+        TurnInput::ResponseItem(audio.clone()),
+        TurnInput::AnnotatedResponseItem(AnnotatedResponseItem {
+            item: audio,
+            annotations: Default::default(),
+        }),
+    ] {
+        let error = test
+            .codex
+            .start_or_steer_turn(TurnInputRequest::new(input))
+            .await
+            .err()
+            .context("turn input accepted an untyped audio file")?;
+        assert!(matches!(
+            error.details(),
+            CodexErrorDetails::InvalidRequest(_)
+        ));
+    }
+    let after = test.codex.conversation_history_snapshot().await;
+    assert_eq!(after.history_version(), before.history_version());
+    assert_eq!(
+        after.items().collect::<Vec<_>>(),
+        before.items().collect::<Vec<_>>()
+    );
+    test.codex.shutdown_and_wait().await?;
+    Ok(())
+}
 
 #[test_case(ThreadHistoryMode::Legacy; "legacy")]
 #[test_case(ThreadHistoryMode::Paginated; "paginated")]

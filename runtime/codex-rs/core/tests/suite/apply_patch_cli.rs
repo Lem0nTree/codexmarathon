@@ -3,6 +3,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use codex_core::StartThreadOptions;
 use codex_core::TurnInputRequest;
+use codex_protocol::protocol::TurnEnvironmentRequests;
 use core_test_support::responses::ev_apply_patch_custom_tool_call;
 use core_test_support::responses::ev_apply_patch_exec_command_call_via_heredoc;
 use core_test_support::responses::ev_exec_command_call;
@@ -43,7 +44,6 @@ use codex_protocol::protocol::ReviewDecision;
 use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::protocol::TurnEnvironmentSelection;
-use codex_protocol::protocol::TurnEnvironmentSelections;
 use codex_protocol::user_input::UserInput;
 #[cfg(target_os = "linux")]
 use codex_sandboxing::landlock::CODEX_LINUX_SANDBOX_ARG0;
@@ -347,15 +347,11 @@ fn apply_patch_responses(
     ]
 }
 
-async fn assert_apply_patch_crlf_update(
-    configure: impl FnOnce(TestCodexBuilder) -> TestCodexBuilder,
-    model_output: CrLfApplyPatchModelOutput,
-    expected: &str,
-) -> Result<()> {
+async fn assert_apply_patch_crlf_update(model_output: CrLfApplyPatchModelOutput) -> Result<()> {
     skip_if_no_network!(Ok(()));
 
-    let harness = apply_patch_harness_with(configure).await?;
-    let call_id = "apply-patch-crlf-rollout";
+    let harness = apply_patch_harness().await?;
+    let call_id = "apply-patch-crlf";
     let file_name = "crlf.txt";
     harness.write_file(file_name, "before\r\n").await?;
     let patch = format!(
@@ -385,7 +381,7 @@ async fn assert_apply_patch_crlf_update(
         )
         .await?;
 
-    assert_eq!(harness.read_file_text(file_name).await?, expected);
+    assert_eq!(harness.read_file_text(file_name).await?, "after\r\n");
     Ok(())
 }
 
@@ -396,61 +392,14 @@ enum CrLfApplyPatchModelOutput {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn apply_patch_normalizes_crlf_without_preserve_line_endings_feature() -> Result<()> {
-    assert_apply_patch_crlf_update(
-        |builder| builder,
-        CrLfApplyPatchModelOutput::CustomTool,
-        "after\n",
-    )
-    .await
+async fn apply_patch_preserves_crlf_by_default() -> Result<()> {
+    assert_apply_patch_crlf_update(CrLfApplyPatchModelOutput::CustomTool).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn apply_patch_preserves_crlf_with_preserve_line_endings_feature() -> Result<()> {
-    assert_apply_patch_crlf_update(
-        |builder| {
-            builder.with_config(|config| {
-                config
-                    .features
-                    .enable(Feature::ApplyPatchPreserveLineEndings)
-                    .expect("feature should be enabled");
-            })
-        },
-        CrLfApplyPatchModelOutput::CustomTool,
-        "after\r\n",
-    )
-    .await
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn apply_patch_shell_heredoc_normalizes_crlf_without_preserve_line_endings_feature()
--> Result<()> {
+async fn apply_patch_shell_heredoc_preserves_crlf_by_default() -> Result<()> {
     skip_if_wine_exec!(Ok(()), "uses a POSIX shell heredoc");
-    assert_apply_patch_crlf_update(
-        |builder| builder,
-        CrLfApplyPatchModelOutput::ExecCommandViaHeredoc,
-        "after\n",
-    )
-    .await
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn apply_patch_shell_heredoc_preserves_crlf_with_preserve_line_endings_feature() -> Result<()>
-{
-    skip_if_wine_exec!(Ok(()), "uses a POSIX shell heredoc");
-    assert_apply_patch_crlf_update(
-        |builder| {
-            builder.with_config(|config| {
-                config
-                    .features
-                    .enable(Feature::ApplyPatchPreserveLineEndings)
-                    .expect("feature should be enabled");
-            })
-        },
-        CrLfApplyPatchModelOutput::ExecCommandViaHeredoc,
-        "after\r\n",
-    )
-    .await
+    assert_apply_patch_crlf_update(CrLfApplyPatchModelOutput::ExecCommandViaHeredoc).await
 }
 
 #[cfg(target_os = "linux")]
@@ -1110,9 +1059,9 @@ async fn intercepted_apply_patch_updates_absolute_target_after_turn_cwd_is_remov
                 text_elements: Vec::new(),
             }])
             .with_thread_settings(ThreadSettingsOverrides {
-                environments: Some(TurnEnvironmentSelections::new(
+                environments: Some(TurnEnvironmentRequests::new(
                     test.config.cwd.clone(),
-                    vec![selection],
+                    vec![selection.into_request()],
                 )),
                 approval_policy: Some(AskForApproval::Never),
                 sandbox_policy: Some(sandbox_policy),
@@ -2034,8 +1983,7 @@ async fn apply_patch_turn_diff_skips_git_root_when_feature_is_enabled(
         .thread_manager
         .start_thread(StartThreadOptions {
             metrics_service_name: Some(originator.to_string()),
-            environments: Some(test.codex.environment_selections().await),
-            ..StartThreadOptions::new(test.config.clone())
+            ..test.start_thread_options().await
         })
         .await?
         .thread;
@@ -2389,6 +2337,7 @@ async fn apply_patch_turn_diff_tracks_local_and_remote_environment_paths() -> Re
     let environments = vec![
         local(shared_cwd.clone()),
         TurnEnvironmentSelection {
+            selected_capability_roots: Default::default(),
             environment_id: REMOTE_ENVIRONMENT_ID.to_string(),
             cwd: PathUri::from_abs_path(&shared_cwd),
             workspace_roots: vec![PathUri::from_abs_path(&shared_cwd)],
@@ -2402,9 +2351,12 @@ async fn apply_patch_turn_diff_tracks_local_and_remote_environment_paths() -> Re
                 text_elements: Vec::new(),
             }])
             .with_thread_settings(ThreadSettingsOverrides {
-                environments: Some(codex_protocol::protocol::TurnEnvironmentSelections::new(
+                environments: Some(codex_protocol::protocol::TurnEnvironmentRequests::new(
                     test.config.cwd.clone(),
-                    environments,
+                    environments
+                        .into_iter()
+                        .map(TurnEnvironmentSelection::into_request)
+                        .collect(),
                 )),
                 approval_policy: Some(AskForApproval::Never),
                 sandbox_policy: Some(sandbox_policy),
@@ -2503,26 +2455,34 @@ async fn apply_patch_aggregates_diff_across_multiple_tool_calls() -> Result<()> 
         ev_apply_patch_custom_tool_call(call2, patch2),
         ev_completed("resp-2"),
     ]);
-    let s3 = sse(vec![
+    let mut continue_sampling = ev_completed("resp-3");
+    continue_sampling["response"]["end_turn"] = json!(false);
+    let s3 = sse(vec![ev_response_created("resp-3"), continue_sampling]);
+    let s4 = sse(vec![
         ev_assistant_message("msg-1", "ok"),
-        ev_completed("resp-3"),
+        ev_completed("resp-4"),
     ]);
-    mount_sse_sequence(harness.server(), vec![s1, s2, s3]).await;
+    mount_sse_sequence(harness.server(), vec![s1, s2, s3, s4]).await;
 
     submit_without_wait(&harness, "aggregate diffs").await?;
 
-    let mut last_diff: Option<String> = None;
-    wait_for_event(&codex, |event| match event {
-        EventMsg::TurnDiff(ev) => {
-            last_diff = Some(ev.unified_diff.clone());
-            false
+    let mut saw_final_answer = false;
+    let mut diffs = Vec::new();
+    wait_for_event(&codex, |event| {
+        match event {
+            EventMsg::TurnDiff(ev) => diffs.push((saw_final_answer, ev.unified_diff.clone())),
+            EventMsg::AgentMessage(message) if message.message == "ok" => saw_final_answer = true,
+            _ => {}
         }
-        EventMsg::TurnComplete(_) => true,
-        _ => false,
+        matches!(event, EventMsg::TurnComplete(_))
     })
     .await;
 
-    let diff = last_diff.expect("expected TurnDiff after two patches");
+    let [(false, first), (false, diff), (true, final_diff)] = diffs.as_slice() else {
+        anyhow::bail!("expected both patch updates and one final snapshot, got {diffs:?}");
+    };
+    assert!(first.contains("+v1\n"));
+    assert_eq!(final_diff, diff);
     assert!(diff.contains("agg/a.txt"), "diff missing agg/a.txt: {diff}");
     assert!(diff.contains("agg/b.txt"), "diff missing agg/b.txt: {diff}");
     // Final content reflects v2 for a.txt

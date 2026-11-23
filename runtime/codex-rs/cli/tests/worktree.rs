@@ -9,6 +9,7 @@ use std::io::Write as _;
 use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
+use std::time::Instant;
 #[cfg(not(unix))]
 use tempfile::TempDir;
 use wiremock::Mock;
@@ -80,7 +81,7 @@ async fn rejected_start(
     expected: &str,
 ) -> anyhow::Result<String> {
     let spawned = codex_utils_pty::spawn_pty_process(
-        &program.to_string_lossy(),
+        program.as_os_str(),
         args,
         cwd,
         env,
@@ -192,13 +193,14 @@ chatgpt_base_url = "{}/source/backend-api"
 analytics.enabled = false
 check_for_update_on_startup = false
 features.daemon_auto_start = {}
+features.mcp_oauth_refresh_coordination = true
 model_provider = "local"
 model = "test-model"
 sandbox_mode = "workspace-write"
 windows.sandbox = "unelevated"
 tui.disable_paste_burst = true
 [otel]
-metrics_exporter = {{ otlp-http = {{ endpoint = "{}/metrics", protocol = "json" }} }}
+metrics_exporter = "none"
 [model_providers.local]
 name = "local test"
 base_url = "{}/v1"
@@ -210,7 +212,6 @@ trust_level = "trusted"
 "#,
             server.uri(),
             backend == "daemon",
-            server.uri(),
             server.uri(),
             serde_json::to_string(&source)?,
             serde_json::to_string(&launcher)?
@@ -253,6 +254,10 @@ trust_level = "trusted"
     env.insert("TERM".into(), "xterm-256color".into());
     env.insert("TERM_PROGRAM".into(), "unrecognized-terminal".into());
     env.insert("OTEL_METRIC_EXPORT_INTERVAL".into(), "100".into());
+    env.insert(
+        "OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE".into(),
+        "delta".into(),
+    );
     for key in [
         "CODEX_EXEC_SERVER_URL",
         "CODEX_ACCESS_TOKEN",
@@ -281,7 +286,8 @@ trust_level = "trusted"
         #[cfg(unix)]
         std::os::unix::fs::symlink(program.canonicalize()?, &managed)?;
         #[cfg(not(unix))]
-        fs::hard_link(&program, &managed).or_else(|_| fs::copy(&program, &managed).map(|_| ()))?;
+        fs::hard_link(&program, &managed)
+            .or_else(|_| codex_utils_cargo_bin::copy_executable(&program, &managed))?;
         fs::create_dir(home.join("app-server-daemon"))?;
         fs::write(
             home.join("app-server-daemon/settings.json"),
@@ -301,8 +307,6 @@ trust_level = "trusted"
         "--enable".into(),
         "worktrees".into(),
         "--no-alt-screen".into(),
-        "-c".into(),
-        "features.mcp_oauth_refresh_coordination=true".into(),
         "-c".into(),
         "suppress_unstable_features_warning=true".into(),
     ];
@@ -335,8 +339,8 @@ trust_level = "trusted"
         }
         let (metric_tx, mut metric_rx) = tokio::sync::mpsc::unbounded_channel();
         Mock::given(wiremock::matchers::path("/metrics"))
-            .respond_with(move |_: &wiremock::Request| {
-                let _ = metric_tx.send(());
+            .respond_with(move |request: &wiremock::Request| {
+                let _ = metric_tx.send(request.body.clone());
                 ResponseTemplate::new(200).set_body_json(serde_json::json!({}))
             })
             .mount(&server)
@@ -407,7 +411,16 @@ trust_level = "trusted"
             args.extend(["--cd".into(), source.join(".codex").display().to_string()]);
         }
         if analytics {
-            args.extend(["-c".into(), "analytics.enabled=true".into()]);
+            args.extend([
+                "-c".into(),
+                // An explicit collector is independent of built-in analytics consent.
+                "analytics.enabled=false".into(),
+                "-c".into(),
+                format!(
+                    "otel.metrics_exporter={{otlp-http={{endpoint=\"{}/metrics\",protocol=\"json\"}}}}",
+                    server.uri()
+                ),
+            ]);
         }
         args.push(prompt.into());
         if previous.is_empty() {
@@ -430,7 +443,7 @@ trust_level = "trusted"
             assert!(!home.join("worktrees").exists());
         }
         let spawned = codex_utils_pty::spawn_pty_process(
-            &program.to_string_lossy(),
+            program.as_os_str(),
             &args,
             &launcher,
             &env,
@@ -543,9 +556,44 @@ trust_level = "trusted"
             .with_context(|| format!("daemon status timed out: {output}"))??;
         }
         if analytics {
-            tokio::time::timeout(Duration::from_secs(/*secs*/ 10), metric_rx.recv())
-                .await?
-                .context("metrics export while the TUI is running")?;
+            for reason in ["turn_start", "resize"] {
+                let started = Instant::now();
+                let wait = if reason == "resize" {
+                    session.resize(codex_utils_pty::TerminalSize {
+                        rows: 80,
+                        cols: 240,
+                    })?;
+                    Duration::from_secs(/*secs*/ 30)
+                } else {
+                    Duration::from_secs(/*secs*/ 10)
+                };
+                tokio::time::timeout(wait, async {
+                    loop {
+                        tokio::select! {
+                            body = metric_rx.recv() => {
+                                let payload: Value = serde_json::from_slice(&body.context("metric body")?)?;
+                                let found = payload["resourceMetrics"].as_array().into_iter().flatten()
+                                    .flat_map(|resource| resource["scopeMetrics"].as_array().into_iter().flatten())
+                                    .flat_map(|scope| scope["metrics"].as_array().into_iter().flatten())
+                                    .filter(|metric| metric["name"] == "codex.tui.terminal_size")
+                                    .flat_map(|metric| metric["sum"]["dataPoints"].as_array().into_iter().flatten())
+                                    .any(|point| point["attributes"].as_array().into_iter().flatten().any(|attribute|
+                                        attribute["key"] == "observation_reason" && attribute["value"]["stringValue"] == reason));
+                                if found { return Ok::<_, anyhow::Error>(()); }
+                            }
+                            bytes = stdout.recv() => {
+                                let bytes = bytes.context("TUI exited before size observation")?;
+                                output.push_str(&String::from_utf8_lossy(&bytes));
+                                let replies = queries.feed(&bytes);
+                                if !replies.is_empty() { session.writer_sender().send(replies).await?; }
+                            }
+                        }
+                    }
+                }).await.with_context(|| format!("waiting for {reason} observation"))??;
+                if reason == "resize" {
+                    assert!(started.elapsed() >= Duration::from_secs(/*secs*/ 15));
+                }
+            }
         }
         let startup_result = observed.as_ref().map(|result| result.as_ref().map(|_| ()));
         assert!(
@@ -629,6 +677,7 @@ trust_level = "trusted"
                 .flat_map(|metric| metric["sum"]["dataPoints"].as_array().into_iter().flatten())
                 .next()
                 .context("codex.tui.start data point")?;
+            assert_eq!(point["asInt"], 1);
             let tags = point["attributes"]
                 .as_array()
                 .context("codex.tui.start attributes")?
@@ -645,6 +694,8 @@ trust_level = "trusted"
             let mut expected_tags = HashMap::from([
                 ("app_server_mode", "in_process"),
                 ("terminal_name", "unknown"),
+                ("terminal_columns", "120-239"),
+                ("terminal_rows", "40-79"),
                 ("multiplexer", "none"),
                 ("daemon_selection_reason", "incompatible_option"),
                 (
@@ -660,6 +711,10 @@ trust_level = "trusted"
                 ("update_interval_setting", "default"),
                 ("shutdown_grace_setting", "default"),
             ]);
+            #[cfg(windows)]
+            if codex_app_server_daemon::is_elevated()? {
+                expected_tags.insert("daemon_selection_reason", "elevated_windows");
+            }
             if backend == "daemon" {
                 expected_tags.extend([
                     ("auto_update", "disabled"),
@@ -668,8 +723,42 @@ trust_level = "trusted"
                 ]);
             }
             assert_eq!(tags, expected_tags);
+            let observations = exported
+                .iter()
+                .filter(|metric| metric["name"] == "codex.tui.terminal_size")
+                .flat_map(|metric| metric["sum"]["dataPoints"].as_array().into_iter().flatten())
+                .collect::<Vec<_>>();
+            assert_eq!(observations.len(), 2);
+            for observation in observations {
+                assert_eq!(observation["asInt"], 1);
+                let observation_tags = observation["attributes"]
+                    .as_array()
+                    .context("observation attributes")?
+                    .iter()
+                    .map(|attribute| {
+                        Ok((
+                            attribute["key"].as_str().context("observation key")?,
+                            attribute["value"]["stringValue"]
+                                .as_str()
+                                .context("observation value")?,
+                        ))
+                    })
+                    .collect::<anyhow::Result<HashMap<_, _>>>()?;
+                let reason = observation_tags["observation_reason"];
+                let mut expected = expected_tags.clone();
+                expected.insert("observation_reason", reason);
+                match reason {
+                    "turn_start" => {}
+                    "resize" => {
+                        expected.insert("terminal_columns", "240-479");
+                        expected.insert("terminal_rows", "80-119");
+                    }
+                    other => anyhow::bail!("unexpected observation: {other}"),
+                }
+                assert_eq!(observation_tags, expected);
+            }
         } else {
-            assert!(metrics.is_empty(), "analytics disabled");
+            assert!(metrics.is_empty(), "metrics exporter disabled");
         }
         let (body, checkout, metadata) = observed
             .with_context(|| {
@@ -730,7 +819,7 @@ trust_level = "trusted"
         assert!(context.contains("managed cloud instructions"), "{context}");
         if previous.is_empty() {
             // A legacy summary still says launcher A, but persisted turns use checkout B.
-            let sqlite = codex_state::SqliteConfig::from_sqlite_home(
+            let sqlite = codex_state::SqliteConfig::new_for_testing(
                 codex_utils_absolute_path::AbsolutePathBuf::from_absolute_path(&home)?,
             );
             let db = sqlite.open_read_write_pool(&sqlite.state_db_path()).await?;

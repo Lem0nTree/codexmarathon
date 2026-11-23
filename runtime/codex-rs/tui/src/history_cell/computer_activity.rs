@@ -119,6 +119,14 @@ fn error_preview(call: &McpToolCallCell) -> Option<&str> {
 }
 
 impl HistoryCell for ComputerActivityCell {
+    fn tool_call_labels(&self) -> Vec<String> {
+        self.group
+            .calls
+            .iter()
+            .flat_map(HistoryCell::tool_call_labels)
+            .collect()
+    }
+
     fn append_reasoning(&mut self, cell: Box<dyn HistoryCell>) -> Result<(), Box<dyn HistoryCell>> {
         if self.group.calls.is_empty() {
             Err(cell)
@@ -241,7 +249,10 @@ impl HistoryCell for ComputerActivityCell {
         }
         if hidden > 0 && active.is_none() {
             let summary = preview(
-                &format!("{hidden} more · ctrl+t"),
+                &format!(
+                    "{hidden} more · {}",
+                    crate::key_hint::ctrl(crossterm::event::KeyCode::Char('t')).display_label()
+                ),
                 usize::from(width).saturating_sub(4),
             );
             lines.push(vec!["  └ ".dim(), summary.dim()].into());

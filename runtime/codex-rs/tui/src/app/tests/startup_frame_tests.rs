@@ -21,14 +21,8 @@ async fn owned_startup_hides_tip_in_transcript() -> Result<()> {
     let mut app = crate::app::test_support::make_test_app().await;
     app.local_settings.tui.show_tooltips = true;
     app.local_settings.tui.animations = false;
-    let greeting = Arc::new(std::sync::OnceLock::new());
-    greeting
-        .set(crate::empty_state_animation::Greeting {
-            phrase: "Pull up a prompt.",
-        })
-        .unwrap();
     let session = test_thread_session(ThreadId::new(), app.config.cwd.to_path_buf());
-    let mut session_info = new_session_info(
+    let session_info = new_session_info(
         &app.config,
         &app.local_settings,
         &session.model,
@@ -38,7 +32,6 @@ async fn owned_startup_hides_tip_in_transcript() -> Result<()> {
         Some("Use /mcp to list configured MCP tools.".into()),
         /*auth_plan*/ None,
     );
-    history_cell::set_session_greeting(&mut session_info, &greeting);
     app.transcript_cells = vec![
         Arc::new(session_info),
         Arc::new(AgentMessageCell::new(
@@ -48,6 +41,8 @@ async fn owned_startup_hides_tip_in_transcript() -> Result<()> {
     ];
     let mut tui = crate::tui::test_support::make_test_tui()?;
     tui.set_owned_screen(/*owned*/ true)?;
+    app.chat_widget
+        .set_status_line(Some("GPT-5.6-Sol default · /tmp/project".into()));
     let mut snapshots = Vec::new();
     for width in [80, 32] {
         let size = Size::new(width, /*height*/ 20);
@@ -80,9 +75,8 @@ async fn owned_startup_hides_tip_in_transcript() -> Result<()> {
             .map(ToString::to_string)
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(text.contains("Pull up a prompt."));
         assert!(text.contains("Use /mcp"));
-        assert!(!text.contains("model:"));
+        assert_eq!(text.contains("model:"), mode == HistoryRenderMode::Raw);
         assert!(!text.contains('╭'));
     }
     app.transcript_view.begin_search();
@@ -102,7 +96,8 @@ async fn owned_startup_hides_tip_in_transcript() -> Result<()> {
 async fn owned_startup_preserves_loading_until_resume_replay_is_applied() -> Result<()> {
     for items in [
         Vec::new(),
-        vec![ThreadItem::AgentMessage {
+        vec![ThreadItemPayload::AgentMessage {
+            moderation: None,
             id: "answer".into(),
             text: "Retained **answer** after resume.".into(),
             phase: None,
@@ -114,14 +109,19 @@ async fn owned_startup_preserves_loading_until_resume_replay_is_applied() -> Res
         let (mut app, mut events, _ops) = make_test_app_with_channels().await;
         app.local_settings.tui.show_tooltips = false;
         let mut app_server = crate::start_embedded_app_server_for_picker(&app.config).await?;
+        let backend_id = app_server.backend_id();
         let mut tui = crate::tui::test_support::make_test_tui()?;
         tui.set_owned_screen(/*owned*/ true)?;
         let thread_id = ThreadId::new();
         let mut startup = quiet_startup_test_pump();
-        startup.apply_config(&app.config);
+        startup.apply_settings(
+            &crate::local_settings::LocalSettings::from(&app.config),
+            app.config.cwd.as_path(),
+        );
         startup.update_session_selection(
             &mut tui,
             &SessionSelection::Resume(crate::resume_picker::SessionTarget {
+                backend_id,
                 path: None,
                 thread_id,
                 cwd: None,

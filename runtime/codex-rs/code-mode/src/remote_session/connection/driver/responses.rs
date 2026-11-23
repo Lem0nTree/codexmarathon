@@ -41,6 +41,7 @@ impl ConnectionDriver {
             if !self.start_wait(
                 wait.session,
                 wait.request,
+                wait.max_output_tokens,
                 wait.caller_cancellation,
                 wait.yield_signal,
                 wait.response_tx,
@@ -432,6 +433,7 @@ impl ConnectionDriver {
             HostRequest::Terminate {
                 session_id: session.id.clone(),
                 cell_id: cell_id.clone(),
+                max_output_tokens: None,
             },
             PendingRequest::Terminate {
                 session,

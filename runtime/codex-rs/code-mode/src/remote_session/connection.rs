@@ -5,17 +5,20 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use codex_code_mode_protocol::CellId;
+use codex_code_mode_protocol::CodeModeOutputTruncation;
 use codex_code_mode_protocol::CodeModeSessionCellExecutionLimits;
 use codex_code_mode_protocol::CodeModeSessionDelegate;
-use codex_code_mode_protocol::ExecuteRequest;
+use codex_code_mode_protocol::CodeModeSessionOptions;
 use codex_code_mode_protocol::StartedCell;
+use codex_code_mode_protocol::TerminateRequest;
 use codex_code_mode_protocol::WaitOutcome;
 use codex_code_mode_protocol::WaitRequest;
+use codex_code_mode_protocol::host::BOUNDED_OUTPUT_CAPABILITY;
 use codex_code_mode_protocol::host::Capability;
 use codex_code_mode_protocol::host::CapabilitySet;
 use codex_code_mode_protocol::host::ClientHello;
@@ -24,10 +27,14 @@ use codex_code_mode_protocol::host::EncodedFrame;
 use codex_code_mode_protocol::host::FramedReader;
 use codex_code_mode_protocol::host::FramedWriter;
 use codex_code_mode_protocol::host::HostToClient;
+use codex_code_mode_protocol::host::LARGE_DELEGATE_CAPACITY_CAPABILITY;
+use codex_code_mode_protocol::host::MAX_PENDING_DELEGATE_CALLS;
 use codex_code_mode_protocol::host::ProtocolVersion;
 use codex_code_mode_protocol::host::RequestId;
 use codex_code_mode_protocol::host::SESSION_RESOURCE_LIMITS_CAPABILITY;
 use codex_code_mode_protocol::host::SupportedProtocolVersions;
+use codex_code_mode_protocol::host::TOOL_CATALOG_CAPABILITY;
+use codex_code_mode_protocol::host::WireExecuteRequest;
 use codex_code_mode_protocol::host::YIELD_OBSERVATION_CAPABILITY;
 use codex_protocol::shell_environment::scrub_non_inheritable_env_vars;
 use tokio::io::AsyncBufReadExt;
@@ -54,7 +61,8 @@ use self::reader::drive_reader;
 mod driver;
 mod reader;
 
-const IPC_CHANNEL_CAPACITY: usize = 128;
+// Accommodate a completion burst and concurrent control messages from a full host.
+const IPC_CHANNEL_CAPACITY: usize = MAX_PENDING_DELEGATE_CALLS * 2;
 const LOCAL_HOST_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 // TODO(anp) make this timeout configurable if 60 seconds is insufficient.
 const DEFAULT_HOST_WAIT_TRANSPORT_TIMEOUT: Duration = Duration::from_secs(60);
@@ -209,9 +217,20 @@ impl Connection {
                 .map_err(|error| error.to_string())?;
             let yield_capability =
                 Capability::new(YIELD_OBSERVATION_CAPABILITY).map_err(|error| error.to_string())?;
-            let optional_capabilities =
-                CapabilitySet::try_new([session_limits_capability, yield_capability])
-                    .map_err(|error| error.to_string())?;
+            let output_capability =
+                Capability::new(BOUNDED_OUTPUT_CAPABILITY).map_err(|error| error.to_string())?;
+            let delegate_capacity = Capability::new(LARGE_DELEGATE_CAPACITY_CAPABILITY)
+                .map_err(|error| error.to_string())?;
+            let catalog_capability =
+                Capability::new(TOOL_CATALOG_CAPABILITY).map_err(|error| error.to_string())?;
+            let optional_capabilities = CapabilitySet::try_new([
+                session_limits_capability,
+                yield_capability,
+                output_capability,
+                delegate_capacity,
+                catalog_capability,
+            ])
+            .map_err(|error| error.to_string())?;
             let hello = ClientHello::new(
                 SupportedProtocolVersions::try_new([ProtocolVersion::V1])
                     .map_err(|err| err.to_string())?,
@@ -326,27 +345,42 @@ impl Connection {
         self.alive.load(Ordering::Acquire)
     }
 
+    pub(super) fn supports(&self, capability: &str) -> bool {
+        self.capabilities
+            .iter()
+            .any(|value| value.as_str() == capability)
+    }
+
     pub(super) async fn open_session(
         &self,
         session: RemoteSession,
-        limits: CodeModeSessionCellExecutionLimits,
+        mut options: CodeModeSessionOptions,
+        pinned: &OnceLock<CodeModeOutputTruncation>,
     ) -> Result<SessionCleanup, String> {
-        if limits != CodeModeSessionCellExecutionLimits::default()
-            && !self
-                .capabilities
-                .iter()
-                .any(|capability| capability.as_str() == SESSION_RESOURCE_LIMITS_CAPABILITY)
+        if options.cell_execution_limits != CodeModeSessionCellExecutionLimits::default()
+            && !self.supports(SESSION_RESOURCE_LIMITS_CAPABILITY)
         {
             return Err(format!(
                 "code-mode host does not support session resource limits: missing `{SESSION_RESOURCE_LIMITS_CAPABILITY}` capability"
             ));
         }
+        let pinned_mode = pinned.get().copied();
+        let output_truncation = if self.supports(BOUNDED_OUTPUT_CAPABILITY) {
+            pinned_mode.unwrap_or(options.output_truncation)
+        } else if pinned_mode == Some(CodeModeOutputTruncation::Server) {
+            return Err(
+                "code-mode host cannot preserve server output truncation after reconnect".into(),
+            );
+        } else {
+            CodeModeOutputTruncation::Client
+        };
+        options.output_truncation = output_truncation;
         let cleanup = SessionCleanup::new();
         let cancellation = CallerCancellation::new();
         let (response_tx, response_rx) = oneshot::channel();
         self.send(DriverCommand::OpenSession {
             session,
-            limits,
+            options,
             cleanup: cleanup.clone(),
             caller_cancellation: cancellation.token(),
             response_tx,
@@ -355,13 +389,14 @@ impl Connection {
         let result = self.receive(response_rx).await;
         cancellation.disarm();
         result?;
+        pinned.get_or_init(|| output_truncation);
         Ok(cleanup)
     }
 
     pub(super) async fn execute(
         &self,
         session: RemoteSession,
-        request: ExecuteRequest,
+        request: WireExecuteRequest,
         delegate: Arc<dyn CodeModeSessionDelegate>,
         yield_signal: Option<CancellationToken>,
     ) -> Result<StartedCell, String> {
@@ -424,9 +459,7 @@ impl Connection {
         &self,
         signal: Option<CancellationToken>,
     ) -> Option<CancellationToken> {
-        self.capabilities
-            .iter()
-            .any(|capability| capability.as_str() == YIELD_OBSERVATION_CAPABILITY)
+        self.supports(YIELD_OBSERVATION_CAPABILITY)
             .then_some(signal)
             .flatten()
     }
@@ -434,13 +467,13 @@ impl Connection {
     pub(super) async fn terminate(
         &self,
         session: RemoteSession,
-        cell_id: CellId,
+        request: TerminateRequest,
     ) -> Result<WaitOutcome, String> {
         let (response_tx, response_rx) = oneshot::channel();
         self.with_transport_deadline(Duration::ZERO, "terminate", async {
             self.send(DriverCommand::Terminate {
                 session,
-                cell_id,
+                request,
                 response_tx,
             })
             .await?;

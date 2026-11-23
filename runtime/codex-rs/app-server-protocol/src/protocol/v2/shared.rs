@@ -19,7 +19,6 @@ use schemars::schema::Schema;
 use schemars::schema::SchemaObject;
 use serde::Deserialize;
 use serde::Serialize;
-#[cfg(test)]
 use serde_json::Value as JsonValue;
 
 // Macro to declare a camelCased API v2 enum mirroring a core enum which
@@ -81,7 +80,13 @@ pub enum CodexErrorInfo {
     RateLimitExceeded,
     FlexUnavailable,
     ServerOverloaded,
+    ModelNotFound,
+    // Capacity is unavailable on a route restricted by server policy.
+    PolicyCapacityUnavailable,
+    /// The workspace's inference hook explicitly denied this request.
+    InferenceHookDenied,
     CyberPolicy,
+    BioPolicy,
     MisalignmentPolicyViolation,
     TooManyDenials,
     HttpConnectionFailed {
@@ -119,7 +124,32 @@ pub enum CodexErrorInfo {
         #[ts(rename = "turnKind")]
         turn_kind: NonSteerableTurnKind,
     },
+    #[serde(
+        untagged,
+        serialize_with = "serialize_other_codex_error_info",
+        deserialize_with = "deserialize_other_codex_error_info"
+    )]
+    #[ts(type = "\"other\" | string | { [key: string]: unknown }")]
     Other,
+}
+
+fn serialize_other_codex_error_info<S>(serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_str("other")
+}
+
+fn deserialize_other_codex_error_info<'de, D>(deserializer: D) -> Result<(), D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    match JsonValue::deserialize(deserializer)? {
+        JsonValue::String(_) | JsonValue::Object(_) => Ok(()),
+        _ => Err(serde::de::Error::custom(
+            "expected an error string or object",
+        )),
+    }
 }
 
 impl From<CoreCodexErrorInfo> for CodexErrorInfo {
@@ -131,8 +161,13 @@ impl From<CoreCodexErrorInfo> for CodexErrorInfo {
             CoreCodexErrorInfo::RateLimitExceeded => CodexErrorInfo::RateLimitExceeded,
             CoreCodexErrorInfo::FlexUnavailable => CodexErrorInfo::FlexUnavailable,
             CoreCodexErrorInfo::ServerOverloaded => CodexErrorInfo::ServerOverloaded,
+            CoreCodexErrorInfo::ModelNotFound => CodexErrorInfo::ModelNotFound,
+            CoreCodexErrorInfo::PolicyCapacityUnavailable => {
+                CodexErrorInfo::PolicyCapacityUnavailable
+            }
             CoreCodexErrorInfo::CyberPolicy => CodexErrorInfo::CyberPolicy,
-            CoreCodexErrorInfo::BioPolicy => CodexErrorInfo::Other,
+            CoreCodexErrorInfo::InferenceHookDenied => CodexErrorInfo::InferenceHookDenied,
+            CoreCodexErrorInfo::BioPolicy => CodexErrorInfo::BioPolicy,
             CoreCodexErrorInfo::MisalignmentPolicyViolation => {
                 CodexErrorInfo::MisalignmentPolicyViolation
             }

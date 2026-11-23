@@ -1,11 +1,15 @@
-use std::io;
+use std::sync::Arc;
+use std::sync::Weak;
 
 use codex_code_mode_protocol::grpc::code_mode_host_client::CodeModeHostClient;
 use codex_code_mode_protocol::host::MAX_FRAME_BYTES;
 use codex_http_client::ClientRouteClass;
 use codex_http_client::HttpClientFactory;
 use http_body_util::BodyExt;
+use reqwest::StatusCode;
+use tonic::Status;
 use tonic::body::Body;
+use tonic::codegen::Bytes;
 use tonic::codegen::http::Request;
 use tonic::codegen::http::Response;
 use tonic::codegen::http::Uri;
@@ -16,16 +20,17 @@ use tower::service_fn;
 use tower::util::BoxCloneSyncService;
 
 use super::GrpcClient;
+use super::SessionAdmission;
 
-pub(super) type GrpcTransport = BoxCloneSyncService<Request<Body>, Response<Body>, io::Error>;
+pub(super) type GrpcTransport = BoxCloneSyncService<Request<Body>, Response<Body>, Status>;
 
 pub(super) enum SharedTransport {
     Url {
         endpoint: String,
         http_client_factory: HttpClientFactory,
-        client: tokio::sync::Mutex<Option<(HttpClientFactory, GrpcClient)>>,
+        client: tokio::sync::Mutex<Option<(HttpClientFactory, Weak<GrpcClient>)>>,
     },
-    Connected(GrpcClient),
+    Connected(Arc<GrpcClient>),
 }
 
 impl SharedTransport {
@@ -38,15 +43,25 @@ impl SharedTransport {
     }
 
     pub(super) fn with_channel(channel: Channel) -> Self {
-        let transport = channel.map_err(io::Error::other);
-        Self::Connected(
+        let transport = channel.map_err(|error| Status::from_error(Box::new(error)));
+        Self::Connected(Arc::new(
             CodeModeHostClient::new(BoxCloneSyncService::new(transport))
+                .accept_compressed(tonic::codec::CompressionEncoding::Zstd)
                 .max_decoding_message_size(MAX_FRAME_BYTES)
                 .max_encoding_message_size(MAX_FRAME_BYTES),
-        )
+        ))
     }
 
-    pub(super) async fn client(&self) -> Result<GrpcClient, String> {
+    pub(super) fn with_transport(transport: GrpcTransport) -> Self {
+        Self::Connected(Arc::new(
+            CodeModeHostClient::new(transport)
+                .accept_compressed(tonic::codec::CompressionEncoding::Zstd)
+                .max_decoding_message_size(MAX_FRAME_BYTES)
+                .max_encoding_message_size(MAX_FRAME_BYTES),
+        ))
+    }
+
+    pub(super) async fn client(&self) -> Result<Arc<GrpcClient>, String> {
         let (endpoint, http_client_factory, client) = match self {
             Self::Url {
                 endpoint,
@@ -64,14 +79,15 @@ impl SharedTransport {
         let mut cached = client.lock().await;
         if let Some((factory, client)) = cached.as_ref()
             && factory == &bound_factory
+            && let Some(client) = client.upgrade()
         {
-            return Ok(client.clone());
+            return Ok(client);
         }
         let client = if endpoint.starts_with("unix:") {
             let channel = Endpoint::from_shared(endpoint.clone())
                 .map_err(|error| format!("invalid gRPC code-mode Unix socket endpoint: {error}"))?
                 .connect_lazy();
-            let transport = channel.map_err(io::Error::other);
+            let transport = channel.map_err(|error| Status::from_error(Box::new(error)));
             CodeModeHostClient::new(BoxCloneSyncService::new(transport))
         } else {
             let target = reqwest::Url::parse(endpoint)
@@ -96,29 +112,58 @@ impl SharedTransport {
                 ClientRouteClass::Other,
                 codex_http_client::HttpClientBuilder::new()
                     .without_request_logging()
+                    // Some hosts assign a worker per connection. A quiet session
+                    // must still reach the worker holding its open lease.
+                    .without_pool_idle_timeout()
                     .http2_prior_knowledge()
                     .without_redirects(),
             );
             let transport = service_fn(move |request: Request<Body>| {
                 let client = client.clone();
                 async move {
+                    let admission = request.extensions().get::<SessionAdmission>().is_some();
                     let request =
                         request.map(|body| reqwest::Body::wrap_stream(body.into_data_stream()));
-                    let request = reqwest::Request::try_from(request).map_err(io::Error::other)?;
+                    let request = reqwest::Request::try_from(request)
+                        .map_err(|error| Status::invalid_argument(error.to_string()))?;
                     let response = client
                         .execute(request)
                         .await
-                        .map_err(io::Error::other)?
+                        .map_err(|error| {
+                            // Sending can fail on DNS or a reset connection before
+                            // headers arrive. Keep these distinct from RPC errors.
+                            let mut status = if matches!(
+                                &error,
+                                codex_http_client::HttpError::Request(error)
+                                    if error.is_connect() || error.is_request()
+                            ) {
+                                Status::unavailable(error.to_string())
+                            } else {
+                                Status::unknown(error.to_string())
+                            };
+                            status.set_source(Arc::new(error));
+                            status
+                        })?
                         .into_http_response();
-                    Ok::<_, io::Error>(response.map(Body::new))
+                    if admission && response.status() == StatusCode::SERVICE_UNAVAILABLE {
+                        // A 503 cannot grant a lease. Leave headers and trailers for tonic
+                        // to read the gRPC status, or infer Unavailable when it is absent.
+                        return Ok(response.map(|body| {
+                            Body::new(body.map_frame(|frame| frame.map_data(|_| Bytes::new())))
+                        }));
+                    }
+                    Ok::<_, Status>(response.map(Body::new))
                 }
             });
             CodeModeHostClient::with_origin(BoxCloneSyncService::new(transport), origin)
         };
         let client = client
+            .accept_compressed(tonic::codec::CompressionEncoding::Zstd)
             .max_decoding_message_size(MAX_FRAME_BYTES)
             .max_encoding_message_size(MAX_FRAME_BYTES);
-        *cached = Some((bound_factory, client.clone()));
+        // Let the last session release its worker even if the provider stays alive.
+        let client = Arc::new(client);
+        *cached = Some((bound_factory, Arc::downgrade(&client)));
         Ok(client)
     }
 }

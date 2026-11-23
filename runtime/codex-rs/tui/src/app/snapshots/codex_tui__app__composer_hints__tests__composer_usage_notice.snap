@@ -50,7 +50,7 @@ Conversation
 › draft stays
 
   GPT-5.6-Sol def…
-  tab to queue mes
+  tab to queue
 
 80 columns, 18 rows, running=true, queued=true
 Conversation row 18
@@ -63,7 +63,7 @@ Conversation row 19
 
 • Queued follow-up inputs
   ↳ queued follow-up
-    shift+← edit last queued message
+    ⇧← edit last queued message
                                              ⚠ 5h limit: only 2% left · /status
 
 › draft stays
@@ -77,7 +77,7 @@ Conversation row 19
 
 • Queued follow-up inputs
   ↳ queued follow-up
-    shift+← edit last queued message
+    ⇧← edit last queued message
 
 › draft stays
   second line

@@ -10,6 +10,10 @@ use tokio::sync::watch;
 pub(crate) enum AccountNotification {
     LoginCompleted(AccountLoginCompletedNotification),
     Updated(AccountUpdatedNotification),
+    RecoveryAuthChanged {
+        payload: codex_app_server_protocol::CodexMarathonRecoveryAuthChangedNotification,
+        expected: AuthChangeState,
+    },
 }
 
 impl OutgoingMessageSender {
@@ -32,6 +36,15 @@ impl OutgoingMessageSender {
                     payload.error = Some("account changed before sign-in completed".into());
                 }
                 ServerNotification::AccountLoginCompleted(payload)
+            }
+            AccountNotification::RecoveryAuthChanged { payload, expected } => {
+                if current_auth.owner_generation != expected.owner_generation
+                    || current_auth.source_generation != expected.source_generation
+                    || current_auth.login_generation != expected.login_generation
+                {
+                    return;
+                }
+                ServerNotification::CodexMarathonRecoveryAuthChanged(payload)
             }
             AccountNotification::Updated(payload) => {
                 if current_auth.owner_generation != owner_generation {

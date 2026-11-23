@@ -3,6 +3,7 @@
 use super::*;
 use crate::permission_discovery::PermissionDiscovery;
 use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_DANGER_FULL_ACCESS;
+use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_WORKSPACE;
 
 pub(super) fn permission_preset_description(preset: &ApprovalPreset) -> &'static str {
     match preset.id {
@@ -49,29 +50,99 @@ pub(crate) fn cyber_model_approval_reviewer(config: &Config) -> Option<Approvals
 }
 
 impl ChatWidget {
-    pub(super) fn permission_mode_disabled_reason(
-        &self,
-        preset: &ApprovalPreset,
-        approval_policy: AskForApproval,
-    ) -> Option<String> {
-        self.config
-            .permissions
-            .approval_policy
-            .can_set(&approval_policy.to_core())
-            .and_then(|()| {
-                self.config
-                    .permissions
-                    .can_set_permission_profile(&preset.permission_profile)
-            })
-            .err()
-            .map(|err| err.to_string())
-            .or_else(|| {
-                (!self.config.is_permission_profile_allowed(
-                    &preset.active_permission_profile.id,
-                    &preset.permission_profile,
-                ))
-                .then(|| "Disabled by requirements".to_string())
-            })
+    pub(super) fn try_select_permission_profile(
+        &mut self,
+        discovery: &PermissionDiscovery,
+        profile_id: &str,
+        requested_approval_policy: Option<AskForApproval>,
+        requested_reviewer: Option<ApprovalsReviewer>,
+    ) -> bool {
+        let reviewer = match profile_id {
+            ":approve-for-me" if !self.config.features.enabled(Feature::GuardianApproval) => {
+                self.add_error_message(
+                    "Approve for me is unavailable. Run `/permissions` to see available profiles."
+                        .into(),
+                );
+                return false;
+            }
+            ":approve-for-me" => ApprovalsReviewer::AutoReview,
+            _ => ApprovalsReviewer::User,
+        };
+        let profile_id = match profile_id {
+            ":ask-for-approval" | ":approve-for-me" => BUILT_IN_PERMISSION_PROFILE_WORKSPACE,
+            id => id,
+        };
+        let Some(profile) = discovery
+            .profiles
+            .iter()
+            .find(|profile| profile.id == profile_id)
+        else {
+            self.add_error_message(format!(
+                "Unknown permission profile `{profile_id}`. Run `/permissions` to see available profiles."
+            ));
+            return false;
+        };
+        let preset = builtin_approval_presets()
+            .into_iter()
+            .find(|preset| preset.active_permission_profile.id == profile_id);
+        let approval_policy = requested_approval_policy.or_else(|| {
+            preset
+                .as_ref()
+                .map(|preset| AskForApproval::from(preset.approval))
+        });
+        let approvals_reviewer = requested_reviewer.or_else(|| preset.as_ref().map(|_| reviewer));
+        if approvals_reviewer == Some(ApprovalsReviewer::AutoReview)
+            && !self.config.features.enabled(Feature::GuardianApproval)
+        {
+            self.add_error_message(
+                "Approve for me is unavailable. Run `/permissions` to see available profiles."
+                    .into(),
+            );
+            return false;
+        }
+        if let Some(reason) = discovery.disabled_reason(
+            profile_id,
+            approval_policy,
+            approvals_reviewer.map(Into::into),
+        ) {
+            self.add_error_message(format!(
+                "Permission profile `{profile_id}` is unavailable: {reason}."
+            ));
+            return false;
+        }
+        let display_label = preset.as_ref().map_or(profile.id.as_str(), |preset| {
+            match (preset.id, approvals_reviewer) {
+                ("auto", Some(ApprovalsReviewer::AutoReview)) => APPROVE_FOR_ME_LABEL,
+                ("auto", _) => ASK_FOR_APPROVAL_LABEL,
+                _ => preset.label,
+            }
+        });
+        let selection = PermissionProfileSelection {
+            profile_id: profile_id.to_string(),
+            approval_policy,
+            approvals_reviewer,
+            display_label: display_label.to_string(),
+        };
+        if let Some(preset) = preset {
+            let Some(action) = self
+                .permission_mode_actions(
+                    &preset,
+                    display_label.to_string(),
+                    approvals_reviewer.unwrap_or(reviewer),
+                    /*profile_selection*/ Some(selection),
+                    /*return_to_permissions*/ true,
+                )
+                .into_iter()
+                .next()
+            else {
+                return false;
+            };
+            action(&self.app_event_tx);
+            return true;
+        }
+        self.app_event_tx
+            .send(AppEvent::SelectPermissionProfile(selection));
+        true
     }
 
     pub(super) fn open_permission_profiles_popup(&mut self, discovery: PermissionDiscovery) {
@@ -215,8 +286,17 @@ impl ChatWidget {
         SelectionItem {
             name: label.to_string(),
             description: Some(description),
-            is_current: active_profile_id.as_deref() == Some(id)
-                && current_approval == approval_policy
+            is_current: active_profile_id.as_deref().map_or_else(
+                || {
+                    Self::preset_matches_current(
+                        current_approval,
+                        self.config.permissions.permission_profile(),
+                        self.config.cwd.as_path(),
+                        preset,
+                    )
+                },
+                |active| active == id,
+            ) && current_approval == approval_policy
                 && current_reviewer == approvals_reviewer,
             actions: self.permission_mode_actions(
                 preset,
@@ -226,9 +306,11 @@ impl ChatWidget {
                 /*return_to_permissions*/ true,
             ),
             dismiss_on_select: true,
-            disabled_reason: discovery
-                .disabled_reason(id, Some(approval_policy), Some(approvals_reviewer.into()))
-                .or_else(|| self.permission_mode_disabled_reason(preset, approval_policy)),
+            disabled_reason: discovery.disabled_reason(
+                id,
+                Some(approval_policy),
+                Some(approvals_reviewer.into()),
+            ),
             ..Default::default()
         }
     }

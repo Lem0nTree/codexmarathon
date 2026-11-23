@@ -10,6 +10,8 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 
 use serde_json::Value;
+#[cfg(test)]
+use tokio::sync::oneshot;
 use tokio::sync::watch;
 use tokio_util::task::AbortOnDropHandle;
 
@@ -27,10 +29,12 @@ use crate::sandbox_tags::SandboxTags;
 use crate::sandbox_tags::record_policy_metadata;
 use crate::session::step_settings::ResolvedStepSettings;
 use codex_file_system::WindowsSandboxSelection;
+use codex_git_utils::GitHeadState;
+use codex_git_utils::GitWorktreeStatus;
 use codex_git_utils::SanitizedGitUrl;
-use codex_git_utils::get_git_remote_urls_assume_git_repo;
-use codex_git_utils::get_has_changes_in_repo;
-use codex_git_utils::get_head_commit_hash;
+use codex_git_utils::get_head_state;
+use codex_git_utils::get_worktree_status_in_repo;
+use codex_git_utils::observe_git_remote_urls;
 use codex_protocol::AgentPath;
 use codex_protocol::ThreadId;
 use codex_protocol::models::PermissionProfile;
@@ -38,8 +42,11 @@ use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::ThreadSource;
+use codex_protocol::turn_input::ResponsesApiClientMetadataUpdate;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_git_discovery::GitRootDiscovery;
+use futures::FutureExt;
+use futures::future::FusedFuture;
 
 // Memory requests await this optional metadata before sending their model request.
 const MEMORY_GIT_METADATA_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
@@ -49,6 +56,10 @@ const CODEX_VERSION_KEY: &str = "codex_version";
 const REASONING_EFFORT_KEY: &str = "reasoning_effort";
 const USER_INPUT_REQUESTED_DURING_TURN_KEY: &str = "user_input_requested_during_turn";
 const WORKSPACE_KIND_KEY: &str = "workspace_kind";
+
+fn is_targeted_continuation(value: &str) -> bool {
+    serde_json::from_str::<Value>(value).is_ok_and(|value| value.get("review_target").is_some())
+}
 
 /// Captured execution settings shared by Responses and MCP metadata.
 pub(crate) struct ExecutionMetadata<'a> {
@@ -90,31 +101,6 @@ impl<'a> ExecutionMetadata<'a> {
             None => {
                 metadata.extra.remove(REASONING_EFFORT_KEY);
             }
-        }
-    }
-}
-
-#[derive(Clone, Debug, Default)]
-struct WorkspaceGitMetadata {
-    associated_remote_urls: Option<BTreeMap<String, SanitizedGitUrl>>,
-    latest_git_commit_hash: Option<String>,
-    has_changes: Option<bool>,
-}
-
-impl WorkspaceGitMetadata {
-    fn is_empty(&self) -> bool {
-        self.associated_remote_urls.is_none()
-            && self.latest_git_commit_hash.is_none()
-            && self.has_changes.is_none()
-    }
-}
-
-impl From<WorkspaceGitMetadata> for TurnMetadataWorkspace {
-    fn from(value: WorkspaceGitMetadata) -> Self {
-        Self {
-            associated_remote_urls: value.associated_remote_urls,
-            latest_git_commit_hash: value.latest_git_commit_hash,
-            has_changes: value.has_changes,
         }
     }
 }
@@ -272,9 +258,33 @@ impl TurnMetadataState {
         &self,
         execution: ExecutionMetadata<'_>,
     ) -> Option<serde_json::Value> {
-        let mut responses_metadata = self.mcp_metadata_template();
+        self.current_meta_value_for_tool_request(self.mcp_metadata_template(), execution)
+    }
+
+    pub(crate) fn current_meta_value_for_extension_request(
+        &self,
+        execution: ExecutionMetadata<'_>,
+    ) -> Option<serde_json::Value> {
+        // Native extensions need configured Responses metadata for request attribution,
+        // which the MCP template omits for external servers.
+        self.current_meta_value_for_tool_request(self.responses_metadata_template(), execution)
+    }
+
+    fn current_meta_value_for_tool_request(
+        &self,
+        mut responses_metadata: CodexResponsesMetadata,
+        execution: ExecutionMetadata<'_>,
+    ) -> Option<serde_json::Value> {
+        if responses_metadata
+            .extra
+            .get("misalignment_override")
+            .is_some_and(|value| is_targeted_continuation(value))
+        {
+            // A review target is for Responses admission, not external tools or hooks.
+            responses_metadata.extra.remove("misalignment_override");
+        }
         execution.apply_to(&mut responses_metadata);
-        // Never serialize harness-owned tool inventory for external MCP servers.
+        // Never serialize harness-owned tool inventory for tool requests.
         responses_metadata.tool_namespaces_info = None;
         let Value::Object(mut metadata) = responses_metadata.turn_metadata_value()? else {
             return None;
@@ -306,11 +316,22 @@ impl TurnMetadataState {
         window_id: String,
         request_kind: CodexResponsesRequestKind,
     ) -> CodexResponsesMetadata {
+        let mut metadata = self.responses_metadata_template();
+        if matches!(request_kind, CodexResponsesRequestKind::Compaction(_))
+            && metadata
+                .extra
+                .get("misalignment_override")
+                .is_some_and(|value| is_targeted_continuation(value))
+        {
+            // Target-based intent belongs to the pending turn, not compaction. Preserve the
+            // legacy timestamp path until servers can admit pre-turn compaction separately.
+            metadata.extra.remove("misalignment_override");
+        }
         CodexResponsesMetadata {
             installation_id,
             window_id,
             request_kind: Some(request_kind),
-            ..self.responses_metadata_template()
+            ..metadata
         }
     }
 
@@ -360,26 +381,67 @@ impl TurnMetadataState {
         self.root_turn_id.get().cloned()
     }
 
-    pub(crate) fn set_responsesapi_client_metadata(
+    pub(crate) fn apply_start_responsesapi_client_metadata(
         &self,
-        responsesapi_client_metadata: HashMap<String, String>,
+        update: ResponsesApiClientMetadataUpdate,
     ) {
-        *self
+        self.update_responsesapi_client_metadata(update);
+    }
+
+    /// Capture client attribution without carrying the parent's review or routing intent.
+    pub(crate) fn client_metadata_for_child(&self) -> HashMap<String, String> {
+        self.responsesapi_client_metadata
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|(key, _)| {
+                !matches!(
+                    key.as_str(),
+                    "misalignment_override" | "parent_response_id" | "mcp_request_meta"
+                )
+            })
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect()
+    }
+
+    pub(crate) fn update_responsesapi_client_metadata(
+        &self,
+        update: ResponsesApiClientMetadataUpdate,
+    ) {
+        let replacement = update.replacement.map(filter_extra_metadata);
+        let patch = update.patch.map(filter_extra_metadata).unwrap_or_default();
+        if replacement.is_none() && patch.is_empty() {
+            return;
+        }
+        let mut current = self
             .responsesapi_client_metadata
             .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            filter_extra_metadata(responsesapi_client_metadata);
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let continuation = current
+            .get("misalignment_override")
+            .filter(|value| is_targeted_continuation(value))
+            .cloned();
+        if let Some(replacement) = replacement {
+            *current = replacement;
+        }
+        current.extend(patch);
+        if let Some(continuation) = continuation {
+            // Steering may update other metadata, but cannot replace the reviewed block.
+            current.insert("misalignment_override".to_string(), continuation);
+        }
     }
 
     pub(crate) fn set_responses_api_metadata(
         &self,
         responses_api_metadata: BTreeMap<String, String>,
     ) {
+        let mut metadata = filter_extra_metadata(responses_api_metadata);
+        // Only explicit per-turn metadata can acknowledge a reviewed block.
+        metadata.remove("misalignment_override");
         *self
             .responses_api_metadata
             .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            filter_extra_metadata(responses_api_metadata);
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = metadata;
     }
 
     pub(crate) fn workspace_kind(&self) -> Option<String> {
@@ -528,40 +590,108 @@ impl TurnMetadataState {
     }
 }
 
-async fn memory_workspaces(
-    cwd: &AbsolutePathBuf,
-    repo_root: impl Future<Output = Option<PathBuf>>,
-) -> BTreeMap<String, TurnMetadataWorkspace> {
-    tokio::time::timeout(MEMORY_GIT_METADATA_TIMEOUT, git_workspaces(cwd, repo_root))
-        .await
-        .unwrap_or_default()
-}
-
 async fn git_workspaces(
     cwd: &AbsolutePathBuf,
     repo_root: impl Future<Output = Option<PathBuf>>,
 ) -> BTreeMap<String, TurnMetadataWorkspace> {
-    let Some(repo_root) = repo_root.await else {
-        return BTreeMap::new();
-    };
-    let (head_commit_hash, associated_remote_urls, has_changes) = tokio::join!(
-        get_head_commit_hash(cwd),
-        get_git_remote_urls_assume_git_repo(cwd),
-        get_has_changes_in_repo(cwd, &repo_root),
-    );
-    let workspace_git_metadata = WorkspaceGitMetadata {
-        associated_remote_urls,
-        latest_git_commit_hash: head_commit_hash.map(|sha| sha.0),
-        has_changes,
-    };
     let mut workspaces = BTreeMap::new();
-    if !workspace_git_metadata.is_empty() {
-        workspaces.insert(
-            repo_root.to_string_lossy().into_owned(),
-            workspace_git_metadata.into(),
-        );
-    }
+    collect_git_workspaces(cwd, repo_root, |observed| workspaces = observed).await;
     workspaces
+}
+
+async fn memory_workspaces(
+    cwd: &AbsolutePathBuf,
+    repo_root: impl Future<Output = Option<PathBuf>>,
+) -> BTreeMap<String, TurnMetadataWorkspace> {
+    let mut workspaces = BTreeMap::new();
+    let collect = collect_git_workspaces(cwd, repo_root, |observed| workspaces = observed);
+    let _ = tokio::time::timeout(MEMORY_GIT_METADATA_TIMEOUT, collect).await;
+    workspaces
+}
+
+async fn collect_git_workspaces(
+    cwd: &AbsolutePathBuf,
+    repo_root: impl Future<Output = Option<PathBuf>>,
+    mut publish: impl FnMut(BTreeMap<String, TurnMetadataWorkspace>),
+) {
+    let Some(repo_root) = repo_root.await else {
+        return;
+    };
+    collect_workspace_git_metadata(
+        get_head_state(cwd),
+        |updates| async move { observe_git_remote_urls(cwd, &updates).await },
+        get_worktree_status_in_repo(cwd, &repo_root),
+        |workspace| {
+            publish(BTreeMap::from([(
+                repo_root.to_string_lossy().into_owned(),
+                workspace,
+            )]));
+        },
+    )
+    .await;
+}
+
+async fn collect_workspace_git_metadata<R: Future<Output = ()>>(
+    head: impl Future<Output = GitHeadState>,
+    collect_remotes: impl FnOnce(watch::Sender<BTreeMap<String, SanitizedGitUrl>>) -> R,
+    status: impl Future<Output = Option<GitWorktreeStatus>>,
+    mut publish: impl FnMut(TurnMetadataWorkspace),
+) {
+    let (updates, mut remotes) = watch::channel(BTreeMap::new());
+    let observe = async {
+        let mut head = std::pin::pin!(head.fuse());
+        let mut status = std::pin::pin!(status.fuse());
+        let mut head_state = GitHeadState::Unavailable;
+        let mut observed_status = None;
+        let mut latest_git_commit_hash = None;
+        let mut has_changes = None;
+        let mut observed_remote_urls = false;
+        loop {
+            let mut changed = tokio::select! {
+                result = &mut head, if !head.is_terminated() => {
+                    head_state = result;
+                    if let GitHeadState::Commit(sha) = &head_state {
+                        latest_git_commit_hash = Some(sha.0.clone());
+                    }
+                    latest_git_commit_hash.is_some()
+                }
+                Ok(()) = remotes.changed() => {
+                    observed_remote_urls = true;
+                    true
+                }
+                result = &mut status, if !status.is_terminated() => {
+                    observed_status = result;
+                    false
+                }
+                else => break,
+            };
+            // A shared scan can be stale. Use its HEAD and status together when
+            // the independent lookup failed, but reject a conflicting known HEAD.
+            if head.is_terminated()
+                && let Some(observed) = observed_status.take()
+            {
+                let matches_head = match &head_state {
+                    GitHeadState::Commit(sha) => observed.head_commit_hash.as_ref() == Some(sha),
+                    GitHeadState::Missing => observed.head_commit_hash.is_none(),
+                    GitHeadState::Unavailable => true,
+                };
+                if matches_head {
+                    latest_git_commit_hash = observed.head_commit_hash.map(|sha| sha.0);
+                    has_changes = Some(observed.has_changes);
+                    changed = true;
+                }
+            }
+            if changed {
+                publish(TurnMetadataWorkspace {
+                    associated_remote_urls: observed_remote_urls
+                        .then(|| remotes.borrow_and_update().clone()),
+                    latest_git_commit_hash: latest_git_commit_hash.clone(),
+                    has_changes,
+                });
+            }
+        }
+    };
+    tokio::join!(collect_remotes(updates), observe);
 }
 
 #[cfg(test)]

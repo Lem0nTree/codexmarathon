@@ -71,12 +71,17 @@ pub(crate) struct MarathonService {
     thread_manager: Arc<ThreadManager>,
     running_turns: watch::Receiver<usize>,
     transition_mutex: Arc<Mutex<()>>,
+    admission: crate::turn_admission::TurnAdmission,
+    recovery_bridge: Option<Arc<crate::codexmarathon_bridge::CodexMarathonRecoveryBridge>>,
+    account_processor:
+        Option<Arc<crate::request_processors::account_processor::AccountRequestProcessor>>,
     registry: Arc<FileAccountRegistry>,
     vault: Arc<FileSnapshotVault>,
     codex_home: std::path::PathBuf,
     auto_reset: Arc<AutoResetStore>,
     quota_store: Arc<QuotaSnapshotStore>,
     auth_generation: AtomicU64,
+    observed_auth_owner: StdMutex<codex_login::AuthChangeState>,
     quota_by_account: StdMutex<std::collections::BTreeMap<String, CachedQuota>>,
     auto_failover_in_flight: AtomicBool,
 }
@@ -87,22 +92,32 @@ impl MarathonService {
         thread_manager: Arc<ThreadManager>,
         running_turns: watch::Receiver<usize>,
         transition_mutex: Arc<Mutex<()>>,
+        admission: crate::turn_admission::TurnAdmission,
+        recovery_bridge: Arc<crate::codexmarathon_bridge::CodexMarathonRecoveryBridge>,
+        account_processor: Arc<
+            crate::request_processors::account_processor::AccountRequestProcessor,
+        >,
         config: &MarathonConfig,
     ) -> Result<Self, MarathonServiceError> {
         config
             .validate()
             .map_err(|_| MarathonServiceError::StateUnavailable)?;
+        let initial_auth_owner = *auth_manager.auth_change_state_receiver().borrow();
         Ok(Self {
             auth_manager,
             thread_manager,
             running_turns,
             transition_mutex,
+            admission,
+            recovery_bridge: Some(recovery_bridge),
+            account_processor: Some(account_processor),
             registry: Arc::new(FileAccountRegistry::new(config.registry_path())),
             vault: Arc::new(FileSnapshotVault::new(config.vault_dir())),
             codex_home: config.codex_home().to_path_buf(),
             auto_reset: Arc::new(AutoResetStore::new(config.auto_reset_state_path())),
             quota_store: Arc::new(QuotaSnapshotStore::new(config.quota_db_path())),
             auth_generation: AtomicU64::new(1),
+            observed_auth_owner: StdMutex::new(initial_auth_owner),
             quota_by_account: StdMutex::new(std::collections::BTreeMap::new()),
             auto_failover_in_flight: AtomicBool::new(false),
         })
@@ -117,11 +132,15 @@ impl MarathonService {
         registry: Arc<FileAccountRegistry>,
         vault: Arc<FileSnapshotVault>,
     ) -> Self {
+        let initial_auth_owner = *auth_manager.auth_change_state_receiver().borrow();
         Self {
             auth_manager,
             thread_manager,
             running_turns,
             transition_mutex,
+            admission: crate::turn_admission::TurnAdmission::default(),
+            recovery_bridge: None,
+            account_processor: None,
             registry: Arc::clone(&registry),
             vault,
             codex_home: registry
@@ -145,8 +164,117 @@ impl MarathonService {
                     .join("quota.sqlite"),
             )),
             auth_generation: AtomicU64::new(1),
+            observed_auth_owner: StdMutex::new(initial_auth_owner),
             quota_by_account: StdMutex::new(std::collections::BTreeMap::new()),
             auto_failover_in_flight: AtomicBool::new(false),
+        }
+    }
+
+    /// Coalesce native owner/source changes into the service generation, even
+    /// when the change came from Codex's workspace or login flows.
+    fn synchronize_auth_generation(&self) -> Result<u64, MarathonServiceError> {
+        let mut observed = self
+            .observed_auth_owner
+            .lock()
+            .map_err(|_| MarathonServiceError::StateUnavailable)?;
+        let current = *self.auth_manager.auth_change_state_receiver().borrow();
+        if current.owner_generation != observed.owner_generation
+            || current.source_generation != observed.source_generation
+            || current.login_generation != observed.login_generation
+        {
+            *observed = current;
+            return Ok(self.auth_generation.fetch_add(1, Ordering::AcqRel) + 1);
+        }
+        Ok(self.auth_generation.load(Ordering::Acquire))
+    }
+
+    /// Keep an existing registry's active marker aligned with native login and
+    /// workspace changes without creating Marathon state for nonusers.
+    pub(crate) fn start_native_owner_reconciliation(self: &Arc<Self>) {
+        let weak = Arc::downgrade(self);
+        let mut changes = self.auth_manager.auth_change_state_receiver();
+        tokio::spawn(async move {
+            let mut retry = tokio::time::interval(std::time::Duration::from_secs(30));
+            loop {
+                let Some(service) = weak.upgrade() else {
+                    break;
+                };
+                if let Err(error) = service.reconcile_existing_registry().await {
+                    tracing::warn!(%error, "could not reconcile Marathon active account");
+                }
+                drop(service);
+                tokio::select! {
+                    result = changes.changed() => if result.is_err() { break; },
+                    _ = retry.tick() => {},
+                }
+            }
+        });
+    }
+
+    async fn reconcile_existing_registry(&self) -> Result<(), MarathonServiceError> {
+        if !self
+            .registry
+            .path()
+            .try_exists()
+            .map_err(|_| MarathonServiceError::Persistence)?
+        {
+            return Ok(());
+        }
+        let _guard = self.transition_mutex.lock().await;
+        let generation = self.synchronize_auth_generation()?;
+        let expected = *self.auth_manager.auth_change_state_receiver().borrow();
+        let current = self
+            .auth_manager
+            .auth_cached()
+            .and_then(|auth| auth.get_account_id());
+        let lock = self
+            .registry
+            .lock_exclusive()
+            .map_err(|_| MarathonServiceError::Persistence)?;
+        if !self
+            .registry
+            .path()
+            .try_exists()
+            .map_err(|_| MarathonServiceError::Persistence)?
+        {
+            return Ok(());
+        }
+        let mut state = self
+            .registry
+            .state_locked(&lock)
+            .map_err(|_| MarathonServiceError::StateUnavailable)?;
+        let desired = current
+            .filter(|id| state.accounts.contains_key(id))
+            .unwrap_or_default();
+        if state.active_account_id == desired {
+            return Ok(());
+        }
+        let after = *self.auth_manager.auth_change_state_receiver().borrow();
+        if after.owner_generation != expected.owner_generation
+            || after.source_generation != expected.source_generation
+            || after.login_generation != expected.login_generation
+            || self.synchronize_auth_generation()? != generation
+        {
+            return Err(MarathonServiceError::NativeTransition);
+        }
+        state.active_account_id = desired;
+        self.auth_manager
+            .with_auth_owner_unchanged(expected, || {
+                self.registry
+                    .replace_locked(&lock, state)
+                    .map_err(|_| std::io::Error::other("Marathon registry update failed"))
+            })
+            .map_err(|_| MarathonServiceError::NativeTransition)
+    }
+
+    pub(crate) fn record_usage_limit(&self, thread_id: &str, turn_id: &str) {
+        if let Some(bridge) = &self.recovery_bridge {
+            let owner = self
+                .auth_manager
+                .auth_change_state_receiver()
+                .borrow()
+                .owner_generation;
+            bridge.record_usage_limit(thread_id, turn_id, owner);
         }
     }
 
@@ -260,6 +388,7 @@ impl MarathonService {
             .auth_manager
             .auth_cached()
             .and_then(|auth| auth.get_account_id());
+        let auth_generation = self.synchronize_auth_generation()?;
         let active_turn_count = (*self.running_turns.borrow()).min(u32::MAX as usize) as u32;
         let now = chrono::Utc::now();
         let quotas = self.quota_by_account.lock().ok();
@@ -276,7 +405,7 @@ impl MarathonService {
                 MarathonAccount {
                     account_id: account.id.clone(),
                     alias: account.alias.clone(),
-                    active: state.active_account_id == account.id,
+                    active: current_account_id.as_deref() == Some(account.id.as_str()),
                     credential_present,
                     credential_health: credential_health_label(account.credential_health),
                     weekly_quota_remaining_percent: quotas
@@ -298,10 +427,12 @@ impl MarathonService {
             .map_err(|_| MarathonServiceError::StateUnavailable)?;
         Ok(MarathonStatusResponse {
             enabled: state.enabled,
-            active_account_id: (!state.active_account_id.is_empty())
-                .then_some(state.active_account_id),
+            active_account_id: current_account_id
+                .as_ref()
+                .filter(|id| state.accounts.contains_key(*id))
+                .cloned(),
             current_account_id,
-            auth_generation: self.auth_generation.load(Ordering::Acquire),
+            auth_generation,
             active_turn_count,
             accounts,
             auto_reset_expiry: None,
@@ -390,6 +521,8 @@ impl MarathonService {
             .registry
             .state_locked(&state_lock)
             .map_err(|_| MarathonServiceError::StateUnavailable)?;
+        let owner = *self.auth_manager.auth_change_state_receiver().borrow();
+        let generation = self.synchronize_auth_generation()?;
         let current_account_id = self
             .auth_manager
             .auth_cached()
@@ -426,22 +559,29 @@ impl MarathonService {
             source_json,
         )
         .map_err(|_| MarathonServiceError::NativeTransition)?;
-        self.vault
-            .collect_orphans_locked(&state_lock, &state)
-            .map_err(|_| MarathonServiceError::Persistence)?;
         let replaced = state.accounts.contains_key(&current_account_id);
-        account.credential_ref = self
-            .vault
-            .save_fresh_locked(&state_lock, &source_snapshot)
-            .map_err(|_| MarathonServiceError::Persistence)?;
-        account.updated_at = chrono::Utc::now();
-        state
-            .accounts
-            .insert(current_account_id.clone(), account.clone());
-        state.active_account_id = current_account_id.clone();
-        self.registry
-            .replace_locked(&state_lock, state)
-            .map_err(|_| MarathonServiceError::Persistence)?;
+        if self.synchronize_auth_generation()? != generation {
+            return Err(MarathonServiceError::NativeTransition);
+        }
+        self.auth_manager
+            .with_auth_owner_unchanged(owner, || {
+                self.vault
+                    .collect_orphans_locked(&state_lock, &state)
+                    .map_err(|_| std::io::Error::other("Marathon vault cleanup failed"))?;
+                account.credential_ref = self
+                    .vault
+                    .save_fresh_locked(&state_lock, &source_snapshot)
+                    .map_err(|_| std::io::Error::other("Marathon vault update failed"))?;
+                account.updated_at = chrono::Utc::now();
+                state
+                    .accounts
+                    .insert(current_account_id.clone(), account.clone());
+                state.active_account_id = current_account_id.clone();
+                self.registry
+                    .replace_locked(&state_lock, state)
+                    .map_err(|_| std::io::Error::other("Marathon registry update failed"))
+            })
+            .map_err(|_| MarathonServiceError::NativeTransition)?;
 
         Ok(MarathonImportResponse {
             account_id: current_account_id,
@@ -455,7 +595,21 @@ impl MarathonService {
         &self,
         target: &str,
     ) -> Result<MarathonSwitchResponse, MarathonServiceError> {
+        // Drain admitted starts before taking the transition lock: an admitted
+        // turn may itself be waiting for that lock. Keep the pause through the
+        // identity change and transport invalidation.
+        let _pause = self
+            .admission
+            .pause()
+            .await
+            .map_err(|_| MarathonServiceError::NativeTransition)?;
         let _transition_guard = self.transition_mutex.lock().await;
+        let source_auth_state = *self.auth_manager.auth_change_state_receiver().borrow();
+        let parked = self
+            .recovery_bridge
+            .as_ref()
+            .map(|bridge| bridge.parked_at_transition_start(source_auth_state.owner_generation))
+            .unwrap_or_default();
         let state_lock = self
             .registry
             .lock_exclusive()
@@ -465,7 +619,7 @@ impl MarathonService {
             .state_locked(&state_lock)
             .map_err(|_| MarathonServiceError::StateUnavailable)?;
         let active_turn_count = (*self.running_turns.borrow()).min(u32::MAX as usize) as u32;
-        let auth_generation = self.auth_generation.load(Ordering::Acquire);
+        let auth_generation = self.synchronize_auth_generation()?;
         if let Some((outcome, reason)) = switch_admission(state.enabled, active_turn_count) {
             return Ok(MarathonSwitchResponse {
                 account_id: None,
@@ -485,9 +639,13 @@ impl MarathonService {
             ),
         };
         if current_account_id.as_deref() == Some(target_account.id.as_str()) {
-            self.registry
-                .set_active_locked(&state_lock, &target_account.id)
-                .map_err(|_| MarathonServiceError::Persistence)?;
+            self.auth_manager
+                .with_auth_owner_unchanged(source_auth_state, || {
+                    self.registry
+                        .set_active_locked(&state_lock, &target_account.id)
+                        .map_err(|_| std::io::Error::other("Marathon registry update failed"))
+                })
+                .map_err(|_| MarathonServiceError::NativeTransition)?;
             return Ok(MarathonSwitchResponse {
                 account_id: Some(target_account.id),
                 outcome: MarathonSwitchOutcome::Committed,
@@ -497,6 +655,7 @@ impl MarathonService {
             });
         }
 
+        let mut rollback_snapshot = None;
         if let Some(current_account_id) = current_account_id.as_deref() {
             // Capture any refreshed source credentials through the guarded
             // native AuthManager API before loading the target snapshot.
@@ -505,6 +664,7 @@ impl MarathonService {
                 .snapshot_for_transition(current_account_id)
                 .await
                 .map_err(|_| MarathonServiceError::NativeTransition)?;
+            rollback_snapshot = Some(source_snapshot.clone());
             let source_json = serde_json::to_vec(source_snapshot.as_auth_dot_json())
                 .map_err(|_| MarathonServiceError::NativeTransition)?;
             let source_snapshot = codexmarathon_runtime::AuthSnapshot::from_owned_bytes(
@@ -523,9 +683,13 @@ impl MarathonService {
                     }
                 })
                 .unwrap_or_else(|| current_account_id.to_string());
-            self.vault
-                .save_locked(&state_lock, &source_credential_ref, &source_snapshot)
-                .map_err(|_| MarathonServiceError::Persistence)?;
+            self.auth_manager
+                .with_auth_owner_unchanged(source_auth_state, || {
+                    self.vault
+                        .save_locked(&state_lock, &source_credential_ref, &source_snapshot)
+                        .map_err(|_| std::io::Error::other("Marathon vault update failed"))
+                })
+                .map_err(|_| MarathonServiceError::NativeTransition)?;
         }
 
         let target_credential_ref = if target_account.credential_ref.is_empty() {
@@ -548,15 +712,30 @@ impl MarathonService {
             return Err(MarathonServiceError::NativeTransition);
         }
 
+        let installed_snapshot = target_auth.clone();
+        let auth_changes = self.auth_manager.auth_change_state_receiver();
+        let before_install = *auth_changes.borrow();
+        if before_install.owner_generation != source_auth_state.owner_generation
+            || before_install.source_generation != source_auth_state.source_generation
+            || before_install.login_generation != source_auth_state.login_generation
+        {
+            return Err(MarathonServiceError::NativeTransition);
+        }
+        let initial_generation = before_install.generation;
         let status = match current_account_id {
             Some(current_account_id) => {
                 self.auth_manager
-                    .install_snapshot_for_transition(target_auth, &current_account_id)
+                    .install_snapshot_for_transition_if_generation(
+                        target_auth,
+                        &current_account_id,
+                        initial_generation,
+                        rollback_snapshot.as_ref(),
+                    )
                     .await
             }
             None => {
                 self.auth_manager
-                    .install_snapshot_for_bootstrap(target_auth)
+                    .install_snapshot_for_bootstrap_if_generation(target_auth, initial_generation)
                     .await
             }
         }
@@ -572,19 +751,113 @@ impl MarathonService {
         if observed.as_deref() != Some(target_account.id.as_str()) {
             return Err(MarathonServiceError::NativeTransition);
         }
-        // The service still owns the shared transition mutex while the
-        // account-bound model transport caches are invalidated.
-        self.thread_manager
-            .invalidate_model_transport_caches()
-            .await;
-        self.registry
-            .set_active_locked(&state_lock, &target_account.id)
-            .map_err(|_| MarathonServiceError::Persistence)?;
-        let auth_generation = if changed {
-            self.auth_generation.fetch_add(1, Ordering::AcqRel) + 1
+        let installed_generation = initial_generation
+            .checked_add(u64::from(changed))
+            .ok_or(MarathonServiceError::NativeTransition)?;
+        if auth_changes.borrow().generation != installed_generation {
+            return Err(MarathonServiceError::NativeTransition);
+        }
+        let installed_owner = *auth_changes.borrow();
+        if let Some(account_processor) = &self.account_processor {
+            if account_processor
+                .marathon_validate_owner(installed_owner)
+                .await
+                .is_err()
+            {
+                // Restore the source under the same admission pause and lock.
+                let restored = match rollback_snapshot {
+                    Some(source) => self
+                        .auth_manager
+                        .install_snapshot_for_transition_if_generation(
+                            source,
+                            &target_account.id,
+                            installed_generation,
+                            Some(&installed_snapshot),
+                        )
+                        .await
+                        .is_ok(),
+                    None => self
+                        .auth_manager
+                        .remove_bootstrap_if_generation(installed_generation, &installed_snapshot)
+                        .await
+                        .is_ok(),
+                };
+                let reconciled = if restored {
+                    let restored_owner = *auth_changes.borrow();
+                    account_processor
+                        .marathon_owner_changed(restored_owner)
+                        .await
+                        .is_ok()
+                } else {
+                    false
+                };
+                if !reconciled {
+                    self.admission.begin_drain();
+                    tracing::error!(
+                        "failed to restore previous auth after Marathon account validation; stopping new work"
+                    );
+                }
+                return Err(MarathonServiceError::NativeTransition);
+            }
+            if account_processor
+                .marathon_owner_changed(installed_owner)
+                .await
+                .is_err()
+            {
+                self.admission.begin_drain();
+                return Err(MarathonServiceError::NativeTransition);
+            }
         } else {
-            self.auth_generation.load(Ordering::Acquire)
-        };
+            self.thread_manager
+                .invalidate_model_transport_caches()
+                .await;
+        }
+        let current_owner = *auth_changes.borrow();
+        if current_owner.owner_generation != installed_owner.owner_generation
+            || current_owner.source_generation != installed_owner.source_generation
+            || current_owner.login_generation != installed_owner.login_generation
+            || self
+                .auth_manager
+                .auth_cached()
+                .and_then(|auth| auth.get_account_id())
+                .as_deref()
+                != Some(target_account.id.as_str())
+        {
+            return Err(MarathonServiceError::NativeTransition);
+        }
+        if self
+            .auth_manager
+            .with_auth_owner_unchanged(installed_owner, || {
+                self.registry
+                    .set_active_locked(&state_lock, &target_account.id)
+                    .map_err(|_| std::io::Error::other("Marathon registry update failed"))
+            })
+            .is_err()
+        {
+            self.admission.begin_drain();
+            return Err(MarathonServiceError::NativeTransition);
+        }
+        let auth_generation = self.synchronize_auth_generation()?;
+        let after_commit = *auth_changes.borrow();
+        if after_commit.owner_generation != installed_owner.owner_generation
+            || after_commit.source_generation != installed_owner.source_generation
+            || after_commit.login_generation != installed_owner.login_generation
+        {
+            return Err(MarathonServiceError::NativeTransition);
+        }
+        drop(state_lock);
+        drop(_transition_guard);
+        drop(_pause);
+        if let Some(bridge) = &self.recovery_bridge {
+            bridge
+                .notify_committed_recoveries(
+                    parked,
+                    &auth_changes,
+                    installed_owner,
+                    auth_generation,
+                )
+                .await;
+        }
         Ok(MarathonSwitchResponse {
             account_id: Some(target_account.id),
             outcome: MarathonSwitchOutcome::Committed,
@@ -600,7 +873,8 @@ impl MarathonService {
         expected_auth_generation: u64,
     ) -> Result<MarathonCheckpointResponse, MarathonServiceError> {
         let _transition_guard = self.transition_mutex.lock().await;
-        let generation = self.auth_generation.load(Ordering::Acquire);
+        let generation = self.synchronize_auth_generation()?;
+        let owner = *self.auth_manager.auth_change_state_receiver().borrow();
         let current = self
             .auth_manager
             .auth_cached()
@@ -623,15 +897,19 @@ impl MarathonService {
         self.vault
             .collect_orphans_locked(&lock, &state)
             .map_err(|_| MarathonServiceError::Persistence)?;
-        let account = state
-            .accounts
-            .get_mut(expected_account_id)
-            .expect("account presence was checked before collecting orphaned snapshots");
         let native = self
             .auth_manager
             .snapshot_for_transition(expected_account_id)
             .await
             .map_err(|_| MarathonServiceError::NativeTransition)?;
+        let after = *self.auth_manager.auth_change_state_receiver().borrow();
+        if after.owner_generation != owner.owner_generation
+            || after.source_generation != owner.source_generation
+            || after.login_generation != owner.login_generation
+            || self.synchronize_auth_generation()? != generation
+        {
+            return Err(MarathonServiceError::NativeTransition);
+        }
         let bytes = serde_json::to_vec(native.as_auth_dot_json())
             .map_err(|_| MarathonServiceError::NativeTransition)?;
         let snapshot =
@@ -640,13 +918,22 @@ impl MarathonService {
         if snapshot.embedded_account_id() != Some(expected_account_id) {
             return Err(MarathonServiceError::NativeTransition);
         }
-        account.credential_ref = self
-            .vault
-            .save_fresh_locked(&lock, &snapshot)
-            .map_err(|_| MarathonServiceError::Persistence)?;
-        self.registry
-            .replace_locked(&lock, state)
-            .map_err(|_| MarathonServiceError::Persistence)?;
+        self.auth_manager
+            .with_auth_owner_unchanged(owner, || {
+                let credential_ref = self
+                    .vault
+                    .save_fresh_locked(&lock, &snapshot)
+                    .map_err(|_| std::io::Error::other("Marathon snapshot write failed"))?;
+                state
+                    .accounts
+                    .get_mut(expected_account_id)
+                    .expect("account presence was checked before collecting orphaned snapshots")
+                    .credential_ref = credential_ref;
+                self.registry
+                    .replace_locked(&lock, state)
+                    .map_err(|_| std::io::Error::other("Marathon registry update failed"))
+            })
+            .map_err(|_| MarathonServiceError::NativeTransition)?;
         Ok(MarathonCheckpointResponse {
             account_id: expected_account_id.to_owned(),
             auth_generation: generation,
@@ -1087,14 +1374,17 @@ mod tests {
     #[test]
     fn failover_starts_only_below_ten_percent_remaining() {
         assert_eq!(
-            quota_used_percent(&rate_limits(1.0, Some(89.9))),
-            Some(89.9)
+            quota_observation(&rate_limits(1.0, Some(89.9))),
+            Some((89.9, true))
         );
         assert_eq!(
-            quota_used_percent(&rate_limits(1.0, Some(90.0))),
-            Some(90.0)
+            quota_observation(&rate_limits(1.0, Some(90.0))),
+            Some((90.0, true))
         );
-        assert_eq!(quota_used_percent(&rate_limits(90.0, None)), Some(90.0));
+        assert_eq!(
+            quota_observation(&rate_limits(90.0, None)),
+            Some((90.0, false))
+        );
         assert!(!quota_requires_failover(90.0));
         assert!(quota_requires_failover(90.1));
     }
@@ -1250,6 +1540,115 @@ mod tests {
             select_auto_target(&state, &quotas, &vault, "account-a", now),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn native_owner_changes_reconcile_and_direct_switch_increments_once() -> anyhow::Result<()>
+    {
+        use app_test_support::{
+            ChatGptAuthFixture, create_mock_responses_server_repeating_assistant,
+            write_chatgpt_auth,
+        };
+        use codex_login::{AuthCredentialsStoreMode, AuthKeyringBackendKind};
+        use core_test_support::test_codex::test_codex;
+        core_test_support::skip_if_no_network!(Ok(()));
+        let server = create_mock_responses_server_repeating_assistant("Done").await;
+        let codex = test_codex().build_with_auto_env(&server).await?;
+        let home = tempdir()?;
+        let mode = AuthCredentialsStoreMode::File;
+        write_chatgpt_auth(
+            home.path(),
+            ChatGptAuthFixture::new("access-a").account_id("account-a"),
+            mode,
+        )?;
+        let auth = Arc::new(
+            AuthManager::new(
+                home.path().to_path_buf(),
+                false,
+                mode,
+                None,
+                Some(codex.config.chatgpt_base_url.clone()),
+                AuthKeyringBackendKind::default(),
+                codex.config.auth_config().auth_route_config,
+            )
+            .await,
+        );
+        let registry = Arc::new(FileAccountRegistry::new(home.path().join("registry.json")));
+        let vault = Arc::new(FileSnapshotVault::new(home.path().join("vault")));
+        let (_running, receiver) = watch::channel(0usize);
+        let service = MarathonService::with_stores_for_test(
+            auth.clone(),
+            codex.thread_manager.clone(),
+            receiver,
+            Arc::new(Mutex::new(())),
+            registry.clone(),
+            vault,
+        );
+        service.reconcile_existing_registry().await?;
+        assert!(
+            !registry.path().exists(),
+            "reconciliation must not initialize Marathon for nonusers"
+        );
+        service.import_current("first").await?;
+        assert_eq!(service.synchronize_auth_generation()?, 1);
+        write_chatgpt_auth(
+            home.path(),
+            ChatGptAuthFixture::new("access-b").account_id("account-b"),
+            mode,
+        )?;
+        assert!(matches!(
+            auth.reload_with_status().await,
+            AuthReloadStatus::Reloaded { changed: true }
+        ));
+        service.reconcile_existing_registry().await?;
+        assert_eq!(registry.state()?.active_account_id, "");
+        assert_eq!(service.synchronize_auth_generation()?, 2);
+        service.import_current("second").await?;
+        let switched = service.switch("first").await?;
+        assert_eq!(switched.outcome, MarathonSwitchOutcome::Committed);
+        assert_eq!(switched.auth_generation, 3);
+        service.reconcile_existing_registry().await?;
+        assert_eq!(registry.state()?.active_account_id, "account-a");
+        assert_eq!(service.synchronize_auth_generation()?, 3);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn switch_defers_for_running_turn_and_reopens_admission() -> anyhow::Result<()> {
+        use app_test_support::create_mock_responses_server_repeating_assistant;
+        use codex_login::CodexAuth;
+        use core_test_support::test_codex::test_codex;
+
+        core_test_support::skip_if_no_network!(Ok(()));
+        let server = create_mock_responses_server_repeating_assistant("Done").await;
+        let codex = test_codex().build_with_auto_env(&server).await?;
+        let home = tempdir()?;
+        let auth = AuthManager::from_auth_for_testing_with_home(
+            CodexAuth::from_api_key("fixture"),
+            home.path().to_path_buf(),
+        );
+        let registry = Arc::new(FileAccountRegistry::new(home.path().join("registry.json")));
+        registry.set_enabled(true)?;
+        let vault = Arc::new(FileSnapshotVault::new(home.path().join("vault")));
+        let (running, receiver) = watch::channel(1usize);
+        let service = MarathonService::with_stores_for_test(
+            auth,
+            codex.thread_manager.clone(),
+            receiver,
+            Arc::new(Mutex::new(())),
+            registry,
+            vault,
+        );
+        let deferred = service.switch("missing").await?;
+        assert_eq!(deferred.outcome, MarathonSwitchOutcome::Deferred);
+        assert!(service.admission.admit().is_ok());
+        running.send_replace(0);
+        assert!(matches!(
+            service.switch("missing").await,
+            Err(MarathonServiceError::AccountNotFound)
+        ));
+        assert!(service.admission.admit().is_ok());
+        Ok(())
     }
 
     #[test]

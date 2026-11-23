@@ -92,7 +92,8 @@ impl EmbeddedNetworkPolicy {
                     .restrict_to_endpoints(endpoint.parse().into_iter().collect()),
             ),
         )
-        .with_local_bootstrap_factory(factory);
+        .with_local_bootstrap_factory(factory)
+        .with_application_network_policy(self.effective.policy());
         auth
     }
 }
@@ -104,7 +105,8 @@ pub(super) async fn configure(
 ) -> IoResult<Arc<AuthManager>> {
     let bootstrap_config = config_manager
         .load_startup_config(Some(config.cwd.to_path_buf()))
-        .await?;
+        .await?
+        .config;
     let caller_auth = config.auth_config();
     let bootstrap_auth = codex_login::AuthConfig {
         chatgpt_base_url: Some(bootstrap_config.chatgpt_base_url.clone()),
@@ -124,14 +126,12 @@ pub(super) async fn configure(
     )
     .await
     .map_err(IoError::other)?;
-    config_manager.replace_cloud_config_bundle_loader(
-        bootstrap_auth_manager,
-        bootstrap_config.chatgpt_base_url.clone(),
-        bootstrap_config.http_client_factory(),
-    );
+    config_manager.update_managed_config_loader(bootstrap_auth_manager, &bootstrap_config);
     let policy_config = config_manager
         .load_startup_config(Some(config.cwd.to_path_buf()))
-        .await?;
+        .await?
+        .config;
+    config.validate_windows_mxc_requirement_from(&policy_config)?;
     let auth_config = codex_login::AuthConfig {
         chatgpt_base_url: Some(policy_config.chatgpt_base_url.clone()),
         forced_login_method: policy_config.forced_login_method,
@@ -159,16 +159,13 @@ pub(super) async fn configure(
     };
     let config = Arc::make_mut(config);
     config.chatgpt_base_url = policy_config.chatgpt_base_url;
+    config.chatgpt_base_url_is_explicit = policy_config.chatgpt_base_url_is_explicit;
     config.enforce_residency = policy_config.enforce_residency;
     config.application_network_policy = policy_config.application_network_policy;
     config.application_auth_route_config = policy_config.application_auth_route_config;
     config.forced_login_method = policy_config.forced_login_method;
     config.forced_chatgpt_workspace_id = policy_config.forced_chatgpt_workspace_id;
-    config_manager.replace_cloud_config_bundle_loader(
-        policy_auth_manager,
-        config.chatgpt_base_url.clone(),
-        config.http_client_factory(),
-    );
+    config_manager.update_managed_config_loader(policy_auth_manager, config);
     codex_login::default_client::set_default_client_residency_requirement(
         config.enforce_residency.value(),
     );

@@ -355,9 +355,14 @@ fn portable_tool_schema_normalizes_embedded_code_mode_shell_guidance() {
     let description = |shell: String, wait: &str| {
         format!("### `exec_command`\n{shell}\n\nexec tool declaration:\n```ts\n  // {wait}\n```")
     };
-    let nested = |description| {
+    let nested = |description: String| {
+        let shell_description = description
+            .strip_prefix("### `exec_command`\n")
+            .expect("embedded shell guidance")
+            .to_string();
         json!({ "type": "namespace", "name": "functions", "tools": [
-            { "type": "custom", "name": "exec", "description": description }
+            { "type": "custom", "name": "exec", "description": description },
+            { "type": "function", "name": "exec_command", "description": shell_description }
         ] })
     };
     let unix = nested(description(
@@ -375,6 +380,47 @@ fn portable_tool_schema_normalizes_embedded_code_mode_shell_guidance() {
         "Maximum time to wait before returning a session ID for a still-running command. Commands that finish sooner return immediately. For ordinary commands, omit this parameter to use the 10000 ms default. Effective range on Windows is 10000-30000 ms.",
     ));
     assert_ne!(portable_tool_schema(&unix), portable_tool_schema(&changed));
+}
+
+#[test]
+fn portable_tool_schema_normalizes_only_the_exact_powershell_login_description() {
+    let plain = "Request login-shell startup. Omit to inherit.";
+    let powershell = "Login-shell startup. In PowerShell, false skips profiles. Keep them enabled for profile-defined commands, even unattended. Omit to inherit.";
+    let tool = |description: &str| {
+        json!({
+            "name": "exec_command",
+            "parameters": {"properties": {"login": {"description": description}}}
+        })
+    };
+    assert_eq!(
+        portable_tool_schema(&tool(plain)),
+        portable_tool_schema(&tool(powershell))
+    );
+    assert_ne!(
+        portable_tool_schema(&tool(plain)),
+        portable_tool_schema(&tool("Different advice"))
+    );
+    let embedded = |description: &str| {
+        json!({
+            "name": "exec",
+            "description": format!("  // {description}\n  login?: boolean;")
+        })
+    };
+    assert_eq!(
+        portable_tool_schema(&embedded(plain)),
+        portable_tool_schema(&embedded(powershell))
+    );
+    let direct = |description: &str| {
+        json!({
+            "name": "exec_command",
+            "description": format!("  // {description}\n  login?: boolean;"),
+            "parameters": {"properties": {"login": {"description": description}}}
+        })
+    };
+    assert_eq!(
+        portable_tool_schema(&direct(plain)),
+        portable_tool_schema(&direct(powershell))
+    );
 }
 
 #[test]
@@ -655,6 +701,10 @@ fn rewritten_segments_share_one_tag_format_and_keep_compaction_data() {
             "You are judging one planned coding-agent action.\nRoutine guidance.",
         ),
         message(
+            "developer",
+            "# Transcript provenance\nRoutine guidance.\n\nYou are judging one planned coding-agent action.",
+        ),
+        message(
             "user",
             "# AGENTS.md instructions for project\n\n<INSTRUCTIONS>\nProject rules\n</INSTRUCTIONS>",
         ),
@@ -677,6 +727,7 @@ fn rewritten_segments_share_one_tag_format_and_keep_compaction_data() {
         [
             "<APPS_INSTRUCTIONS>",
             "<PLUGINS_INSTRUCTIONS>",
+            "<GUARDIAN_INSTRUCTIONS>",
             "<GUARDIAN_INSTRUCTIONS>",
             "<AGENTS_MD>",
             "<SUMMARIZATION_PROMPT>",

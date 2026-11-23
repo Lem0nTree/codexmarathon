@@ -22,6 +22,7 @@ fn first_screen_stage_ignores_notices_and_hides_instead_of_shrinking() {
         );
         assert_eq!(
             animation.render_first_screen(
+                screen,
                 free,
                 &mut buffer,
                 Some(ComposerState::Empty),
@@ -39,6 +40,7 @@ fn first_screen_stage_ignores_notices_and_hides_instead_of_shrinking() {
     // Content which reaches the center must win; it must not move the stage down.
     let free = Rect::new(screen.x, /*y*/ 20, screen.width, /*height*/ 24);
     animation.render_first_screen(
+        screen,
         free,
         &mut buffer,
         Some(ComposerState::Empty),
@@ -50,6 +52,7 @@ fn first_screen_stage_ignores_notices_and_hides_instead_of_shrinking() {
         let screen = Rect::new(/*x*/ 7, /*y*/ 3, width, height);
         let mut buffer = Buffer::empty(screen);
         animation.render_first_screen(
+            screen,
             screen,
             &mut buffer,
             Some(ComposerState::Empty),
@@ -75,7 +78,7 @@ fn first_screen_single_click_replays_the_visible_blossom() {
     };
     let draw = |animation: &mut EmptyStateAnimation, buffer: &mut Buffer, composer| {
         buffer.reset();
-        animation.render_first_screen(screen, buffer, composer, MotionMode::Animated)
+        animation.render_first_screen(screen, screen, buffer, composer, MotionMode::Animated)
     };
     assert_eq!(
         draw(&mut animation, &mut buffer, Some(ComposerState::Empty)),
@@ -193,6 +196,7 @@ fn first_screen_single_click_replays_the_visible_blossom() {
     // Disabling motion removes both the logo and its click target.
     buffer.reset();
     animation.render_first_screen(
+        screen,
         screen,
         &mut buffer,
         Some(ComposerState::Empty),

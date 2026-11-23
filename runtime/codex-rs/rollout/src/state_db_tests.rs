@@ -81,6 +81,7 @@ async fn list_threads_db_rejects_mismatched_sqlite_config_without_cleanup() -> a
         &[],
         /*model_providers*/ None,
         /*cwd_filters*/ None,
+        /*included_thread_ids*/ None,
         /*relation_filter*/ None,
         /*archived*/ false,
         /*section*/ None,
@@ -323,8 +324,10 @@ fn write_rollout_with_user_message(
         RolloutLine {
             timestamp: "2026-06-01T14:26:25Z".to_string(),
             ordinal: None,
-            item: RolloutItem::SessionMeta(SessionMetaLine {
+            item: RolloutItem::SessionMeta(Box::new(SessionMetaLine {
                 meta: SessionMeta {
+                    account_scoped: false,
+                    attached_thread: false,
                     creator_user_id: None,
                     creator_account_id: None,
                     session_id: thread_id.into(),
@@ -354,7 +357,7 @@ fn write_rollout_with_user_message(
                     context_window: None,
                 },
                 git: None,
-            }),
+            })),
         },
         RolloutLine {
             timestamp: "2026-06-01T14:26:26Z".to_string(),

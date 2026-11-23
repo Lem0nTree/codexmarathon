@@ -25,6 +25,7 @@ doctest = false
 workspace = true
 
 [dependencies]
+codex-agent-message-board-host = { workspace = true }
 codex-utils-process = { workspace = true }
 anyhow = { workspace = true }
 base64 = { workspace = true }
@@ -35,7 +36,7 @@ axum = { workspace = true, default-features = false, features = [
     "ws",
 ] }
 codex-analytics = { workspace = true }
-codex-agent-extension = { workspace = true }
+codex-app-server-daemon = { workspace = true }
 codex-arg0 = { workspace = true }
 codex-aws-auth = { workspace = true }
 codex-cloud-config = { workspace = true }
@@ -51,9 +52,11 @@ codex-exec-server = { workspace = true }
 codex-extension-api = { workspace = true }
 codex-external-agent-migration = { workspace = true }
 codex-features = { workspace = true }
+codex-multi-env-copy-file = { workspace = true }
 codex-goal-extension = { workspace = true }
 codex-git-attribution = { workspace = true }
 codex-guardian-v2 = { workspace = true }
+codex-guardian-v3 = { workspace = true }
 codex-git-utils = { workspace = true }
 codex-file-watcher = { workspace = true }
 codex-hooks = { workspace = true }
@@ -71,6 +74,7 @@ codex-backend-client = { workspace = true }
 codex-file-search = { workspace = true }
 codex-chatgpt = { workspace = true }
 codex-login = { workspace = true }
+codex-runtime-agent-instance = { workspace = true }
 codexmarathon-accountd-client = { workspace = true }
 codexmarathon-runtime = { workspace = true }
 codexmarathon-runtime-adapter = { workspace = true }
@@ -126,10 +130,15 @@ uuid = { workspace = true, features = ["serde", "v7"] }
 [target.'cfg(all(target_os = "linux", target_env = "musl", any(target_arch = "x86_64", target_arch = "aarch64")))'.dependencies]
 tikv-jemallocator = { workspace = true }
 
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
 [target.'cfg(windows)'.dependencies]
 codex-windows-sandbox = { workspace = true }
 
 [dev-dependencies]
+codex-message-board = { workspace = true }
+zip = { workspace = true }
 codex-uds = { workspace = true }
 app_test_support = { workspace = true }
 axum = { workspace = true, default-features = false, features = [
@@ -138,11 +147,14 @@ axum = { workspace = true, default-features = false, features = [
     "tokio",
 ] }
 base64 = { workspace = true }
+codex-rollout-trace = { workspace = true }
 codex-utils-cargo-bin = { workspace = true }
 core_test_support = { workspace = true }
 flate2 = { workspace = true }
 hmac = { workspace = true }
 http = { workspace = true }
+insta = { workspace = true }
+keyring = { workspace = true }
 opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true }
 pretty_assertions = { workspace = true }

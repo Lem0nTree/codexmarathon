@@ -24,7 +24,7 @@ use crate::terminal_hyperlinks::prefix_hyperlink_lines;
 use crate::terminal_hyperlinks::remap_source_wrapped_line;
 use crate::terminal_hyperlinks::visible_lines;
 use crate::tool_output::tool_output_hyperlink_preview;
-use crate::ui_consts::TRANSCRIPT_HINT;
+use crate::ui_consts::transcript_hint;
 use crate::wrapping::RtOptions;
 use crate::wrapping::adaptive_wrap_line_with_source;
 use codex_ansi_escape::ansi_escape_line;
@@ -241,7 +241,7 @@ impl HistoryCell for ExecCell {
         if self.is_exploring_cell() {
             let mut lines = self.exploring_display_lines(width);
             lines.truncate(1 + crate::history_cell::activity_preview::DETAIL_PREVIEW_LINES);
-            let failures = self
+            let nonzero_exits = self
                 .group
                 .calls
                 .iter()
@@ -251,12 +251,17 @@ impl HistoryCell for ExecCell {
                         .is_some_and(|output| output.exit_code != 0)
                 })
                 .count();
-            if failures > 0
+            if nonzero_exits > 0
                 && let Some(header) = lines.first_mut()
             {
+                let exit_label = if nonzero_exits == 1 {
+                    "nonzero exit"
+                } else {
+                    "nonzero exits"
+                };
                 header
                     .line
-                    .push_span(format!(" · {failures} failed").red().bold());
+                    .push_span(format!(" · {nonzero_exits} {exit_label}").bold());
             }
             lines
                 .into_iter()
@@ -287,6 +292,50 @@ impl HistoryCell for ExecCell {
         self.detailed_hyperlink_lines(width, HistoryRenderMode::Rich)
     }
 
+    fn tool_call_labels(&self) -> Vec<String> {
+        self.iter_calls()
+            .filter(|call| !call.is_user_shell_command())
+            .map(|call| {
+                let active = call.duration.is_none();
+                let (running, finished, target) = match call.parsed.as_slice() {
+                    [ParsedCommand::Read { name, .. }] => ("Reading", "Read", name.clone()),
+                    [
+                        ParsedCommand::Search {
+                            query: Some(query),
+                            path,
+                            ..
+                        },
+                    ] => {
+                        let target = match path {
+                            Some(path) => format!("{query} in {path}"),
+                            None => query.clone(),
+                        };
+                        ("Searching for", "Searched for", target)
+                    }
+                    [
+                        ParsedCommand::Search {
+                            path: Some(path), ..
+                        },
+                    ] => ("Searching files in", "Searched files in", path.clone()),
+                    [ParsedCommand::ListFiles { path, .. }] => (
+                        "Listing files in",
+                        "Listed files in",
+                        path.as_deref().unwrap_or(".").to_owned(),
+                    ),
+                    _ => ("Running", "Ran", strip_bash_lc_and_escape(&call.command)),
+                };
+                let verb = if active { running } else { finished };
+                let mut label = format!("{verb} {target}");
+                if let Some(output) = &call.output
+                    && output.exit_code != 0
+                {
+                    label.push_str(&format!(" (exit {})", output.exit_code));
+                }
+                label
+            })
+            .collect()
+    }
+
     fn activity_ids(&self) -> Vec<String> {
         self.iter_calls()
             .map(|call| format!("exec:{}", call.call_id))
@@ -303,7 +352,7 @@ impl HistoryCell for ExecCell {
 impl ExecCell {
     fn output_ellipsis_text(omitted: usize) -> String {
         let noun = if omitted == 1 { "line" } else { "lines" };
-        format!("… +{omitted} {noun} ({TRANSCRIPT_HINT})")
+        format!("… +{omitted} {noun} ({})", transcript_hint())
     }
 
     fn output_ellipsis_line(omitted: usize) -> Line<'static> {
@@ -947,7 +996,7 @@ mod tests {
             .split_whitespace()
             .join(" ");
         assert!(
-            normalized.contains(TRANSCRIPT_HINT),
+            normalized.contains(&transcript_hint()),
             "expected truncated output to advertise transcript shortcut, got {normalized}"
         );
     }
@@ -979,7 +1028,7 @@ mod tests {
         assert!(
             rendered
                 .iter()
-                .any(|line| line.contains("… +6 lines (ctrl+t to view transcript)")),
+                .any(|line| line.contains("… +6 lines (⌃t to view transcript)")),
             "expected omitted hint to count hidden lines (not wrapped rows), got: {rendered:?}"
         );
     }
@@ -1007,7 +1056,7 @@ mod tests {
 
         assert_eq!(
             rendered,
-            vec!["1", "2", "… +3 lines (ctrl+t to view transcript)", "6", "7",]
+            vec!["1", "2", "… +3 lines (⌃t to view transcript)", "6", "7",]
         );
     }
 

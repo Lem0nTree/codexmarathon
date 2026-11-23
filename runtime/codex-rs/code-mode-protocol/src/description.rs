@@ -7,6 +7,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 
 use crate::PUBLIC_TOOL_NAME;
 use crate::json_schema_types::render_json_schema_to_typescript;
@@ -14,7 +15,10 @@ use crate::json_schema_types::render_json_schema_to_typescript_with_budget;
 
 const MAX_JS_SAFE_INTEGER: u64 = (1_u64 << 53) - 1;
 const DEFERRED_NESTED_TOOLS_GUIDANCE: &str = r#"Some deferred nested tools may be omitted from this description. They are still available on the global `tools` object and listed in `ALL_TOOLS`.
-To find one, filter `ALL_TOOLS` by `name` and `description`."#;
+To find one, filter `ALL_TOOLS` by `name` and `description`.
+
+Tool availability can change between calls."#;
+pub const TOOL_SEARCH_GUIDANCE: &str = r#"Use `await tools.tool_search({query: "...", limit: 8})` for BM25-ranked discovery of deferred tools (up to `limit` matches; 8 by default). It returns `{tools: [{name, description}]}` with callable names and full TypeScript declarations. Print results with `text()` and inspect unfamiliar declarations before calling `tools[result.name](arguments)` in a later execution."#;
 const LEGACY_IMAGE_HELPER_DESCRIPTION: &str = r#"`image(imageUrlOrItem: string | { image_url: string; detail?: "auto" | "low" | "high" | "original" | null } | ImageContent, detail?: "auto" | "low" | "high" | "original" | null)`: Appends an image item. `image_url` should be a base64-encoded `data:` URL. To forward an MCP tool image, pass an individual `ImageContent` block from `result.content`, for example `image(result.content[0])`. MCP image blocks may request detail with `_meta: { "codex/imageDetail": "original" }`. When provided, the second `detail` argument overrides any detail embedded in the first argument."#;
 const UNIFIED_IMAGE_HELPER_DESCRIPTION: &str = r#"`image(imageUrlOrItem: string | { image_url: string } | ImageContent)`: Appends an image item. `image_url` should be a base64-encoded `data:` URL. To forward an MCP tool image, pass an individual `ImageContent` block from `result.content`, for example `image(result.content[0])`."#;
 const EXEC_DESCRIPTION_TEMPLATE: &str = r#"Run JavaScript code to orchestrate/compose tool calls
@@ -156,6 +160,15 @@ pub struct ToolNamespaceDescription {
     pub description: String,
 }
 
+/// One complete tool definition or namespace instruction and its identity in an update.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExecDefinition {
+    /// Stable identity (`Tool: tools.<name>` or `Namespace instructions: <name>`) used for diffing.
+    pub key: String,
+    /// Complete rendered entry, including its heading, used to replace an earlier definition.
+    pub description: String,
+}
+
 #[derive(Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct CodeModeExecPragma {
@@ -266,15 +279,25 @@ pub enum ImageDetailVisibility {
     Hidden,
 }
 
-pub fn build_exec_tool_description(
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DeferredToolDiscovery {
+    Catalog,
+    RankedSearch,
+}
+
+/// Builds the full description and optionally collects stable entries in one rendering pass.
+#[allow(clippy::too_many_arguments)]
+pub fn build_exec_tool_description_and_definitions(
     enabled_tools: &[ToolDefinition],
-    deferred_tools: &[ToolDefinition],
+    _deferred_tools: &[ToolDefinition],
     namespace_descriptions: &BTreeMap<String, ToolNamespaceDescription>,
     default_exec_yield_time_ms: u64,
     code_mode_only: bool,
     image_detail_visibility: ImageDetailVisibility,
+    deferred_tool_discovery: DeferredToolDiscovery,
+    incremental_exec_enabled: bool,
     messages: Option<&CodeModeToolMessages>,
-) -> String {
+) -> (String, Vec<ExecDefinition>) {
     let mut sections = Vec::new();
     let image_helper = match image_detail_visibility {
         ImageDetailVisibility::Visible => LEGACY_IMAGE_HELPER_DESCRIPTION,
@@ -292,33 +315,36 @@ pub fn build_exec_tool_description(
     if !description.is_empty() {
         sections.push(description);
     }
-    if !deferred_tools.is_empty() {
-        let guidance = messages
-            .and_then(|messages| messages.deferred_nested_tools_guidance.as_deref())
-            .unwrap_or(DEFERRED_NESTED_TOOLS_GUIDANCE);
-        if !guidance.is_empty() {
-            sections.push(guidance.to_string());
+    let default_guidance = match deferred_tool_discovery {
+        // In Code Mode Only, the enabled search tool's description is rendered below.
+        DeferredToolDiscovery::RankedSearch if !code_mode_only => {
+            format!("{DEFERRED_NESTED_TOOLS_GUIDANCE}\n\n{TOOL_SEARCH_GUIDANCE}")
         }
+        DeferredToolDiscovery::Catalog | DeferredToolDiscovery::RankedSearch => {
+            DEFERRED_NESTED_TOOLS_GUIDANCE.to_string()
+        }
+    };
+    let guidance = messages
+        .and_then(|messages| messages.deferred_nested_tools_guidance.as_deref())
+        .unwrap_or(&default_guidance);
+    if !guidance.is_empty() {
+        sections.push(guidance.to_string());
     }
     if !code_mode_only {
-        return sections.join("\n\n");
+        return (sections.join("\n\n"), Vec::new());
     }
 
-    let has_mcp_tools = enabled_tools
-        .iter()
-        .chain(deferred_tools)
-        .any(|tool| mcp_structured_content_schema(tool.output_schema.as_ref()).is_some());
-    if has_mcp_tools {
-        let preamble = messages
-            .and_then(|messages| messages.mcp_typescript_preamble.as_deref())
-            .unwrap_or(MCP_TYPESCRIPT_PREAMBLE);
-        if !preamble.is_empty() {
-            sections.push(format!("Shared MCP Types:\n```ts\n{preamble}\n```"));
-        }
+    let preamble = messages
+        .and_then(|messages| messages.mcp_typescript_preamble.as_deref())
+        .unwrap_or(MCP_TYPESCRIPT_PREAMBLE);
+    if !preamble.is_empty() {
+        sections.push(format!("Shared MCP Types:\n```ts\n{preamble}\n```"));
     }
 
+    let mut entries = Vec::new();
     if !enabled_tools.is_empty() {
         let mut current_namespace: Option<&str> = None;
+        let mut seen_namespaces = BTreeSet::new();
         let mut nested_tool_sections = Vec::with_capacity(enabled_tools.len());
 
         for tool in enabled_tools {
@@ -331,35 +357,57 @@ pub fn build_exec_tool_description(
                 .and_then(|namespace| namespace_descriptions.get(namespace));
             let next_namespace = namespace_description
                 .map(|namespace_description| namespace_description.name.as_str());
-            if next_namespace != current_namespace {
-                if let Some(namespace_description) = namespace_description {
-                    let namespace_description_text = namespace_description.description.trim();
-                    if !namespace_description_text.is_empty() {
-                        nested_tool_sections.push(format!(
+            if let Some(namespace_description) = namespace_description {
+                let namespace_description_text = namespace_description.description.trim();
+                if !namespace_description_text.is_empty() {
+                    let new_entry = incremental_exec_enabled
+                        && seen_namespaces.insert(&namespace_description.name);
+                    let new_group = next_namespace != current_namespace;
+                    if new_entry || new_group {
+                        let description = format!(
                             "## {}\n{namespace_description_text}",
                             namespace_description.name
-                        ));
+                        );
+                        if new_entry {
+                            entries.push(ExecDefinition {
+                                key: format!(
+                                    "Namespace instructions: {}",
+                                    namespace_description.name
+                                ),
+                                description: description.clone(),
+                            });
+                        }
+                        if new_group {
+                            nested_tool_sections.push(description);
+                        }
                     }
                 }
-                current_namespace = next_namespace;
             }
+            current_namespace = next_namespace;
 
             let global_name = normalize_code_mode_identifier(name);
             let nested_description = nested_description.trim();
-            if nested_description.is_empty() {
-                nested_tool_sections.push(render_tool_heading(&global_name, name));
+            let description = if nested_description.is_empty() {
+                render_tool_heading(&global_name, name)
             } else {
-                nested_tool_sections.push(format!(
+                format!(
                     "{}\n{nested_description}",
                     render_tool_heading(&global_name, name)
-                ));
+                )
+            };
+            if incremental_exec_enabled {
+                entries.push(ExecDefinition {
+                    key: format!("Tool: tools.{global_name}"),
+                    description: description.clone(),
+                });
             }
+            nested_tool_sections.push(description);
         }
 
         sections.push(nested_tool_sections.join("\n\n"));
     }
 
-    sections.join("\n\n")
+    (sections.join("\n\n"), entries)
 }
 
 pub fn build_wait_tool_description() -> &'static str {
@@ -535,12 +583,13 @@ mod description_override_tests;
 #[cfg(test)]
 mod tests {
     use super::CodeModeToolKind;
+    use super::DeferredToolDiscovery;
     use super::ImageDetailVisibility;
     use super::ParsedExecSource;
     use super::ToolDefinition;
     use super::ToolNamespaceDescription;
     use super::augment_tool_definition;
-    use super::build_exec_tool_description;
+    use super::build_exec_tool_description_and_definitions;
     use super::normalize_code_mode_identifier;
     use super::parse_exec_source;
     use codex_protocol::ToolName;
@@ -728,7 +777,7 @@ mod tests {
 
     #[test]
     fn code_mode_only_description_includes_nested_tools() {
-        let description = build_exec_tool_description(
+        let (description, entries) = build_exec_tool_description_and_definitions(
             &[ToolDefinition {
                 name: "foo".to_string(),
                 tool_name: ToolName::plain("foo"),
@@ -743,8 +792,11 @@ mod tests {
             crate::DEFAULT_EXEC_YIELD_TIME_MS,
             /*code_mode_only*/ true,
             ImageDetailVisibility::Visible,
+            DeferredToolDiscovery::Catalog,
+            /*incremental_exec_enabled*/ false,
             /*messages*/ None,
         );
+        assert!(entries.is_empty());
         assert!(description.contains(
             "### `foo`
 bar"
@@ -754,13 +806,15 @@ bar"
 
     #[test]
     fn exec_description_mentions_timeout_helpers() {
-        let description = build_exec_tool_description(
+        let (description, _) = build_exec_tool_description_and_definitions(
             &[],
             &[],
             &BTreeMap::new(),
             crate::DEFAULT_EXEC_YIELD_TIME_MS,
             /*code_mode_only*/ false,
             ImageDetailVisibility::Visible,
+            DeferredToolDiscovery::Catalog,
+            /*incremental_exec_enabled*/ false,
             /*messages*/ None,
         );
         assert!(description.contains("`audio(audioUrlOrItem:"));
@@ -769,7 +823,7 @@ bar"
     }
 
     #[test]
-    fn code_mode_only_description_groups_namespace_instructions_once() {
+    fn code_mode_only_definitions_match_full_description() {
         let namespace_descriptions = BTreeMap::from([(
             "mcp__sample__".to_string(),
             ToolNamespaceDescription {
@@ -777,58 +831,112 @@ bar"
                 description: "Shared namespace guidance.".to_string(),
             },
         )]);
-        let description = build_exec_tool_description(
+        let enabled_tools = [
+            ToolDefinition {
+                name: "mcp__sample__alpha-tool".to_string(),
+                tool_name: ToolName::namespaced("mcp__sample__", "alpha-tool"),
+                description: "First tool".to_string(),
+                kind: CodeModeToolKind::Function,
+                input_schema: Some(json!({
+                    "type": "object",
+                    "properties": { "city": { "type": "string" } },
+                    "required": ["city"],
+                    "additionalProperties": false
+                })),
+                input_schema_max_bytes: None,
+                output_schema: Some(mcp_call_tool_result_schema(json!({
+                    "type": "object",
+                    "properties": { "ok": { "type": "boolean" } },
+                    "required": ["ok"],
+                    "additionalProperties": false
+                }))),
+            },
+            ToolDefinition {
+                name: "mcp__sample__beta".to_string(),
+                tool_name: ToolName::namespaced("mcp__sample__", "beta"),
+                description: "Second tool".to_string(),
+                kind: CodeModeToolKind::Function,
+                input_schema: Some(json!({
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false
+                })),
+                input_schema_max_bytes: None,
+                output_schema: Some(mcp_call_tool_result_schema(json!({
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false
+                }))),
+            },
+        ];
+        let (description, entries) = build_exec_tool_description_and_definitions(
+            &enabled_tools,
+            &[],
+            &namespace_descriptions,
+            crate::DEFAULT_EXEC_YIELD_TIME_MS,
+            /*code_mode_only*/ true,
+            ImageDetailVisibility::Visible,
+            DeferredToolDiscovery::Catalog,
+            /*incremental_exec_enabled*/ true,
+            /*messages*/ None,
+        );
+        assert_eq!(description.matches("## mcp__sample").count(), 1);
+        assert!(description.contains("## mcp__sample\nShared namespace guidance."));
+        assert!(description.contains(
+            "declare const tools: { mcp__sample__alpha_tool(args: { city: string; }): Promise<CallToolResult<{ ok: boolean; }>>; };"
+        ));
+        assert!(description.contains(
+            "declare const tools: { mcp__sample__beta(args: {}): Promise<CallToolResult<{}>>; };"
+        ));
+
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.key.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "Namespace instructions: mcp__sample",
+                "Tool: tools.mcp__sample__alpha_tool",
+                "Tool: tools.mcp__sample__beta",
+            ]
+        );
+        let catalog_start = description.find("## mcp__sample\n").unwrap();
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.description.as_str())
+                .collect::<Vec<_>>()
+                .join("\n\n"),
+            &description[catalog_start..]
+        );
+
+        // Full descriptions repeat a returning namespace heading; update entries keep one identity.
+        let mut plain_tool = enabled_tools[1].clone();
+        plain_tool.name = "plain".to_string();
+        plain_tool.tool_name = ToolName::plain("plain");
+        let (description, interleaved_entries) = build_exec_tool_description_and_definitions(
             &[
-                ToolDefinition {
-                    name: "mcp__sample__alpha".to_string(),
-                    tool_name: ToolName::namespaced("mcp__sample__", "alpha"),
-                    description: "First tool".to_string(),
-                    kind: CodeModeToolKind::Function,
-                    input_schema: Some(json!({
-                        "type": "object",
-                        "properties": {},
-                        "additionalProperties": false
-                    })),
-                    input_schema_max_bytes: None,
-                    output_schema: Some(mcp_call_tool_result_schema(json!({
-                        "type": "object",
-                        "properties": {},
-                        "additionalProperties": false
-                    }))),
-                },
-                ToolDefinition {
-                    name: "mcp__sample__beta".to_string(),
-                    tool_name: ToolName::namespaced("mcp__sample__", "beta"),
-                    description: "Second tool".to_string(),
-                    kind: CodeModeToolKind::Function,
-                    input_schema: Some(json!({
-                        "type": "object",
-                        "properties": {},
-                        "additionalProperties": false
-                    })),
-                    input_schema_max_bytes: None,
-                    output_schema: Some(mcp_call_tool_result_schema(json!({
-                        "type": "object",
-                        "properties": {},
-                        "additionalProperties": false
-                    }))),
-                },
+                enabled_tools[0].clone(),
+                plain_tool,
+                enabled_tools[1].clone(),
             ],
             &[],
             &namespace_descriptions,
             crate::DEFAULT_EXEC_YIELD_TIME_MS,
             /*code_mode_only*/ true,
             ImageDetailVisibility::Visible,
+            DeferredToolDiscovery::Catalog,
+            /*incremental_exec_enabled*/ true,
             /*messages*/ None,
         );
-        assert_eq!(description.matches("## mcp__sample").count(), 1);
-        assert!(description.contains("## mcp__sample\nShared namespace guidance."));
-        assert!(description.contains(
-            "declare const tools: { mcp__sample__alpha(args: {}): Promise<CallToolResult<{}>>; };"
-        ));
-        assert!(description.contains(
-            "declare const tools: { mcp__sample__beta(args: {}): Promise<CallToolResult<{}>>; };"
-        ));
+        assert_eq!(description.matches("## mcp__sample").count(), 2);
+        assert_eq!(
+            interleaved_entries
+                .iter()
+                .filter(|entry| entry.key.starts_with("Namespace instructions:"))
+                .collect::<Vec<_>>(),
+            vec![&entries[0]],
+        );
     }
 
     #[test]
@@ -840,7 +948,7 @@ bar"
                 description: String::new(),
             },
         )]);
-        let description = build_exec_tool_description(
+        let (description, _) = build_exec_tool_description_and_definitions(
             &[ToolDefinition {
                 name: "mcp__sample__alpha".to_string(),
                 tool_name: ToolName::namespaced("mcp__sample__", "alpha"),
@@ -863,6 +971,8 @@ bar"
             crate::DEFAULT_EXEC_YIELD_TIME_MS,
             /*code_mode_only*/ true,
             ImageDetailVisibility::Visible,
+            DeferredToolDiscovery::Catalog,
+            /*incremental_exec_enabled*/ false,
             /*messages*/ None,
         );
 
@@ -943,7 +1053,7 @@ bar"
             })),
         });
 
-        let description = build_exec_tool_description(
+        let (description, _) = build_exec_tool_description_and_definitions(
             &[
                 ToolDefinition {
                     name: first_tool.name,
@@ -969,6 +1079,8 @@ bar"
             crate::DEFAULT_EXEC_YIELD_TIME_MS,
             /*code_mode_only*/ true,
             ImageDetailVisibility::Visible,
+            DeferredToolDiscovery::Catalog,
+            /*incremental_exec_enabled*/ false,
             /*messages*/ None,
         );
 
@@ -1001,13 +1113,15 @@ bar"
             }))),
         };
 
-        let description = build_exec_tool_description(
+        let (description, _) = build_exec_tool_description_and_definitions(
             &[],
             &[deferred_tool],
             &BTreeMap::new(),
             crate::DEFAULT_EXEC_YIELD_TIME_MS,
             /*code_mode_only*/ true,
             ImageDetailVisibility::Visible,
+            DeferredToolDiscovery::Catalog,
+            /*incremental_exec_enabled*/ false,
             /*messages*/ None,
         );
 
@@ -1017,27 +1131,65 @@ bar"
     }
 
     #[test]
-    fn exec_description_mentions_deferred_nested_tools_when_available() {
-        let description = build_exec_tool_description(
-            &[],
-            &[ToolDefinition {
-                name: "deferred_tool".to_string(),
-                tool_name: ToolName::plain("deferred_tool"),
-                description: "Deferred tool".to_string(),
-                kind: CodeModeToolKind::Function,
-                input_schema: None,
-                input_schema_max_bytes: None,
-                output_schema: None,
-            }],
-            &BTreeMap::new(),
-            crate::DEFAULT_EXEC_YIELD_TIME_MS,
-            /*code_mode_only*/ false,
-            ImageDetailVisibility::Visible,
-            /*messages*/ None,
-        );
+    fn exec_description_preserves_discovery_guidance_across_catalog_changes() {
+        let deferred_tools = [ToolDefinition {
+            name: "deferred_tool".to_string(),
+            tool_name: ToolName::plain("deferred_tool"),
+            description: "Deferred tool".to_string(),
+            kind: CodeModeToolKind::Function,
+            input_schema: None,
+            input_schema_max_bytes: None,
+            output_schema: None,
+        }];
+        let search_tool = ToolDefinition {
+            name: "tool_search".to_string(),
+            tool_name: ToolName::plain("tool_search"),
+            description: super::TOOL_SEARCH_GUIDANCE.to_string(),
+            kind: CodeModeToolKind::Function,
+            input_schema: None,
+            input_schema_max_bytes: None,
+            output_schema: None,
+        };
+        for code_mode_only in [false, true] {
+            for discovery in [
+                DeferredToolDiscovery::Catalog,
+                DeferredToolDiscovery::RankedSearch,
+            ] {
+                let enabled_tools = match discovery {
+                    DeferredToolDiscovery::Catalog => Vec::new(),
+                    DeferredToolDiscovery::RankedSearch => vec![search_tool.clone()],
+                };
+                let (description, _) = build_exec_tool_description_and_definitions(
+                    &enabled_tools,
+                    &deferred_tools,
+                    &BTreeMap::new(),
+                    crate::DEFAULT_EXEC_YIELD_TIME_MS,
+                    code_mode_only,
+                    ImageDetailVisibility::Visible,
+                    discovery,
+                    /*incremental_exec_enabled*/ false,
+                    /*messages*/ None,
+                );
+                assert!(description.contains("Some deferred nested tools may be omitted"));
+                assert!(description.contains("filter `ALL_TOOLS` by `name` and `description`"));
+                assert_eq!(
+                    description.matches("await tools.tool_search(").count(),
+                    usize::from(discovery == DeferredToolDiscovery::RankedSearch),
+                );
 
-        assert!(description.contains("Some deferred nested tools may be omitted"));
-        assert!(description.contains("filter `ALL_TOOLS` by `name` and `description`"));
-        assert!(!description.contains("do not print the full `ALL_TOOLS` array"));
+                let (empty_catalog_description, _) = build_exec_tool_description_and_definitions(
+                    &enabled_tools,
+                    &[],
+                    &BTreeMap::new(),
+                    crate::DEFAULT_EXEC_YIELD_TIME_MS,
+                    code_mode_only,
+                    ImageDetailVisibility::Visible,
+                    discovery,
+                    /*incremental_exec_enabled*/ false,
+                    /*messages*/ None,
+                );
+                assert_eq!(description, empty_catalog_description);
+            }
+        }
     }
 }

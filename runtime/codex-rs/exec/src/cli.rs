@@ -17,6 +17,24 @@ pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Command>,
 
+    /// Connect to an existing app server.
+    #[arg(
+        id = "exec_remote",
+        long = "remote",
+        value_name = "ADDR",
+        global = true
+    )]
+    pub remote: Option<String>,
+
+    /// Environment variable containing the remote WebSocket bearer token.
+    #[arg(
+        id = "exec_remote_auth_token_env",
+        long = "remote-auth-token-env",
+        value_name = "ENV_VAR",
+        global = true
+    )]
+    pub remote_auth_token_env: Option<String>,
+
     /// Error out when config.toml contains fields that are not recognized by this version of Codex.
     #[arg(long = "strict-config", global = true, default_value_t = false)]
     pub strict_config: bool,
@@ -28,9 +46,19 @@ pub struct Cli {
     #[arg(long = "thread-source", value_name = "SOURCE", global = true)]
     pub thread_source: Option<ThreadSource>,
 
+    /// Request an experimental Cyber access program for this turn (OpenAI provider only).
+    /// Omit to use server defaults. Not supported with review; fork requires a prompt.
+    #[arg(long, value_enum, value_name = "PROGRAM", global = true)]
+    pub cyber_access_program: Option<CyberAccessProgramCliArg>,
+
     /// Allow running Codex outside a Git repository.
     #[arg(long = "skip-git-repo-check", global = true, default_value_t = false)]
     pub skip_git_repo_check: bool,
+
+    /// Save trust for this project and future chats, including MCP commands outside the sandbox.
+    /// Persists even with --ephemeral. Does not override an explicitly untrusted project.
+    #[arg(long, global = true)]
+    pub trust: bool,
 
     /// Run without persisting session files to disk.
     #[arg(long = "ephemeral", global = true, default_value_t = false)]
@@ -78,6 +106,24 @@ pub struct Cli {
     /// a prompt is also provided, stdin is appended as a `<stdin>` block.
     #[arg(value_name = "PROMPT", value_hint = clap::ValueHint::Other)]
     pub prompt: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[value(rename_all = "snake_case")]
+pub enum CyberAccessProgramCliArg {
+    Standard,
+    DaybreakBlue,
+    DaybreakRed,
+}
+
+impl From<CyberAccessProgramCliArg> for codex_app_server_protocol::CyberAccessProgram {
+    fn from(value: CyberAccessProgramCliArg) -> Self {
+        match value {
+            CyberAccessProgramCliArg::Standard => Self::Standard,
+            CyberAccessProgramCliArg::DaybreakBlue => Self::DaybreakBlue,
+            CyberAccessProgramCliArg::DaybreakRed => Self::DaybreakRed,
+        }
+    }
 }
 
 impl std::ops::Deref for Cli {

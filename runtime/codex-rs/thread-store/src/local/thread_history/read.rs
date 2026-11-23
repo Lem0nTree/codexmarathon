@@ -5,12 +5,12 @@ use serde::Serialize;
 use sqlx::Row;
 
 use super::super::LocalThreadStore;
-use super::super::rollout_lineage::RolloutLineage;
+use super::super::rollout_lineage::LineageWalk;
 use super::segment_paging::page_item_rows;
 use super::segment_paging::page_turn_rows;
 use super::segment_paging::validate_page_size;
 use super::sqlite_integer;
-use super::turn_lookup::find_source_turn;
+use super::turn_lookup::find_turn;
 use crate::ItemPage;
 use crate::ListItemsParams;
 use crate::ListTurnsParams;
@@ -52,6 +52,7 @@ pub(super) struct RolloutHistoryPosition {
 pub(super) struct StoredTurnRow {
     pub position: RolloutHistoryPosition,
     pub turn_id: String,
+    pub root_turn_id: Option<String>,
     pub status: StoredTurnStatus,
     pub error: Option<StoredTurnError>,
     pub started_at: Option<i64>,
@@ -110,12 +111,12 @@ pub(in crate::local) async fn list_turns(
     )
     .await?;
     validate_page_size(params.page_size)?;
-    let lineage = store.resolve_rollout_lineage(params.thread_id).await?;
     let pool = store.thread_history_db().await?;
+    let mut lineage = LineageWalk::for_history_page(store, params.thread_id);
     let page = page_turn_rows(
         pool,
         params.thread_id,
-        &lineage,
+        &mut lineage,
         params.cursor.as_deref(),
         params.page_size,
         params.sort_direction,
@@ -133,12 +134,13 @@ pub(in crate::local) async fn list_turns(
             {
                 // Synthetic fork-boundary rows are interrupted without local summary IDs.
                 // Load their summary from the earliest visible source turn.
-                load_inherited_summary_items(pool, &lineage, &turn).await?
+                load_inherited_summary_items(pool, &mut lineage, &turn).await?
             }
             StoredTurnItemsView::Summary => turn.summary_items,
         };
         turns.push(StoredTurn {
             turn_id: turn.turn_id,
+            root_turn_id: turn.root_turn_id,
             items,
             items_view: params.items_view,
             status: turn.status,
@@ -158,7 +160,7 @@ pub(in crate::local) async fn list_turns(
 
 pub(in crate::local) async fn list_items(
     store: &LocalThreadStore,
-    params: ListItemsParams,
+    mut params: ListItemsParams,
 ) -> ThreadStoreResult<ItemPage> {
     validate_thread_for_paginated_reads(
         store,
@@ -167,10 +169,26 @@ pub(in crate::local) async fn list_items(
         "list_items",
     )
     .await?;
+    if let Some(ids) = &params.item_ids {
+        if params.turn_id.is_none()
+            || params.position.is_some()
+            || params.after_updated_at_ordinal.is_some()
+            || params.before_updated_at_ordinal.is_some()
+            || params.sort_key != crate::ItemSortKey::CreatedAtOrdinal
+            || !(1..=100).contains(&ids.len())
+        {
+            return Err(ThreadStoreError::InvalidRequest {
+                message: "itemIds requires turnId, 1 to 100 IDs, and no cursor or update replay"
+                    .to_string(),
+            });
+        }
+        params.page_size = ids.len();
+        params.sort_direction = crate::SortDirection::Asc;
+    }
     validate_page_size(params.page_size)?;
-    let lineage = store.resolve_rollout_lineage(params.thread_id).await?;
     let pool = store.thread_history_db().await?;
-    let page = page_item_rows(pool, &lineage, &params).await?;
+    let mut lineage = LineageWalk::for_history_page(store, params.thread_id);
+    let page = page_item_rows(pool, &mut lineage, &params).await?;
 
     Ok(ItemPage {
         items: page.rows.into_iter().map(|row| row.item).collect(),
@@ -211,12 +229,12 @@ pub(super) async fn validate_thread_for_paginated_reads(
 
 async fn load_inherited_summary_items(
     pool: &sqlx::SqlitePool,
-    lineage: &RolloutLineage,
+    lineage: &mut LineageWalk<'_>,
     turn: &StoredTurnRow,
 ) -> ThreadStoreResult<Vec<StoredThreadItem>> {
-    let source = find_source_turn(pool, lineage, turn.turn_id.as_str()).await?;
+    let lineage = lineage.resolve_all().await?;
+    let source = find_turn(pool, lineage.iter().rev(), turn.turn_id.as_str()).await?;
     let Some(segment) = lineage
-        .segments()
         .iter()
         .find(|segment| segment.rollout_id() == source.rollout_id)
     else {
@@ -308,6 +326,7 @@ pub(super) fn stored_turn_row(row: sqlx::sqlite::SqliteRow) -> ThreadStoreResult
             rollout_ordinal: row.try_get("rollout_ordinal")?,
         },
         turn_id: row.try_get("turn_id")?,
+        root_turn_id: row.try_get("root_turn_id")?,
         status,
         error,
         started_at: row.try_get("started_at")?,

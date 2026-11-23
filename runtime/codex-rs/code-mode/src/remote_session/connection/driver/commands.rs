@@ -1,14 +1,16 @@
 use std::sync::Arc;
 
-use codex_code_mode_protocol::CellId;
-use codex_code_mode_protocol::CodeModeSessionCellExecutionLimits;
+use codex_code_mode_protocol::CodeModeOutputTruncation;
 use codex_code_mode_protocol::CodeModeSessionDelegate;
-use codex_code_mode_protocol::ExecuteRequest;
+use codex_code_mode_protocol::CodeModeSessionOptions;
+use codex_code_mode_protocol::TerminateRequest;
 use codex_code_mode_protocol::WaitOutcome;
 use codex_code_mode_protocol::WaitRequest;
 use codex_code_mode_protocol::host::ClientToHost;
 use codex_code_mode_protocol::host::EncodedFrame;
 use codex_code_mode_protocol::host::HostRequest;
+use codex_code_mode_protocol::host::WireExecuteRequest;
+use codex_code_mode_protocol::host::WireOutputTruncation;
 use codex_code_mode_protocol::host::WireSessionCellExecutionLimits;
 use codex_code_mode_protocol::host::WireWaitRequest;
 use tokio::sync::oneshot;
@@ -30,11 +32,11 @@ impl ConnectionDriver {
         match command {
             DriverCommand::OpenSession {
                 session,
-                limits,
+                options,
                 cleanup,
                 caller_cancellation,
                 response_tx,
-            } => self.open_session(session, limits, cleanup, caller_cancellation, response_tx),
+            } => self.open_session(session, options, cleanup, caller_cancellation, response_tx),
             DriverCommand::Execute {
                 session,
                 request,
@@ -65,9 +67,9 @@ impl ConnectionDriver {
             ),
             DriverCommand::Terminate {
                 session,
-                cell_id,
+                request,
                 response_tx,
-            } => self.terminate(session, cell_id, response_tx),
+            } => self.terminate(session, request, response_tx),
             DriverCommand::ShutdownSession {
                 session,
                 response_tx,
@@ -78,7 +80,7 @@ impl ConnectionDriver {
     fn open_session(
         &mut self,
         session: RemoteSession,
-        limits: CodeModeSessionCellExecutionLimits,
+        options: CodeModeSessionOptions,
         cleanup: super::cleanup::SessionCleanup,
         caller_cancellation: CancellationToken,
         response_tx: oneshot::Sender<Result<(), String>>,
@@ -90,7 +92,7 @@ impl ConnectionDriver {
             )));
             return true;
         }
-        let limits = match WireSessionCellExecutionLimits::try_from(limits) {
+        let limits = match WireSessionCellExecutionLimits::try_from(options.cell_execution_limits) {
             Ok(limits) => limits,
             Err(error) => {
                 let _ = response_tx.send(Err(format!(
@@ -112,6 +114,8 @@ impl ConnectionDriver {
                 session_id: session.id.clone(),
                 cell_execution_limits: (limits != WireSessionCellExecutionLimits::default())
                     .then_some(limits),
+                output_truncation: (options.output_truncation == CodeModeOutputTruncation::Server)
+                    .then_some(WireOutputTruncation::Server),
             },
         };
         let frame = match EncodedFrame::encode(&message) {
@@ -140,7 +144,7 @@ impl ConnectionDriver {
     fn execute(
         &mut self,
         session: RemoteSession,
-        request: ExecuteRequest,
+        request: WireExecuteRequest,
         delegate: Arc<dyn CodeModeSessionDelegate>,
         caller_cancellation: CancellationToken,
         yield_signal: Option<CancellationToken>,
@@ -150,15 +154,6 @@ impl ConnectionDriver {
             let _ = response_tx.send(Err(err));
             return true;
         }
-        let request = match request.try_into() {
-            Ok(request) => request,
-            Err(err) => {
-                let _ = response_tx.send(Err(format!(
-                    "failed to encode code-mode execute request: {err}"
-                )));
-                return true;
-            }
-        };
         let request_id = match self.requests.allocate_id() {
             Ok(id) => id,
             Err(err) => {
@@ -212,6 +207,7 @@ impl ConnectionDriver {
             let _ = response_tx.send(Err(err));
             return true;
         }
+        let max_output_tokens = request.max_output_tokens;
         let request = match remote_wait_request(&session, request) {
             Ok(request) => request,
             Err(err) => {
@@ -223,6 +219,7 @@ impl ConnectionDriver {
             self.requests.push_deferred_wait(DeferredWait {
                 session,
                 request,
+                max_output_tokens,
                 caller_cancellation,
                 yield_signal,
                 response_tx,
@@ -232,6 +229,7 @@ impl ConnectionDriver {
         self.start_wait(
             session,
             request,
+            max_output_tokens,
             caller_cancellation,
             yield_signal,
             response_tx,
@@ -242,6 +240,7 @@ impl ConnectionDriver {
         &mut self,
         session: RemoteSession,
         request: WireWaitRequest,
+        max_output_tokens: Option<usize>,
         caller_cancellation: CancellationToken,
         yield_signal: Option<CancellationToken>,
         response_tx: oneshot::Sender<Result<WaitOutcome, String>>,
@@ -251,6 +250,7 @@ impl ConnectionDriver {
             HostRequest::Wait {
                 session_id: session.id.clone(),
                 request,
+                max_output_tokens,
             },
             PendingRequest::Wait {
                 session,
@@ -265,14 +265,14 @@ impl ConnectionDriver {
     fn terminate(
         &mut self,
         session: RemoteSession,
-        cell_id: CellId,
+        request: TerminateRequest,
         response_tx: oneshot::Sender<Result<WaitOutcome, String>>,
     ) -> bool {
         if let Err(err) = self.sessions.require_ready(&session) {
             let _ = response_tx.send(Err(err));
             return true;
         }
-        let cell_id = match remote_cell_id(&session, &cell_id) {
+        let cell_id = match remote_cell_id(&session, &request.cell_id) {
             Ok(cell_id) => cell_id,
             Err(err) => {
                 let _ = response_tx.send(Err(err));
@@ -284,6 +284,7 @@ impl ConnectionDriver {
             HostRequest::Terminate {
                 session_id: session.id.clone(),
                 cell_id,
+                max_output_tokens: request.max_output_tokens,
             },
             PendingRequest::Terminate {
                 session,

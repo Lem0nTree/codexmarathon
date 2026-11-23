@@ -29,7 +29,7 @@ use codex_app_server_protocol::MarathonSwitchResponse;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ServerNotification;
 use codex_arg0::Arg0DispatchPaths;
-use codex_cloud_config::cloud_config_bundle_loader_for_storage;
+use codex_cloud_config::managed_config_bundle_loader_for_storage;
 use codex_config::CloudConfigBundleLoader;
 use codex_config::LoaderOverrides;
 use codex_core::config::Config;
@@ -285,6 +285,7 @@ async fn start_client_with_prepared(
         config,
         cli_overrides,
         cloud_config_bundle,
+        network_policy,
     } = prepared;
 
     let config_warnings = config
@@ -304,13 +305,14 @@ async fn start_client_with_prepared(
     ));
 
     Ok(InProcessAppServerClient::start(InProcessClientStartArgs {
+        required_human_approval: false,
         arg0_paths,
         config: Arc::new(config),
         cli_overrides,
         loader_overrides,
         strict_config,
         cloud_config_bundle,
-        embedded_network_policy: Default::default(),
+        embedded_network_policy: network_policy,
         feedback: CodexFeedback::new(),
         log_db: None,
         state_db: None,
@@ -333,6 +335,7 @@ struct PreparedConfig {
     config: Config,
     cli_overrides: Vec<(String, toml::Value)>,
     cloud_config_bundle: CloudConfigBundleLoader,
+    network_policy: codex_app_server::in_process::EmbeddedNetworkPolicy,
 }
 
 async fn prepare_config(
@@ -352,23 +355,29 @@ async fn prepare_config(
         .strict_config(strict_config)
         .build()
         .await?;
-    let cloud_config_bundle = cloud_config_bundle_loader_for_storage(
-        bootstrap_config.auth_config(),
+    let network_policy =
+        codex_app_server::in_process::EmbeddedNetworkPolicy::load(loader_overrides).await;
+    let cloud_config_bundle = managed_config_bundle_loader_for_storage(
+        network_policy.bind_bootstrap_auth(bootstrap_config.auth_config()),
+        bootstrap_config.config_layer_stack.requirements_toml(),
         /*enable_codex_api_key_env*/ false,
     )
     .await?;
-    let config = ConfigBuilder::default()
+    let mut config = ConfigBuilder::default()
         .cli_overrides(cli_overrides.clone())
         .loader_overrides(loader_overrides.clone())
         .strict_config(strict_config)
         .cloud_config_bundle(cloud_config_bundle.clone())
         .build()
         .await?;
+    config.config_layer_stack.ensure_config_server_applied()?;
+    network_policy.activate(&mut config);
 
     Ok(PreparedConfig {
         config,
         cli_overrides,
         cloud_config_bundle,
+        network_policy,
     })
 }
 

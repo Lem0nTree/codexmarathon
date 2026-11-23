@@ -20,12 +20,7 @@ impl ExecutedToolCalls {
         let Some(state) = state.as_mut() else {
             return false;
         };
-        Self::attach_pending_to_prompt_with_state(
-            state,
-            items,
-            retry_cache,
-            MetadataBudgetScope::AllCalls,
-        )
+        Self::attach_pending_to_prompt_with_state(state, items, retry_cache, RequestKind::Sampling)
     }
 }
 
@@ -105,6 +100,34 @@ fn tool_calls_complete(item: &ResponseItem) -> Option<bool> {
 }
 
 #[test]
+fn selected_exec_result_uses_only_the_retained_wrapper_inventory() {
+    let recorder = new_recorder(InitialHistory::New);
+    let cell = CellId::new("cell".to_string());
+    recorder.start_cell(&cell, "exec");
+    recorder.record_nested_tool_call(
+        cell.clone(),
+        "inner".to_owned(),
+        ExecutedToolCall::new("normalized-alias__lookup".to_owned(), json!({})),
+        /*original_bytes*/ 2,
+    );
+    recorder.finish_cell_recording(&cell);
+    let exec = exec_output("exec");
+    let tools = ["normalized_alias__lookup".to_owned()];
+    assert!(!recorder.exec_output_matches(&exec, &tools));
+    let mut prompt = vec![exec_input("exec"), exec.clone()];
+    recorder.attach_to_prompt(&mut prompt, &mut HashMap::new());
+
+    assert!(recorder.exec_output_matches(&exec, &tools));
+    assert!(recorder.exec_output_matches(&exec, &["normalized-alias__lookup".to_owned()]));
+    assert!(!recorder.exec_output_matches(&exec, &["another_tool".to_owned()]));
+    assert!(!recorder.exec_output_matches(&exec_output("inner"), &tools));
+    assert!(!recorder.exec_output_matches(&output("exec"), &tools));
+
+    recorder.attach_to_prompt(&mut [], &mut HashMap::new());
+    assert!(!recorder.exec_output_matches(&exec, &tools));
+}
+
+#[test]
 fn compaction_attaches_pending_and_retained_code_mode_metadata() {
     for previously_sampled in [false, true] {
         let recorder = new_recorder(InitialHistory::New);
@@ -145,147 +168,135 @@ fn compaction_attaches_pending_and_retained_code_mode_metadata() {
 }
 
 #[test]
-fn failed_compaction_preserves_observations_absent_from_trimmed_retries() {
-    let call_count = 100;
-    for rebudget in [false, true] {
-        let recorder = new_recorder(InitialHistory::New);
-        let mut history = Vec::new();
-        for origin in ["old", "recent"] {
-            let cell = CellId::new(origin.to_string());
-            recorder.start_cell(&cell, origin);
-            for index in 0..call_count {
-                record_nested_call(&recorder, &cell, &format!("nested-{index}"));
-            }
-            recorder.finish_cell_recording(&cell);
-            history.extend([exec_input(origin), exec_output(origin)]);
-        }
-        let mut full_attempt = history.clone();
-        recorder.attach_to_compaction_prompt(&mut full_attempt);
-        assert_eq!(tool_calls_complete(&full_attempt[1]), Some(true));
+fn large_direct_and_code_mode_metadata_survive_sampling_and_compaction() {
+    let recorder = new_recorder(InitialHistory::New);
+    recorder
+        .retained_direct_metadata_bytes
+        .store(MAX_RETAINED_DIRECT_METADATA_BYTES, Ordering::Relaxed);
 
-        if rebudget {
-            // Late results make the retained retry item exceed the budget independently of
-            // the older output that the compaction retry has temporarily removed.
-            let source = ToolCallSource::CodeMode {
-                cell_id: "recent".to_string(),
-                runtime_tool_call_id: "runtime".to_string(),
-            };
-            for index in 0..call_count {
-                assert!(recorder.record_tool_result_metadata(
-                    &source,
-                    &format!("nested-{index}"),
-                    &json!({"provider": "x".repeat(24 * 1024)}),
-                ));
-            }
-        }
-        let mut trimmed_attempt = history[2..].to_vec();
-        recorder.attach_to_compaction_prompt(&mut trimmed_attempt);
-        assert_eq!(tool_calls_complete(&trimmed_attempt[1]), Some(true));
-        if rebudget {
-            let encoded = serde_json::to_value(&trimmed_attempt[1]).unwrap();
-            assert!(
-                encoded["internal_chat_message_metadata_passthrough"]["executed_tool_calls"][0]["tool_result_metadata"]
-                    .as_str()
-                    .is_some_and(|marker| marker.starts_with("omitted_due_to_size_limit (overage_bytes=")),
-            );
-        }
+    let direct_metadata = json!({"openai/resource_access": {"data": "d".repeat(900 * 1024)}});
+    let mut direct_call = ExecutedToolCall::new("direct_tool".to_string(), json!({}));
+    direct_call.set_tool_result_metadata(ToolResultMetadata::new(&direct_metadata));
+    let ordinary_direct = output("direct");
+    let mut direct = ordinary_direct.clone();
+    recorder.attach_direct_call_to_output(
+        &mut direct,
+        Some((direct_call, recorder.reserve_direct_call().unwrap())),
+        &codex_protocol_test_support::uuid_v7_item_id_generator_for_test(),
+    );
+    assert!(direct.executed_tool_call_metadata().is_none());
 
-        // Exhausted retries leave the session's original history intact.
-        let mut expected = full_attempt;
-        expected[2..].clone_from_slice(&trimmed_attempt);
-        // The restored inventory must fit without causing another round of raw-result shedding.
-        assert!(
-            expected
-                .iter()
-                .map(executed_tool_call_metadata_bytes)
-                .sum::<usize>()
-                <= 2 * 1024 * 1024
-        );
-        let mut resumed = history.clone();
-        recorder.attach_to_prompt(&mut resumed, &mut HashMap::new());
-        assert_eq!(resumed, expected);
-        // Once ordinary sampling advances to a smaller window, the old record is pruned.
-        recorder.attach_to_prompt(&mut history[2..], &mut HashMap::new());
-        let mut old = vec![exec_input("old"), exec_output("old")];
-        recorder.attach_to_prompt(&mut old, &mut HashMap::new());
-        assert_eq!(old, vec![exec_input("old"), exec_output("old")]);
-    }
+    let cell = CellId::new("code-cell".to_string());
+    recorder.start_cell(&cell, "exec");
+    record_nested_call(&recorder, &cell, "nested");
+    let code_metadata = json!({"openai/resource_access": {"data": "c".repeat(1400 * 1024)}});
+    let source = ToolCallSource::CodeMode {
+        cell_id: cell.as_str().to_string(),
+        runtime_tool_call_id: "nested".to_string(),
+    };
+    assert!(recorder.record_tool_result_metadata(&source, "nested", &code_metadata));
+    recorder.finish_cell_recording(&cell);
+    let ordinary_code = ResponseItem::from(ResponseInputItem::CustomToolCallOutput {
+        call_id: "exec".to_string(),
+        name: None,
+        output: FunctionCallOutputPayload::from_text("ordinary result".to_string()),
+    });
+    let history = vec![direct, exec_input("exec"), ordinary_code.clone()];
+
+    let mut compact = history.clone();
+    recorder.attach_to_compaction_prompt(&mut compact);
+    assert!(
+        compact
+            .iter()
+            .map(executed_tool_call_metadata_bytes)
+            .sum::<usize>()
+            > 2 * 1024 * 1024
+    );
+    let direct_wire = serde_json::to_value(&compact[0]).unwrap();
+    let code_wire = serde_json::to_value(&compact[2]).unwrap();
+    assert_eq!(
+        direct_wire["output"],
+        serde_json::to_value(&ordinary_direct).unwrap()["output"]
+    );
+    assert_eq!(
+        code_wire["output"],
+        serde_json::to_value(&ordinary_code).unwrap()["output"]
+    );
+    assert_eq!(
+        direct_wire["internal_chat_message_metadata_passthrough"]["executed_tool_calls"][0]["tool_result_metadata"],
+        direct_metadata
+    );
+    assert_eq!(
+        code_wire["internal_chat_message_metadata_passthrough"]["executed_tool_calls"][0]["tool_result_metadata"],
+        code_metadata
+    );
+    assert_eq!(tool_calls_complete(&compact[2]), Some(true));
+
+    let mut sampled = history.clone();
+    recorder.attach_to_prompt(&mut sampled, &mut HashMap::new());
+    assert_eq!(sampled, compact);
+
+    // A smaller window still has the full Code Mode result and its completion marker.
+    let mut next = history[1..].to_vec();
+    recorder.attach_to_prompt(&mut next, &mut HashMap::new());
+    assert_eq!(next[1], compact[2]);
 }
 
 #[test]
-fn compaction_bounds_code_mode_metadata_without_rebudgeting_direct_history() {
+fn failed_compaction_preserves_observations_absent_from_trimmed_retries() {
     let recorder = new_recorder(InitialHistory::New);
-    let mut history = Vec::new();
-    let arguments = json!({"value": "x".repeat(7 * 1024)});
-    let argument_bytes = serialized_json_bytes(&arguments).unwrap();
-    for index in 0..96 {
-        let origin = format!("exec-{index}");
-        let cell = CellId::new(format!("cell-{index}"));
-        recorder.start_cell(&cell, &origin);
-        let mut call = ExecutedToolCall::new("nested_tool".to_string(), arguments.clone());
-        call.set_tool_result_metadata(ToolResultMetadata::new(&json!({
-            "provider": "x".repeat(24 * 1024),
-        })));
-        recorder.record_nested_tool_call(
-            cell.clone(),
-            format!("nested-{index}"),
-            call,
-            argument_bytes,
-        );
+    recorder
+        .retained_direct_metadata_bytes
+        .store(MAX_RETAINED_DIRECT_METADATA_BYTES, Ordering::Relaxed);
+    let mut direct = output("direct");
+    let mut direct_call = ExecutedToolCall::new("direct_tool".to_string(), json!({}));
+    direct_call.set_tool_result_metadata(ToolResultMetadata::new(&json!({"resource": "old"})));
+    recorder.attach_direct_call_to_output(
+        &mut direct,
+        Some((direct_call, recorder.reserve_direct_call().unwrap())),
+        &codex_protocol_test_support::uuid_v7_item_id_generator_for_test(),
+    );
+    assert!(direct.executed_tool_call_metadata().is_none());
+    let mut history = vec![direct.clone()];
+    for origin in ["old", "recent"] {
+        let cell = CellId::new(origin.to_string());
+        recorder.start_cell(&cell, origin);
+        record_nested_call(&recorder, &cell, "nested");
         recorder.finish_cell_recording(&cell);
-        history.extend([exec_input(&origin), exec_output(&origin)]);
+        history.extend([exec_input(origin), exec_output(origin)]);
     }
-    let direct_start = history.len();
-    for index in 0..24 {
-        let mut item = output(&format!("direct-{index}"));
-        let mut call = ExecutedToolCall::new("direct_tool".to_string(), arguments.clone());
-        call.set_tool_result_metadata(ToolResultMetadata::new(&json!({"id": index})));
-        recorder.attach_direct_call_to_output(
-            &mut item,
-            Some((call, recorder.reserve_direct_call().unwrap())),
-        );
-        history.push(item);
-    }
-    assert!(
-        history[direct_start..]
-            .iter()
-            .map(executed_tool_call_metadata_bytes)
-            .sum::<usize>()
-            > 128 * 1024
+    let mut full_attempt = history.clone();
+    recorder.attach_to_compaction_prompt(&mut full_attempt);
+    assert_eq!(tool_calls_complete(&full_attempt[0]), Some(true));
+    assert_eq!(tool_calls_complete(&full_attempt[2]), Some(true));
+
+    let source = ToolCallSource::CodeMode {
+        cell_id: "recent".to_string(),
+        runtime_tool_call_id: "runtime".to_string(),
+    };
+    let large_metadata = json!({"provider": "x".repeat(2100 * 1024)});
+    assert!(recorder.record_tool_result_metadata(&source, "nested", &large_metadata));
+    let mut trimmed_attempt = history[3..].to_vec();
+    recorder.attach_to_compaction_prompt(&mut trimmed_attempt);
+    assert_eq!(tool_calls_complete(&trimmed_attempt[1]), Some(true));
+    let encoded = serde_json::to_value(&trimmed_attempt[1]).unwrap();
+    assert_eq!(
+        encoded["internal_chat_message_metadata_passthrough"]["executed_tool_calls"][0]["tool_result_metadata"],
+        large_metadata
     );
 
-    let mut code_mode_only = history[..direct_start].to_vec();
-    recorder.attach_to_compaction_prompt(&mut code_mode_only);
-    let mut compact = history.clone();
-    recorder.attach_to_compaction_prompt(&mut compact);
-    assert_eq!(&compact[direct_start..], &history[direct_start..]);
-    assert_eq!(&compact[..direct_start], &code_mode_only);
-    assert!(
-        compact[..direct_start]
-            .iter()
-            .map(executed_tool_call_metadata_bytes)
-            .sum::<usize>()
-            <= 2 * 1024 * 1024
-    );
-    let mut newest = exec_output("exec-95");
-    let mut newest_call = ExecutedToolCall::new("nested_tool".to_string(), arguments);
-    newest_call.set_tool_result_metadata(ToolResultMetadata::new(&json!({
-        "provider": "x".repeat(24 * 1024),
-    })));
-    newest.append_executed_tool_calls(vec![newest_call]);
-    newest.set_tool_call_cell_id("exec-95");
-    newest.mark_tool_calls_complete();
-    assert_eq!(compact[direct_start - 1], newest);
-    let oldest = serde_json::to_value(&compact[1]).unwrap();
-    assert!(
-        oldest["internal_chat_message_metadata_passthrough"]["executed_tool_calls"][0]["tool_result_metadata"]
-            .as_str()
-            .is_some_and(|marker| marker.starts_with("omitted_due_to_size_limit (overage_bytes=")),
-    );
-    assert_eq!(tool_calls_complete(&compact[1]), Some(true));
-    let mut retry = history;
-    recorder.attach_to_compaction_prompt(&mut retry);
-    assert_eq!(retry, compact);
+    // Failed retries do not install the trimmed history or lose older observations.
+    let mut expected = full_attempt;
+    expected[3..].clone_from_slice(&trimmed_attempt);
+    let mut resumed = history.clone();
+    recorder.attach_to_prompt(&mut resumed, &mut HashMap::new());
+    assert_eq!(resumed, expected);
+
+    // Normal sampling in the smaller window can prune the old observation.
+    recorder.attach_to_prompt(&mut history[3..], &mut HashMap::new());
+    let mut old = vec![direct.clone(), exec_input("old"), exec_output("old")];
+    recorder.attach_to_prompt(&mut old, &mut HashMap::new());
+    assert_eq!(old, vec![direct, exec_input("old"), exec_output("old")]);
 }
 
 #[test]
@@ -299,6 +310,7 @@ fn compaction_keeps_direct_outputs_in_code_mode_binding_validation() {
     recorder.attach_direct_call_to_output(
         &mut direct,
         Some((call.clone(), recorder.reserve_direct_call().unwrap())),
+        &codex_protocol_test_support::uuid_v7_item_id_generator_for_test(),
     );
     let mut compact = vec![exec_input("exec"), exec_output("exec"), direct.clone()];
     recorder.attach_to_compaction_prompt(&mut compact);
@@ -321,8 +333,10 @@ fn direct_retained_metadata_budget_sheds_results_then_calls_across_refresh() {
     recorder.attach_direct_call_to_output(
         &mut first,
         Some((call.clone(), recorder.reserve_direct_call().unwrap())),
+        &codex_protocol_test_support::uuid_v7_item_id_generator_for_test(),
     );
     let mut expected_first = output("first");
+    expected_first.set_id(first.id().cloned());
     expected_first.append_executed_tool_calls(vec![call.clone()]);
     expected_first.mark_tool_calls_complete();
     assert_eq!(first, expected_first);
@@ -355,7 +369,9 @@ fn direct_retained_metadata_budget_sheds_results_then_calls_across_refresh() {
     recorder.clone().attach_direct_call_to_output(
         &mut resource_only_output,
         Some((call.clone(), recorder.reserve_direct_call().unwrap())),
+        &codex_protocol_test_support::uuid_v7_item_id_generator_for_test(),
     );
+    expected_resource_only.set_id(resource_only_output.id().cloned());
     assert_eq!(resource_only_output, expected_resource_only);
     assert_eq!(
         recorder
@@ -378,8 +394,10 @@ fn direct_retained_metadata_budget_sheds_results_then_calls_across_refresh() {
     recorder.clone().attach_direct_call_to_output(
         &mut second,
         Some((call.clone(), recorder.reserve_direct_call().unwrap())),
+        &codex_protocol_test_support::uuid_v7_item_id_generator_for_test(),
     );
     let mut expected_second = output("second");
+    expected_second.set_id(second.id().cloned());
     expected_second.append_executed_tool_calls(vec![ExecutedToolCall::new(
         "test_tool".to_string(),
         json!({"argument": "kept"}),
@@ -416,6 +434,7 @@ fn direct_retained_metadata_budget_sheds_results_then_calls_across_refresh() {
     recorder.attach_direct_call_to_output(
         &mut third,
         Some((call, recorder.reserve_direct_call().unwrap())),
+        &codex_protocol_test_support::uuid_v7_item_id_generator_for_test(),
     );
     assert!(third.executed_tool_call_metadata().is_none());
     assert_eq!(
@@ -424,6 +443,33 @@ fn direct_retained_metadata_budget_sheds_results_then_calls_across_refresh() {
             .load(Ordering::Relaxed),
         MAX_RETAINED_DIRECT_METADATA_BYTES,
     );
+}
+
+#[tokio::test]
+async fn stale_runtime_refresh_preserves_recording_state() {
+    let (session, _turn) = crate::session::tests::make_session_and_context().await;
+    let calls = session.services.executed_tool_calls.clone();
+    assert!(calls.lock_state().is_none());
+    let stale_owner = session.get_config().await;
+    let mut stale_config = stale_owner.as_ref().clone();
+    stale_config
+        .features
+        .enable(Feature::ExecutedToolCallMetadata)
+        .expect("enable executed tool call metadata");
+    assert_eq!(
+        session
+            .refresh_mcp_config(Arc::clone(&stale_owner), stale_owner.as_ref().clone())
+            .await,
+        crate::ConfigRefreshOutcome::Published
+    );
+
+    assert_eq!(
+        session
+            .refresh_runtime_config(stale_owner, stale_config)
+            .await,
+        crate::ConfigRefreshOutcome::Stale
+    );
+    assert!(calls.lock_state().is_none());
 }
 
 #[tokio::test]
@@ -462,11 +508,14 @@ async fn recorder_refreshes_without_changing_execution_features_or_claiming_miss
     let mut retry_cache = HashMap::new();
     let mut prior_generation = None;
     for (index, enabled) in [false, true, false, true].into_iter().enumerate() {
+        let current_config = session.get_config().await;
         next_config
             .features
             .set_enabled(Feature::ExecutedToolCallMetadata, enabled)
             .expect("test feature must be configurable");
-        session.refresh_runtime_config(next_config.clone()).await;
+        let _ = session
+            .refresh_runtime_config(current_config, next_config.clone())
+            .await;
         assert_eq!(calls.lock_state().is_some(), enabled);
         // A legacy file reload has no new rollout snapshot and must keep this setting.
         session.reload_user_config_layer().await;
@@ -484,6 +533,7 @@ async fn recorder_refreshes_without_changing_execution_features_or_claiming_miss
                 arguments: r#"{"value":7}"#.to_string(),
             },
             encrypted_function_args: None,
+            native_call: None,
         };
         let prepared = calls.prepare_direct_call(&call, &ToolCallSource::Direct, &step);
         let expected = ExecutedToolCall::new("test_tool".to_string(), json!({"value": 7}));
@@ -494,13 +544,21 @@ async fn recorder_refreshes_without_changing_execution_features_or_claiming_miss
         if enabled {
             if let Some(stale) = prior_generation.take() {
                 let mut stale_output = output("stale");
-                calls.attach_direct_call_to_output(&mut stale_output, Some(stale));
+                calls.attach_direct_call_to_output(
+                    &mut stale_output,
+                    Some(stale),
+                    &session.item_id_generator,
+                );
                 assert!(stale_output.executed_tool_call_metadata().is_none());
             }
             prior_generation = calls.prepare_direct_call(&call, &ToolCallSource::Direct, &step);
         }
         let mut direct_output = output(&call.call_id);
-        calls.attach_direct_call_to_output(&mut direct_output, prepared);
+        calls.attach_direct_call_to_output(
+            &mut direct_output,
+            prepared,
+            &session.item_id_generator,
+        );
         assert_eq!(
             direct_output
                 .executed_tool_call_metadata()
@@ -508,6 +566,26 @@ async fn recorder_refreshes_without_changing_execution_features_or_claiming_miss
             enabled.then_some(&vec![expected]),
         );
         assert_eq!(tool_calls_complete(&direct_output), enabled.then_some(true));
+
+        if enabled {
+            // Reapplying an enabled config must preserve already-recorded calls.
+            let prepared = calls.prepare_direct_call(&call, &ToolCallSource::Direct, &step);
+            let current_config = session.get_config().await;
+            assert_eq!(
+                session
+                    .refresh_runtime_config(current_config, next_config.clone())
+                    .await,
+                crate::ConfigRefreshOutcome::Published
+            );
+            let mut replay = output(&call.call_id);
+            // Replay the same history item across the configuration refresh.
+            replay.set_id(direct_output.id().cloned());
+            calls.attach_direct_call_to_output(&mut replay, prepared, &session.item_id_generator);
+            assert_eq!(
+                replay.executed_tool_call_metadata(),
+                direct_output.executed_tool_call_metadata()
+            );
+        }
 
         let cell = CellId::new(format!("cell-{index}"));
         let origin = format!("exec-{index}");
@@ -523,7 +601,13 @@ async fn recorder_refreshes_without_changing_execution_features_or_claiming_miss
         nested.set_tool_result_metadata(ToolResultMetadata::new(&json!({})));
         if enabled {
             // Reapplying an enabled config must preserve pending calls and their metadata.
-            session.refresh_runtime_config(next_config.clone()).await;
+            let current_config = session.get_config().await;
+            assert_eq!(
+                session
+                    .refresh_runtime_config(current_config, next_config.clone())
+                    .await,
+                crate::ConfigRefreshOutcome::Published
+            );
         }
         calls.finish_cell_recording(&cell);
         let mut prompt = vec![exec_input(&origin), exec_output(&origin)];
@@ -551,6 +635,7 @@ fn executed_tool_call_recorder_bounds_pending_calls_and_preserves_overflow() {
                     input: "".to_string(),
                 },
                 encrypted_function_args: None,
+                native_call: None,
             },
             &ToolCallSource::Direct,
             ToolMode::CodeMode,
@@ -651,79 +736,6 @@ fn executed_tool_call_recorder_bounds_pending_calls_and_preserves_overflow() {
     let state = state.as_ref().unwrap();
     assert!(state.retained_calls.is_empty());
     assert!(!state.cells.contains_key(&cell_id));
-}
-
-#[test]
-fn executed_tool_call_recorder_bounds_retained_history_and_keeps_latest_calls() {
-    let recorder = new_recorder(InitialHistory::Forked(Vec::new()));
-    let mut history = Vec::new();
-    let arguments = json!({ "payload": "x".repeat(7 * 1024) });
-    let argument_bytes = serialized_json_bytes(&arguments).expect("tool arguments must serialize");
-    let cell_count = 100;
-    let calls_per_cell = 4;
-    assert!(argument_bytes < MAX_EXECUTED_TOOL_CALL_ARGUMENT_BYTES);
-    assert!(
-        argument_bytes * calls_per_cell < MAX_EXECUTED_TOOL_CALL_FULL_ARGUMENT_BYTES_PER_OUTPUT
-    );
-    assert!(argument_bytes * calls_per_cell * cell_count > 2 * 1024 * 1024);
-    let mut prompt = Vec::new();
-
-    for index in 0..cell_count {
-        let call_id = format!("retained-{index}");
-        let cell_id = CellId::new(format!("retained-cell-{index}"));
-        recorder.start_cell(&cell_id, &call_id);
-        let expected_calls = (0..calls_per_cell)
-            .map(|nested_index| {
-                ExecutedToolCall::new(
-                    format!("retained_tool_{index}_{nested_index}"),
-                    arguments.clone(),
-                )
-            })
-            .collect::<Vec<_>>();
-        for (nested_index, call) in expected_calls.iter().enumerate() {
-            recorder.record_nested_tool_call(
-                cell_id.clone(),
-                format!("nested-{index}-{nested_index}"),
-                call.clone(),
-                argument_bytes,
-            );
-        }
-        recorder.finish_cell_recording(&cell_id);
-        history.extend([exec_input(&call_id), exec_output(&call_id)]);
-        prompt = history.clone();
-        assert!(recorder.attach_pending_to_prompt(&mut prompt, &mut HashMap::new()));
-        codex_protocol::models::bound_executed_tool_calls_for_prompt(&mut prompt);
-        let latest_calls = prompt
-            .last()
-            .and_then(ResponseItem::executed_tool_call_metadata)
-            .and_then(|metadata| metadata.executed_tool_calls.as_ref())
-            .expect("latest tool calls must remain in retained metadata");
-        assert_eq!(latest_calls, &expected_calls);
-    }
-
-    let state = recorder.lock_state();
-    let state = state.as_ref().unwrap();
-    let retained_bytes = state
-        .retained_calls
-        .values()
-        .map(|retained| serialized_json_bytes(&retained.calls))
-        .sum::<serde_json::Result<usize>>()
-        .expect("retained calls must serialize");
-    assert!(retained_bytes <= 2 * 1024 * 1024);
-
-    let metadata = prompt
-        .iter()
-        .filter_map(ResponseItem::executed_tool_call_metadata)
-        .filter_map(|metadata| metadata.executed_tool_calls.as_ref())
-        .flatten()
-        .map(|call| serde_json::to_value(call).expect("retained call must serialize"))
-        .collect::<Vec<_>>();
-    assert!(metadata.len() < cell_count * calls_per_cell);
-    // Dropped outputs do not add their omission counts to unrelated surviving calls.
-    assert!(metadata.iter().all(|call| {
-        let omitted = &call["arguments"]["_codex_executed_tool_call_truncated"]["omitted_calls"];
-        omitted.is_null() || *omitted == json!(calls_per_cell - 1)
-    }));
 }
 
 #[test]
@@ -897,6 +909,7 @@ fn tool_call_completeness_survives_waits_without_changing_deltas() {
                             arguments: json!({"cell_id": cell_id.as_str()}).to_string(),
                         },
                         encrypted_function_args: None,
+                        native_call: None,
                     },
                     &ToolCallSource::Direct,
                     ToolMode::CodeModeOnly,
@@ -919,11 +932,11 @@ fn tool_call_completeness_survives_waits_without_changing_deltas() {
             if index < 2 {
                 // Identical calls are distinct submissions; truncation stays sticky across waits.
                 let original_bytes = if truncated && index == 1 { 9_000 } else { 2 };
-                let call = if original_bytes > MAX_EXECUTED_TOOL_CALL_ARGUMENT_BYTES {
+                let call = if truncated && index == 1 {
                     ExecutedToolCall::truncated(
                         "nested_tool".to_string(),
                         original_bytes,
-                        MAX_EXECUTED_TOOL_CALL_ARGUMENT_BYTES,
+                        /*max_bytes*/ 8_192,
                     )
                 } else {
                     ExecutedToolCall::new("nested_tool".to_string(), json!({}))
@@ -961,10 +974,10 @@ fn tool_call_completeness_survives_waits_without_changing_deltas() {
             } else if index == 3 {
                 recorder.finish_cell_recording(&cell_id);
             }
-            if index < 2 || index == 3 && !truncated {
+            if index < 2 || index == 3 {
                 expected_output.set_tool_call_cell_id("exec");
             }
-            if index == 3 && !truncated {
+            if index == 3 {
                 expected_output.mark_tool_calls_complete();
             }
             expected.push(expected_output);
@@ -997,74 +1010,16 @@ fn tool_call_completeness_survives_waits_without_changing_deltas() {
 }
 
 #[test]
-fn unrelated_raw_overflow_retains_a_complete_exec_within_the_request_budget() {
-    let request_budget = 2 * 1024 * 1024;
-    let recorder = new_recorder(InitialHistory::New);
-    let cell = CellId::new("clean-overflow-cell".to_string());
-    recorder.start_cell(&cell, "exec-clean");
-    let clean_call = record_nested_call(&recorder, &cell, "nested-clean");
-    recorder.finish_cell_recording(&cell);
-
-    let mut unrelated = output("direct-oversized");
-    let arguments = json!("x".repeat(7 * 1024));
-    assert!(serialized_json_bytes(&arguments).unwrap() <= MAX_EXECUTED_TOOL_CALL_ARGUMENT_BYTES);
-    unrelated.append_executed_tool_calls(
-        (0..request_budget / (7 * 1024) + 1)
-            .map(|index| ExecutedToolCall::new(format!("direct-{index}"), arguments.clone()))
-            .collect(),
-    );
-    let original = [
-        unrelated,
-        exec_input("exec-clean"),
-        exec_output("exec-clean"),
-    ];
-    let mut prompt = original.clone();
-    assert!(
-        prompt
-            .iter()
-            .map(executed_tool_call_metadata_bytes)
-            .sum::<usize>()
-            > request_budget
-    );
-    recorder.attach_to_prompt(&mut prompt, &mut HashMap::new());
-    let metadata = prompt[2]
-        .executed_tool_call_metadata()
-        .expect("the later clean output must retain its calls");
-    assert_eq!(metadata.executed_tool_calls, Some(vec![clean_call]));
-    assert_eq!(metadata.tool_calls_complete, Some(true));
-    assert!(
-        prompt[0]
-            .executed_tool_call_metadata()
-            .and_then(|metadata| metadata.executed_tool_calls.as_ref())
-            .is_some_and(|calls| calls.iter().any(|call| matches!(
-                call.arguments(),
-                ExecutedToolCallArguments::Truncated { .. }
-            )))
-    );
-    assert!(
-        prompt
-            .iter()
-            .map(executed_tool_call_metadata_bytes)
-            .sum::<usize>()
-            <= request_budget
-    );
-
-    let mut retry = original;
-    recorder.attach_to_prompt(&mut retry, &mut HashMap::new());
-    assert_eq!(retry, prompt);
-}
-
-#[test]
 fn paginated_history_allows_fresh_origins_but_rejects_known_ids() {
     for origin in ["fresh-exec", "old-exec"] {
         let history = InitialHistory::Forked(vec![
-            RolloutItem::SessionMeta(SessionMetaLine {
+            RolloutItem::SessionMeta(Box::new(SessionMetaLine {
                 meta: SessionMeta {
                     history_mode: ThreadHistoryMode::Paginated,
                     ..SessionMeta::default()
                 },
                 git: None,
-            }),
+            })),
             RolloutItem::ResponseItem(exec_input("old-exec").into()),
             RolloutItem::ResponseItem(exec_output("old-exec").into()),
         ]);
@@ -1222,6 +1177,7 @@ fn completeness_rejects_direct_id_collision_and_late_calls() {
                 arguments: "{}".to_string(),
             },
             encrypted_function_args: None,
+            native_call: None,
         },
         &ToolCallSource::Direct,
         ToolMode::Direct,
@@ -1247,72 +1203,40 @@ fn completeness_rejects_direct_id_collision_and_late_calls() {
 }
 
 #[test]
-fn request_truncation_prevents_completion_after_compaction() {
+fn large_wrapped_arguments_preserve_later_wait_completeness() {
     let recorder = new_recorder(InitialHistory::New);
-    let cell_id = CellId::new("compacted-cell".to_string());
-    recorder.start_cell(&cell_id, "exec");
-
+    let cell = CellId::new("active-cell".to_string());
+    recorder.start_cell(&cell, "exec");
     let arguments = json!({
-        "payload": "x".repeat(MAX_EXECUTED_TOOL_CALL_ARGUMENT_BYTES - r#"{"payload":""}"#.len()),
+        "_codex_executed_tool_call_truncated": true,
+        "padding": "x".repeat(40 * 1024),
     });
-    for index in 0..4 {
-        recorder.record_nested_tool_call(
-            cell_id.clone(),
-            format!("nested-{index}"),
-            ExecutedToolCall::new("nested_tool".to_string(), arguments.clone()),
-            MAX_EXECUTED_TOOL_CALL_ARGUMENT_BYTES,
-        );
-    }
-
-    let mut initial = vec![exec_input("exec"), exec_output("exec")];
-    for index in 0..63 {
-        let origin = format!("other-{index}");
-        let other_cell = CellId::new(origin.clone());
-        recorder.start_cell(&other_cell, &origin);
-        for nested in 0..4 {
-            recorder.record_nested_tool_call(
-                other_cell.clone(),
-                format!("other-{index}-{nested}"),
-                ExecutedToolCall::new("nested_tool".to_string(), arguments.clone()),
-                MAX_EXECUTED_TOOL_CALL_ARGUMENT_BYTES,
-            );
-        }
-        recorder.finish_cell_recording(&other_cell);
-        initial.extend([exec_input(&origin), exec_output(&origin)]);
-    }
-    assert!(recorder.attach_pending_to_prompt(&mut initial, &mut HashMap::new()));
-    assert!(
+    let (call, original_bytes) = recorded_call(&ToolCall {
+        tool_name: codex_tools::ToolName::plain("nested_tool"),
+        call_id: "nested".to_string(),
+        payload: ToolPayload::Function {
+            arguments: arguments.to_string(),
+        },
+        encrypted_function_args: None,
+        native_call: None,
+    });
+    recorder.record_nested_tool_call(cell.clone(), "nested".to_string(), call, original_bytes);
+    let mut initial = [exec_input("exec"), exec_output("exec")];
+    recorder.attach_to_prompt(&mut initial, &mut HashMap::new());
+    assert_eq!(
         initial[1]
             .executed_tool_call_metadata()
-            .and_then(|metadata| metadata.executed_tool_calls.as_ref())
-            .is_some_and(|calls| calls.iter().any(|call| matches!(
-                call.arguments(),
-                ExecutedToolCallArguments::Truncated { .. }
-            )))
+            .unwrap()
+            .executed_tool_calls
+            .as_ref()
+            .unwrap(),
+        &vec![ExecutedToolCall::new("nested_tool".to_string(), arguments)],
     );
-    let source = ToolCallSource::CodeMode {
-        cell_id: cell_id.as_str().to_string(),
-        runtime_tool_call_id: "runtime-call".to_string(),
-    };
-    for index in 0..4 {
-        assert!(!recorder.record_tool_result_metadata(
-            &source,
-            &format!("nested-{index}"),
-            &json!({}),
-        ));
-    }
-
-    recorder.attach_pending_to_prompt(&mut [], &mut HashMap::new());
-    recorder.register_cell(&cell_id, "wait");
-    recorder.finish_cell_recording(&cell_id);
-    let mut final_output = [wait_input("wait", &cell_id), output("wait")];
-    recorder.attach_pending_to_prompt(&mut final_output, &mut HashMap::new());
-    assert_eq!(
-        final_output[1]
-            .executed_tool_call_metadata()
-            .and_then(|metadata| metadata.tool_calls_complete),
-        None,
-    );
+    recorder.register_cell(&cell, "wait");
+    recorder.finish_cell_recording(&cell);
+    let mut wait = [wait_input("wait", &cell), output("wait")];
+    recorder.attach_to_prompt(&mut wait, &mut HashMap::new());
+    assert_eq!(tool_calls_complete(&wait[1]), Some(true));
 }
 
 #[test]
@@ -1477,6 +1401,8 @@ fn late_truncated_metadata_survives_subsequent_waits() {
         recorder.finish_cell_recording(&cell);
         history.extend([wait_input("wait-2", &cell), output("wait-2")]);
         expected.extend([wait_input("wait-2", &cell), output("wait-2")]);
+        expected[5].set_tool_call_cell_id("exec");
+        expected[5].mark_tool_calls_complete();
         recorder.attach_pending_to_prompt(&mut history, &mut retry_cache);
         assert_eq!(history, expected);
     }
@@ -1502,15 +1428,19 @@ fn late_truncated_metadata_survives_close_before_first_attachment() {
     let mut expected = history.clone();
     expected[1].append_executed_tool_calls(vec![call]);
     expected[1].set_tool_call_cell_id("exec");
+    expected[1].mark_tool_calls_complete();
     for wait in ["wait-1", "wait-2"] {
         recorder.finish_cell_recording(&cell);
         recorder.register_cell(&cell, wait);
         history.extend([wait_input(wait, &cell), output(wait)]);
-        expected.extend([wait_input(wait, &cell), output(wait)]);
+        let mut expected_output = output(wait);
+        expected_output.set_tool_call_cell_id("exec");
+        expected_output.mark_tool_calls_complete();
+        expected.extend([wait_input(wait, &cell), expected_output]);
         let mut request = history.clone();
         recorder.attach_pending_to_prompt(&mut request, &mut retry_cache);
         assert_eq!(request, expected);
-        assert_eq!(tool_calls_complete(&request[1]), None);
+        assert_eq!(tool_calls_complete(&request[1]), Some(true));
     }
 }
 
@@ -1669,7 +1599,31 @@ fn late_truncated_metadata_is_not_attached_to_ambiguous_outputs() {
 }
 
 #[test]
-fn late_truncated_metadata_obeys_the_existing_request_budget() {
+fn late_raw_metadata_is_not_attached_after_duplicate_outputs() {
+    let recorder = new_recorder(InitialHistory::New);
+    let cell = CellId::new("ambiguous-cell".to_string());
+    recorder.start_cell(&cell, "exec");
+    record_nested_call(&recorder, &cell, "nested");
+    let mut duplicate = [exec_input("exec"), exec_output("exec"), exec_output("exec")];
+    recorder.attach_to_prompt(&mut duplicate, &mut HashMap::new());
+
+    let source = ToolCallSource::CodeMode {
+        cell_id: cell.as_str().to_string(),
+        runtime_tool_call_id: "nested".to_string(),
+    };
+    assert!(!recorder.record_tool_result_metadata(
+        &source,
+        "nested",
+        &json!({"openai/resource_access": {"resources": ["result"]}}),
+    ));
+    let mut retry = [exec_input("exec"), exec_output("exec")];
+    recorder.attach_to_prompt(&mut retry, &mut HashMap::new());
+    assert!(!retry[1].has_tool_result_metadata());
+    assert_eq!(tool_calls_complete(&retry[1]), None);
+}
+
+#[test]
+fn late_truncated_metadata_preserves_large_result_on_retry() {
     let recorder = new_recorder(InitialHistory::New);
     let cell = CellId::new("late-truncated-cell".to_string());
     recorder.start_cell(&cell, "exec");
@@ -1693,19 +1647,18 @@ fn late_truncated_metadata_obeys_the_existing_request_budget() {
         let actual = serde_json::to_value(&retry[1]).unwrap();
         assert_eq!(
             actual["internal_chat_message_metadata_passthrough"]["executed_tool_calls"][0]["tool_result_metadata"],
-            json!({"openai/resource_access": {"resources": ["result"]}}),
+            metadata,
         );
     }
 }
 
 #[test]
-fn late_truncated_metadata_is_not_reused_after_budget_changes_calls() {
+fn late_truncated_metadata_with_wrapped_arguments_rejects_ambiguous_outputs() {
     let recorder = new_recorder(InitialHistory::New);
     let cell = CellId::new("late-truncated-cell".to_string());
     recorder.start_cell(&cell, "exec");
     record_truncated_call(&recorder, &cell, "nested");
-    // The reserved key requires a wrapper in recorded arguments. The wrapper can
-    // put an otherwise accepted function argument over the later prompt limit.
+    // The reserved key requires a wrapper in recorded arguments.
     let arguments = json!({
         "_codex_executed_tool_call_truncated": true,
         "padding": "x".repeat(8_120),
@@ -1716,12 +1669,8 @@ fn late_truncated_metadata_is_not_reused_after_budget_changes_calls() {
         call_id: "other".to_string(),
         payload: ToolPayload::Function { arguments },
         encrypted_function_args: None,
+        native_call: None,
     });
-    assert!(original_bytes <= MAX_EXECUTED_TOOL_CALL_ARGUMENT_BYTES);
-    assert!(
-        serialized_json_bytes(wrapped_call.arguments()).unwrap()
-            > MAX_EXECUTED_TOOL_CALL_ARGUMENT_BYTES
-    );
     recorder.record_nested_tool_call(
         cell.clone(),
         "other".to_string(),
@@ -1750,142 +1699,6 @@ fn late_truncated_metadata_is_not_reused_after_budget_changes_calls() {
         ambiguous
             .iter()
             .all(|item| !item.has_tool_result_metadata())
-    );
-}
-
-#[test]
-fn untracked_history_budget_loss_keeps_later_wait_incomplete() {
-    let recorder = new_recorder(InitialHistory::New);
-    let cell = CellId::new("running-cell".to_string());
-    recorder.start_cell(&cell, "exec");
-    recorder.record_nested_tool_call(
-        cell.clone(),
-        "nested".to_string(),
-        ExecutedToolCall::new("nested_tool".to_string(), json!("x".repeat(8190))),
-        /*original_bytes*/ 8192,
-    );
-    let mut prompt = vec![exec_input("exec"), exec_output("exec")];
-    let untracked_count = 256;
-    let per_output_budget = 2 * 1024 * 1024 / untracked_count;
-    let mut empty_output = output("untracked");
-    empty_output.append_executed_tool_calls(vec![ExecutedToolCall::new(
-        "other_tool".to_string(),
-        json!(""),
-    )]);
-    // Fill the budget with intact unmanaged outputs, leaving no room for the tracked record.
-    let payload_bytes = per_output_budget - executed_tool_call_metadata_bytes(&empty_output);
-    for index in 0..untracked_count {
-        let mut item = output(&format!("untracked-{index}"));
-        item.append_executed_tool_calls(vec![ExecutedToolCall::new(
-            "other_tool".to_string(),
-            json!("x".repeat(payload_bytes)),
-        )]);
-        assert_eq!(executed_tool_call_metadata_bytes(&item), per_output_budget);
-        prompt.push(item);
-    }
-    recorder.attach_to_prompt(&mut prompt, &mut HashMap::new());
-    assert!(prompt[1].executed_tool_call_metadata().is_none());
-
-    recorder.attach_to_prompt(&mut [], &mut HashMap::new());
-    recorder.register_cell(&cell, "wait");
-    recorder.finish_cell_recording(&cell);
-    let mut wait = [wait_input("wait", &cell), output("wait")];
-    recorder.attach_to_prompt(&mut wait, &mut HashMap::new());
-    assert_eq!(tool_calls_complete(&wait[1]), None);
-}
-
-#[test]
-fn result_metadata_shedding_preserves_completion_after_compaction() {
-    let recorder = new_recorder(InitialHistory::New);
-    let cell_id = CellId::new("compacted-cell".to_string());
-    recorder.start_cell(&cell_id, "exec");
-
-    let call_count = 79;
-    let argument_bytes = MAX_EXECUTED_TOOL_CALL_FULL_ARGUMENT_BYTES_PER_OUTPUT / call_count - 64;
-    let arguments = json!({
-        "payload": "x".repeat(argument_bytes - r#"{"payload":""}"#.len()),
-    });
-    for index in 0..call_count {
-        recorder.record_nested_tool_call(
-            cell_id.clone(),
-            format!("nested-{index}"),
-            ExecutedToolCall::new("nested_tool".to_string(), arguments.clone()),
-            argument_bytes,
-        );
-    }
-    let source = ToolCallSource::CodeMode {
-        cell_id: cell_id.as_str().to_string(),
-        runtime_tool_call_id: "runtime-call".to_string(),
-    };
-    let mut retry_cache = HashMap::new();
-    recorder.attach_pending_to_prompt(
-        &mut [exec_input("exec"), exec_output("exec")],
-        &mut retry_cache,
-    );
-    // Each snapshot fits alone; together they push the calls over the aggregate budget.
-    let large_metadata = json!({ "provider_data": "x".repeat(26 * 1024) });
-    for index in (0..call_count).filter(|index| *index != 1) {
-        assert!(recorder.record_tool_result_metadata(
-            &source,
-            &format!("nested-{index}"),
-            &large_metadata,
-        ));
-    }
-
-    assert!(recorder.record_tool_result_metadata(
-        &source,
-        "nested-1",
-        &json!({ "status": "unavailable" })
-    ));
-    let mut initial = [exec_output("exec")];
-    assert!(recorder.attach_pending_to_prompt(&mut initial, &mut retry_cache));
-    let calls = initial[0]
-        .executed_tool_call_metadata()
-        .and_then(|metadata| metadata.executed_tool_calls.as_ref())
-        .expect("metadata shedding must preserve recorded calls");
-    let mut expected_calls =
-        vec![ExecutedToolCall::new("nested_tool".to_string(), arguments); call_count];
-    for call in &mut expected_calls {
-        call.set_tool_result_metadata(ToolResultMetadata::new(&large_metadata));
-    }
-    expected_calls[1]
-        .set_tool_result_metadata(ToolResultMetadata::new(&json!({ "status": "unavailable" })));
-    let mut unbounded = exec_output("exec");
-    unbounded.append_executed_tool_calls(expected_calls.clone());
-    unbounded.set_tool_call_cell_id("exec");
-    let overage = executed_tool_call_metadata_bytes(&unbounded) - 2 * 1024 * 1024;
-    expected_calls[0].set_tool_result_metadata(ToolResultMetadata::new(&json!(format!(
-        "omitted_due_to_size_limit (overage_bytes={overage})"
-    ))));
-    assert_eq!(calls, &expected_calls);
-    let mut retry = [exec_output("exec")];
-    assert!(recorder.attach_pending_to_prompt(&mut retry, &mut retry_cache));
-    assert_eq!(retry, initial);
-
-    // A different call can still attach a small result after the oversized metadata is shed.
-    let metadata = json!({ "id": "R2" });
-    assert!(recorder.record_tool_result_metadata(&source, "nested-2", &metadata));
-    let mut expected_calls = calls.clone();
-    expected_calls[2].set_tool_result_metadata(ToolResultMetadata::new(&metadata));
-    let mut expected = exec_output("exec");
-    expected.append_executed_tool_calls(expected_calls);
-    expected.set_tool_call_cell_id("exec");
-    let mut retry = [exec_output("exec")];
-    assert!(recorder.attach_pending_to_prompt(&mut retry, &mut retry_cache));
-    assert_eq!(retry, [expected]);
-
-    recorder.attach_pending_to_prompt(&mut [], &mut retry_cache);
-    assert!(retry_cache.is_empty());
-    assert!(!recorder.record_tool_result_metadata(&source, "nested-2", &metadata));
-    recorder.register_cell(&cell_id, "wait");
-    recorder.finish_cell_recording(&cell_id);
-    let mut final_output = [wait_input("wait", &cell_id), output("wait")];
-    recorder.attach_pending_to_prompt(&mut final_output, &mut HashMap::new());
-    assert_eq!(
-        final_output[1]
-            .executed_tool_call_metadata()
-            .and_then(|metadata| metadata.tool_calls_complete),
-        Some(true),
     );
 }
 
@@ -1994,7 +1807,7 @@ fn finished_cells_without_more_waits_do_not_block_new_calls() {
 fn wire_inventory_loss_keeps_later_wait_incomplete() {
     for (scenario, expect_complete) in [
         ("metadata_only", true),
-        ("arguments", false),
+        ("arguments", true),
         ("name", false),
         ("removed", false),
     ] {

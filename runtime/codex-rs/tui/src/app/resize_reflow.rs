@@ -432,10 +432,7 @@ impl App {
     ) -> Result<()> {
         self.flush_native_history(tui);
         if tui.is_owned_screen() {
-            let width = self.transcript_reflow.note_width(size.width);
-            if width.changed || width.initialized {
-                self.chat_widget.on_terminal_resize(size.width);
-            }
+            self.transcript_reflow.note_width(size.width);
             if size != tui.terminal.last_known_screen_size {
                 self.refresh_status_line();
             }
@@ -580,6 +577,10 @@ impl App {
             && self
                 .resize_reflow_max_rows()
                 .is_some_and(|max_rows| rendered_rows < max_rows)
+            && !self
+                .transcript_cells
+                .iter()
+                .any(|cell| cell.as_any().is::<history_cell::ClearScreenHeader>())
     }
 
     fn request_scrollback_history_top_up(&self, rendered_rows: usize) {
@@ -671,6 +672,9 @@ impl App {
                 is_stream_continuation: cell.is_stream_continuation(),
             });
 
+            if cell.as_any().is::<history_cell::ClearScreenHeader>() {
+                break;
+            }
             if row_cap.is_some_and(|max_rows| rendered_rows > max_rows) {
                 history_was_truncated = true;
                 break;

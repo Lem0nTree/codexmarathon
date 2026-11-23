@@ -5,6 +5,7 @@ use crate::history_cell::HistoryCell;
 use pretty_assertions::assert_eq;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
+use ratatui::style::Modifier;
 use std::path::Path;
 
 #[path = "table_copy_tests.rs"]
@@ -16,7 +17,7 @@ mod elements;
 #[test]
 fn selected_markdown_preserves_lists_and_inline_code() {
     let cells: Vec<Arc<dyn HistoryCell>> = vec![Arc::new(AgentMarkdownCell::new(
-        "- setting `closeRequested_`,\n- removing the tailer from `tailers_`,\n- clearing its live/discovery state.".into(),
+        "- setting `closeRequested_`,\n- removing the tailer from `tailers_`,\n- clearing /repo/my_notes!.txt.".into(),
         Path::new("/"),
     ))];
     let mut view = TranscriptView::default();
@@ -53,11 +54,13 @@ fn selected_markdown_preserves_lists_and_inline_code() {
         &plain,
         /*clear_selection*/ true,
         |text, format| {
-            assert_eq!(format, CopyFormat::Markdown);
+            let CopyFormat::MarkdownSelection(source) = format else {
+                panic!("expected rich selection");
+            };
             insta::assert_snapshot!(text);
             insta::assert_snapshot!(
                 "selected_list_html",
-                crate::clipboard_html::render_markdown(text)
+                crate::clipboard_html::render_markdown(&source)
             );
             Ok(crate::clipboard_copy::CopyStatus::Confirmed)
         },
@@ -75,8 +78,8 @@ fn markdown_layout(markdown: &str, width: u16) -> TextLayout {
 
 fn payload(layout: &TextLayout, range: std::ops::Range<usize>) -> (String, CopyFormat) {
     let mut lines = Vec::new();
-    layout.copy_lines(range.clone(), "", &mut lines);
-    crate::markdown_copy::selection(&lines, &layout.text()[range])
+    layout.copy_lines(range.clone(), "", &[], &mut lines);
+    crate::markdown_copy::selection(&lines, &layout.text()[range], /*rectangle_rows*/ None)
 }
 
 #[test]
@@ -128,6 +131,20 @@ fn inline_code_selection_copies_only_selected_content() {
         ("before ``a`b`` after", "a`"),
         ("- **`café界_*`**", "café界_*"),
         ("before `  leading and trailing  ` after", " leading"),
+        (r"before ``real\_literal\!`` after", r"real\_literal\!"),
+        ("before [`foo_bar!`](/repo/foo_bar!) after", "repo/foo_bar!"),
+        ("before [`foo_bar!`](/repo/foo_bar!) after", "bar!"),
+        ("[](/foo_bar!)[](/baz_qux!)", "foo_bar!baz_qux!"),
+        ("`foo_bar!`[](/baz_qux!)", "foo_bar!baz_qux!"),
+        ("before **[file](/repo/foo_bar!)** after", "foo_bar!"),
+        (
+            "| File |\n|---|\n| [`foo_bar!`](/repo/foo_bar!) |",
+            "foo_bar!",
+        ),
+        (
+            "before [file](</repo/%60%2A_%5B%5D%3C%3E~%23%7C%26!%3D-+.)>) after",
+            "repo/`*_[]<>~#|&!=-+.)",
+        ),
     ] {
         for width in [18, 80] {
             let layout = markdown_layout(source, width);
@@ -144,6 +161,25 @@ fn inline_code_selection_copies_only_selected_content() {
         }
     }
     insta::assert_snapshot!(copies.join("\n"));
+}
+
+#[test]
+fn mixed_file_targets_preserve_markdown_escaping() {
+    for (source, expected) in [
+        ("before [+](/+) after", "before + (+) after"),
+        ("before [1.)](</1.)>) after", "before 1.) (1.)) after"),
+        (
+            "| File |\n|---|\n| [`foo_bar!`](/repo/foo_bar!) |",
+            "| File |\n|---|\n| `foo_bar!` (repo/foo\\_bar\\!) |",
+        ),
+    ] {
+        let layout = markdown_layout(source, /*width*/ 80);
+        assert_eq!(
+            payload(&layout, 0..layout.text().len()),
+            (expected.into(), CopyFormat::Markdown),
+            "{source}"
+        );
+    }
 }
 
 #[test]
@@ -255,9 +291,10 @@ fn mixed_plain_output_remains_literal_in_html() {
         /*width*/ 40,
     );
     let mut lines = Vec::new();
-    layout.copy_lines(0..layout.text().len(), "", &mut lines);
-    output.copy_lines(0..output.text().len(), "\n", &mut lines);
-    let (copy, format) = crate::markdown_copy::selection(&lines, "unused");
+    layout.copy_lines(0..layout.text().len(), "", &[], &mut lines);
+    output.copy_lines(0..output.text().len(), "\n", &[], &mut lines);
+    let (copy, format) =
+        crate::markdown_copy::selection(&lines, "unused", /*rectangle_rows*/ None);
     assert_eq!(format, CopyFormat::Markdown);
     assert_eq!(
         crate::clipboard_html::render_markdown(&copy),
@@ -269,11 +306,112 @@ fn mixed_plain_output_remains_literal_in_html() {
     );
 }
 
+fn reply_rows(question: &str, answer: &str, width: u16) -> Vec<HyperlinkLine> {
+    let reply = crate::async_question_reply::AsyncQuestionReply {
+        question_item_id: "ask".into(),
+        question: question.into(),
+        answer: answer.into(),
+    };
+    crate::history_cell::new_user_prompt(answer.into(), vec![], vec![], vec![])
+        .with_async_replies(vec![reply], Path::new("/"))
+        .display_hyperlink_lines(width)
+}
+
+#[test]
+fn reply_answer_distinguishes_whitespace_from_nonprinting_markdown() {
+    let definition = "[docs]: https://example.test";
+    for (answer, expected) in [
+        (" \t\n ", vec!["", "↪ Re: Why?", ""]),
+        (
+            definition,
+            vec!["", "↪ Re: Why?", "", "  [docs]: https://example.test", ""],
+        ),
+    ] {
+        let rows: Vec<_> = reply_rows("Why?", answer, /*width*/ 60)
+            .into_iter()
+            .map(|row| row.line.to_string())
+            .collect();
+        assert_eq!(rows, expected);
+    }
+}
+
+#[test]
+fn reply_caption_clips_on_overflow_and_copies_with_its_markdown_answer() {
+    for (width, clipped) in [(17, false), (12, true)] {
+        let rows = reply_rows(
+            "https://example.test",
+            "12345678901234567890\n\n**Tail**",
+            width,
+        );
+        let last = &rows[2]; // The cell starts with one padding row and two caption rows.
+        assert_eq!(last.line.to_string().ends_with('…'), clipped);
+        assert_eq!(
+            last.hyperlinks.last().unwrap().columns.end,
+            last.width() - usize::from(clipped)
+        );
+        let tail = rows
+            .iter()
+            .flat_map(|row| &row.line.spans)
+            .find(|span| span.content == "Tail")
+            .unwrap();
+        assert!(tail.style.add_modifier.contains(Modifier::BOLD));
+        let layout = TextLayout::new(rows, width);
+        let (markdown, _) = payload(&layout, 0..layout.text().len());
+        assert_eq!(markdown.contains('…'), clipped);
+        assert_eq!(markdown.matches("Re: ").count(), 1, "{markdown}");
+        assert!(
+            markdown.contains("12345678901234567890") && markdown.contains("**Tail**"),
+            "{markdown}"
+        );
+        assert!(!markdown.contains("```"), "{markdown}");
+    }
+}
+
+#[test]
+fn full_reply_caption_preserves_links_and_partial_selections() {
+    let width = 44;
+    for prefix in ["", "> ", "- > "] {
+        let question = format!("{prefix}Read the [setup guide](https://example.test/setup)?");
+        let rows = reply_rows(&question, "Yes", width);
+        let first = rows[1].line.to_string();
+        let layout = TextLayout::new(rows, width);
+        assert!(
+            layout
+                .text()
+                .trim_start()
+                .starts_with(first.trim_start_matches("↪ ").trim_end()),
+            "{}",
+            layout.text()
+        );
+        let (copy, _) = payload(&layout, 0..layout.text().len());
+        assert!(
+            copy.trim_start()
+                .starts_with(&format!("Re: {prefix}Read the [setup guide")),
+            "{copy}"
+        );
+        assert!(copy.contains("](<https://example.test/setup>)?"), "{copy}");
+        let start = layout.text().find("guide").unwrap();
+        let question_layout = markdown_layout(&question, width);
+        let original = question_layout.text().find("guide").unwrap();
+        assert_eq!(
+            payload(&layout, start..start + 5),
+            payload(&question_layout, original..original + 5),
+            "{prefix}"
+        );
+    }
+}
+
 #[test]
 fn mixed_user_prose_preserves_literal_text_without_code_fences() {
+    let prompt = "    Explain *literal*\nnext <tag>";
+    let element = "*literal*";
+    let start = prompt.find(element).unwrap();
     let cell = crate::history_cell::new_user_prompt(
-        "    Explain *literal*\nnext <tag>".into(),
-        Vec::new(),
+        prompt.into(),
+        vec![codex_protocol::user_input::TextElement::new(
+            (start..start + element.len()).into(),
+            Some(element.into()),
+        )],
         Vec::new(),
         vec!["https://example.com/image.png".into()],
     );
@@ -292,9 +430,10 @@ fn mixed_user_prose_preserves_literal_text_without_code_fences() {
     for layouts in [[&user, &answer, &tool], [&answer, &tool, &user]] {
         let mut lines = Vec::new();
         for layout in layouts {
-            layout.copy_lines(0..layout.text().len(), "\n\n", &mut lines);
+            layout.copy_lines(0..layout.text().len(), "\n\n", &[], &mut lines);
         }
-        let (text, format) = crate::markdown_copy::selection(&lines, "unused");
+        let (text, format) =
+            crate::markdown_copy::selection(&lines, "unused", /*rectangle_rows*/ None);
         assert_eq!(format, CopyFormat::Markdown);
         copies.push(crate::clipboard_html::render_markdown(&text));
     }
@@ -378,12 +517,15 @@ fn explicit_hard_breaks_survive_only_when_selected() {
 
 #[test]
 fn task_lists_and_transformed_tables_keep_their_meaning() {
-    for (source, expected) in [
-        ("- [x] done\n- [ ] next", "- [x] done\n- [ ] next"),
-        ("1. [x] done\n2. [ ] next", "1. [x] done\n2. [ ] next"),
-    ] {
+    for source in ["- [x] done\n- [ ] next", "1. [x] done\n2. [ ] next"] {
         let layout = markdown_layout(source, /*width*/ 80);
-        assert_eq!(payload(&layout, 0..layout.text().len()).0, expected);
+        let mut lines = Vec::new();
+        layout.copy_lines(0..layout.text().len(), "", &[], &mut lines);
+        assert_eq!(payload(&layout, 0..layout.text().len()).0, source);
+        assert_eq!(
+            crate::markdown_copy::literal_selection(&lines, "unused", /*rectangle_rows*/ None),
+            source
+        );
     }
     let layout = markdown_layout(
         "Prose\n\n| A | B |\n| - | - |\n| x | y |",
@@ -518,9 +660,12 @@ fn selected_hard_breaks_survive_surrounding_blocks() {
     view.extend_selection(/*column*/ 79, /*row*/ 39);
     let plain = view.selected_text(&cells).unwrap();
     view.copy_selected_text_with(&cells, &plain, /*clear_selection*/ true, |text, format| {
-        assert_eq!(format, CopyFormat::Markdown);
+        let CopyFormat::MarkdownSelection(source) = format else {
+            panic!("expected rich selection");
+        };
+        assert_eq!(text, "First paragraph.\n\nSecond paragraph with a hard break:\nnext line.\n\n> quoted words\n> next quote line\n\nFinal paragraph.");
         assert_eq!(
-            crate::clipboard_html::render_markdown(text),
+            crate::clipboard_html::render_markdown(&source),
             "<p>First paragraph.</p>\n<p>Second paragraph with a hard break:<br />\nnext line.</p>\n<blockquote>\n<p>quoted <strong>words</strong><br />\nnext quote line</p>\n</blockquote>\n<p>Final paragraph.</p>\n"
         );
         Ok(crate::clipboard_copy::CopyStatus::Confirmed)
@@ -554,8 +699,11 @@ fn selected_open_code_fence_keeps_streamed_rows_in_one_block() {
         &plain,
         /*clear_selection*/ true,
         |text, format| {
-            assert_eq!(format, CopyFormat::Markdown);
-            insta::assert_snapshot!(crate::clipboard_html::render_markdown(text), @r#"
+            let CopyFormat::MarkdownSelection(source) = format else {
+                panic!("expected rich selection");
+            };
+            assert_eq!(text, "Prose\n\nlet a = 1;\nlet b = 2;");
+            insta::assert_snapshot!(crate::clipboard_html::render_markdown(&source), @r#"
         <p>Prose</p>
         <pre><code>let a = 1;
         let b = 2;
@@ -573,18 +721,18 @@ fn cross_cell_selection_keeps_boundary_breaks() {
     let second = markdown_layout("**second**", /*width*/ 40);
     for (left, right, expected) in [(5..5, 0..6, "\n**second**"), (0..5, 0..0, "first\n")] {
         let mut lines = Vec::new();
-        first.copy_lines(left, "", &mut lines);
-        second.copy_lines(right, "\n", &mut lines);
+        first.copy_lines(left, "", &[], &mut lines);
+        second.copy_lines(right, "\n", &[], &mut lines);
         assert_eq!(
-            crate::markdown_copy::selection(&lines, "unused").0,
+            crate::markdown_copy::selection(&lines, "unused", /*rectangle_rows*/ None).0,
             expected
         );
     }
     let rule = markdown_layout("---", /*width*/ 40);
     let mut lines = Vec::new();
-    first.copy_lines(0..first.text().len(), "", &mut lines);
-    rule.copy_lines(0..rule.text().len(), "\n", &mut lines);
-    let copied = crate::markdown_copy::selection(&lines, "unused").0;
+    first.copy_lines(0..first.text().len(), "", &[], &mut lines);
+    rule.copy_lines(0..rule.text().len(), "\n", &[], &mut lines);
+    let copied = crate::markdown_copy::selection(&lines, "unused", /*rectangle_rows*/ None).0;
     assert_eq!(
         crate::clipboard_html::render_markdown(&copied),
         "<p>first</p>\n<hr />\n"

@@ -23,6 +23,7 @@ impl LocalAgentControl {
                         Op::Shutdown {},
                         /*parent_turn_id*/ None,
                         /*root_turn_id*/ None,
+                        /*message_delivery*/ None,
                     )
                     .await
             };
@@ -35,12 +36,14 @@ impl LocalAgentControl {
                     Op::Shutdown {},
                     /*parent_turn_id*/ None,
                     /*root_turn_id*/ None,
+                    /*message_delivery*/ None,
                 )
                 .await
         };
         let _ = state.remove_thread(&agent_id).await;
         self.forget_v2_residency(agent_id);
         self.runtime.registry.release_spawned_thread(agent_id);
+        self.runtime.mailboxes.remove(agent_id);
         result
     }
 

@@ -1051,6 +1051,68 @@ async fn file_system_full_disk_read_skips_sandbox_only_for_reads() -> Result<()>
     Ok(())
 }
 
+#[test_case(FileSystemImplementation::Local ; "local")]
+#[test_case(FileSystemImplementation::Remote ; "remote")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn full_disk_reads_reject_foreign_permission_paths(
+    implementation: FileSystemImplementation,
+) -> Result<()> {
+    let context = create_file_system_context(implementation).await?;
+    let tmp = TempDir::new()?;
+    let file = tmp.path().join("note.txt");
+    std::fs::write(&file, b"note")?;
+    let file = PathUri::from_host_native_path(file)?;
+    let root = PathUri::from_host_native_path(tmp.path())?;
+    let foreign = PathUri::parse(if cfg!(windows) {
+        "file:///private"
+    } else {
+        "file:///C:/private"
+    })?;
+    let policy = FileSystemSandboxPolicy::restricted(vec![
+        FileSystemSandboxEntry::new(
+            FileSystemPath::Special {
+                value: FileSystemSpecialPath::Root,
+            },
+            FileSystemAccessMode::Read,
+        ),
+        FileSystemSandboxEntry::new(foreign.clone().into(), FileSystemAccessMode::Write),
+    ]);
+    let sandbox = FileSystemSandboxContext::from_permission_profile(
+        PermissionProfile::from_runtime_permissions(&policy, NetworkSandboxPolicy::Restricted),
+        root.clone(),
+    );
+    let fs = context.file_system;
+    for result in [
+        fs.canonicalize(&file, Some(&sandbox)).await.map(|_| ()),
+        fs.read_file(&file, Default::default(), Some(&sandbox))
+            .await
+            .map(|_| ()),
+        fs.read_file_stream(&file, Some(&sandbox)).await.map(|_| ()),
+        fs.get_metadata(&file, Default::default(), Some(&sandbox))
+            .await
+            .map(|_| ()),
+        fs.read_directory(&root, Some(&sandbox)).await.map(|_| ()),
+        fs.walk(
+            &root,
+            WalkOptions {
+                max_depth: 1,
+                max_directories: 1,
+                max_entries: 1,
+                follow_directory_symlinks: false,
+                prune_hidden_directories: false,
+            },
+            Some(&sandbox),
+        )
+        .await
+        .map(|_| ()),
+    ] {
+        let error = result.expect_err("foreign permission paths must not bypass validation");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains(&foreign.to_string()));
+    }
+    Ok(())
+}
+
 /// A stream already opened under one environment remains usable after its accessor is dropped;
 /// cache keys still distinguish a new filesystem or changed captured permissions.
 #[test_case(FileSystemImplementation::Local ; "local")]
@@ -1135,7 +1197,7 @@ async fn file_system_restricted_reads_require_sandbox() -> Result<()> {
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn sandboxed_file_operations_cannot_read_helper_siblings() -> Result<()> {
+async fn sandboxed_file_operations_cannot_read_or_write_helper_siblings() -> Result<()> {
     let helper_paths = crate::common::exec_server::test_codex_helper_paths()?;
     let root = TempDir::new()?;
     let runtime_dir = root.path().join("runtime");
@@ -1145,11 +1207,11 @@ async fn sandboxed_file_operations_cannot_read_helper_siblings() -> Result<()> {
 
     let helper = runtime_dir.join("codex-test-helper");
     std::fs::hard_link(&helper_paths.codex_exe, &helper)
-        .or_else(|_| std::fs::copy(&helper_paths.codex_exe, &helper).map(|_| ()))?;
+        .or_else(|_| codex_utils_cargo_bin::copy_executable(&helper_paths.codex_exe, &helper))?;
     let linux_sandbox = if helper_paths.codex_linux_sandbox_exe.is_some() {
         let alias = runtime_dir.join("codex-linux-sandbox");
         std::fs::hard_link(&helper, &alias)
-            .or_else(|_| std::fs::copy(&helper, &alias).map(|_| ()))?;
+            .or_else(|_| codex_utils_cargo_bin::copy_executable(&helper, &alias))?;
         Some(alias)
     } else {
         None
@@ -1163,13 +1225,18 @@ async fn sandboxed_file_operations_cannot_read_helper_siblings() -> Result<()> {
     std::os::unix::fs::symlink(&sibling, &escaping_link)?;
     let sandbox = workspace_write_sandbox(workspace.clone());
     let allowed_file = workspace.join("allowed.txt");
-    std::fs::write(&allowed_file, b"allowed")?;
-    let allowed_contents = file_system
-        .read_file(
-            &PathUri::from_host_native_path(&allowed_file)?,
+    let allowed_uri = PathUri::from_host_native_path(&allowed_file)?;
+    file_system
+        .write_file(
+            &allowed_uri,
+            b"allowed".to_vec(),
             Default::default(),
             Some(&sandbox),
         )
+        .await?;
+    assert_eq!(std::fs::read(&allowed_file)?, b"allowed");
+    let allowed_contents = file_system
+        .read_file(&allowed_uri, Default::default(), Some(&sandbox))
         .await?;
     assert_eq!(allowed_contents, b"allowed");
 
@@ -1187,6 +1254,22 @@ async fn sandboxed_file_operations_cannot_read_helper_siblings() -> Result<()> {
 
     let sibling_uri = PathUri::from_host_native_path(&sibling)?;
     let destination = PathUri::from_host_native_path(workspace.join("copied.json"))?;
+
+    // Bubblewrap may create a file at this path in its private tmpfs. Check the host file,
+    // whether the sandbox rejected the write or isolated it.
+    let write_result = file_system
+        .write_file(
+            &sibling_uri,
+            b"replacement".to_vec(),
+            Default::default(),
+            Some(&sandbox),
+        )
+        .await;
+    assert_eq!(
+        std::fs::read(&sibling)?,
+        b"secret",
+        "sandboxed write changed host file {sibling_uri} (write returned {write_result:?})"
+    );
 
     for path in [sibling, escaping_link] {
         let path = PathUri::from_host_native_path(path)?;

@@ -26,23 +26,46 @@ fn shared_search_specs_preserve_results_and_release_the_source() {
             definition: "start: \"patch\"".to_string(),
         },
     };
-    for spec in [
-        ToolSpec::Function(function.clone()),
-        ToolSpec::Freeform(custom.clone()),
-        ToolSpec::Namespace(ResponsesApiNamespace {
-            name: "example".to_string(),
-            description: String::new(),
-            tools: vec![
-                ResponsesApiNamespaceTool::Function(function),
-                ResponsesApiNamespaceTool::Custom(custom),
+    for (spec, expected_names) in [
+        (
+            ToolSpec::Function(function.clone()),
+            vec![ToolName::namespaced("functions", "lookup")],
+        ),
+        (
+            ToolSpec::Freeform(custom.clone()),
+            vec![ToolName::namespaced("functions", "patch")],
+        ),
+        (
+            ToolSpec::Namespace(ResponsesApiNamespace {
+                name: "example".to_string(),
+                description: String::new(),
+                tools: vec![
+                    ResponsesApiNamespaceTool::Function(function),
+                    ResponsesApiNamespaceTool::Custom(custom),
+                ],
+            }),
+            vec![
+                ToolName::namespaced("example", "lookup"),
+                ToolName::namespaced("example", "patch"),
             ],
-        }),
+        ),
+        (
+            ToolSpec::Namespace(ResponsesApiNamespace {
+                name: "empty".to_string(),
+                description: String::new(),
+                tools: Vec::new(),
+            }),
+            Vec::new(),
+        ),
     ] {
-        let expected =
+        let normalized =
             ToolSearchInfo::from_spec("query".to_string(), spec.clone(), /*source_info*/ None)
-                .unwrap()
-                .entry
-                .to_loadable_spec();
+                .unwrap();
+        assert_eq!(
+            normalized.entry.tool_names().collect::<Vec<_>>(),
+            expected_names
+        );
+        let expected = normalized.entry.to_loadable_spec();
         let spec = Arc::new(spec);
         let weak = Arc::downgrade(&spec);
         let info = ToolSearchInfo::from_shared_spec(
@@ -57,6 +80,7 @@ fn shared_search_specs_preserve_results_and_release_the_source() {
             "search retains the original spec rather than a deep copy"
         );
         assert_eq!(info.entry.to_loadable_spec(), expected);
+        assert_eq!(info.entry.tool_names().collect::<Vec<_>>(), expected_names);
         drop(info);
         assert!(
             weak.upgrade().is_none(),
@@ -156,7 +180,7 @@ fn default_search_text_uses_model_visible_namespace_metadata_once() {
         /*required*/ None,
         /*additional_properties*/ None,
     );
-    schedule_schema.description = Some("Schedule settings.".to_string());
+    schedule_schema.description = Some("Schedule settings.".into());
     let mut parameters = JsonSchema::object(
         BTreeMap::from([
             (
@@ -168,7 +192,7 @@ fn default_search_text_uses_model_visible_namespace_metadata_once() {
         /*required*/ None,
         /*additional_properties*/ None,
     );
-    parameters.description = Some("Automation options.".to_string());
+    parameters.description = Some("Automation options.".into());
     let spec = ToolSpec::Namespace(crate::ResponsesApiNamespace {
         name: "codex_app".to_string(),
         description: "Manage Codex automations.".to_string(),

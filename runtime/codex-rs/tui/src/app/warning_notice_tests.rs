@@ -28,7 +28,7 @@ async fn warning_notice_keeps_details_in_transcript_and_preserves_draft() -> Res
     app.chat_widget
         .apply_external_edit("draft stays here".into());
     let before = app.render_owned_transcript(&mut tui, size)?;
-    let cursor = tui.terminal.last_known_cursor_pos;
+    let original_cursor = tui.terminal.last_known_cursor_pos;
     for message in [
         "MCP example handshake failed",
         "MCP startup incomplete (example)",
@@ -50,8 +50,17 @@ async fn warning_notice_keeps_details_in_transcript_and_preserves_draft() -> Res
             )),
         );
     }
-    assert_eq!(app.render_owned_transcript(&mut tui, size)?, before);
-    assert_eq!(tui.terminal.last_known_cursor_pos, cursor);
+    let after = app.render_owned_transcript(&mut tui, size)?;
+    let cursor = tui.terminal.last_known_cursor_pos;
+    assert_eq!(
+        (after.bottom(), after.height, cursor.x, cursor.y),
+        (
+            before.bottom(),
+            before.height,
+            original_cursor.x,
+            original_cursor.y
+        )
+    );
     let live = screen(&tui);
     assert!(live.contains("⚠ 2 warnings"));
     let shortcut = app
@@ -93,6 +102,25 @@ async fn warning_notice_keeps_details_in_transcript_and_preserves_draft() -> Res
     app.render_owned_transcript(&mut tui, size)?;
     assert!(!screen(&tui).contains("warnings"));
     assert_eq!(history_cell::warning_count(&app.transcript_cells), 0);
+    tui.set_owned_screen(/*owned*/ false)?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn elevated_launch_warning_appears_in_warning_center() -> Result<()> {
+    let mut app = crate::app::test_support::make_test_app().await;
+    let mut tui = crate::tui::test_support::make_test_tui()?;
+    tui.set_owned_screen(/*owned*/ true)?;
+    let size = Size::new(/*width*/ 80, /*height*/ 24);
+    app.insert_history_cell(
+        &mut tui,
+        Box::new(history_cell::StartupWarningsCell::new(vec![
+            crate::daemon_startup::ELEVATED_LAUNCH_WARNING.into(),
+        ])),
+    );
+    app.chat_widget.open_warnings(&app.transcript_cells);
+    app.render_owned_transcript(&mut tui, size)?;
+    insta::assert_snapshot!("elevated_launch_warning_center", screen(&tui));
     tui.set_owned_screen(/*owned*/ false)?;
     Ok(())
 }

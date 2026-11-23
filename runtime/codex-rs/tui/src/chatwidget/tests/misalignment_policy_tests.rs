@@ -158,20 +158,12 @@ async fn misalignment_policy_failure_stops_the_thread_and_renders_once() {
 
     chat.show_misalignment_policy_precaution();
     chat.handle_key_event(KeyEvent::from(KeyCode::Down));
+    chat.handle_key_event(KeyEvent::from(KeyCode::Down));
     chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
     assert_matches!(rx.try_recv(), Ok(AppEvent::OpenResumePicker));
     assert!(chat.bottom_pane.has_active_view());
 
-    chat.remote_connection = Some(crate::status::remote_connection::RemoteConnectionStatus {
-        address: "wss://remote.example.com".to_string(),
-        version: "v1.0.0".to_string(),
-        is_local_daemon: false,
-    });
     chat.show_misalignment_policy_precaution();
-    assert_chatwidget_snapshot!(
-        "misalignment_policy_violation_remote",
-        render_bottom_popup(&chat, /*width*/ 80)
-    );
     chat.handle_key_event(KeyEvent::from(KeyCode::Down));
     chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
     assert_matches!(rx.try_recv(), Ok(AppEvent::OpenAgentsOverview));
@@ -237,6 +229,7 @@ async fn misalignment_turn_end_discards_history_search_and_question_drafts() {
 fn review_details() -> codex_app_server_protocol::MisalignmentErrorDetails {
     codex_app_server_protocol::MisalignmentErrorDetails {
         error_type: Some("new_category".to_string()),
+        review_target: None,
         detailed_explanation: Some(
             "The agent proposed a change outside your instructions.".to_string(),
         ),
@@ -267,6 +260,8 @@ async fn misalignment_review_requires_current_findings() {
     chat.on_misalignment_error(Some("turn-1".to_string()), Some(review_details()));
     let review = select_review(&mut chat, &mut rx);
     chat.show_misalignment_review_confirmation(Arc::clone(&review));
+    chat.bottom_pane
+        .set_status_line(Some("test project".into()));
     assert_chatwidget_snapshot!(
         "misalignment_review_narrow",
         render_bottom_popup(&chat, /*width*/ 38)

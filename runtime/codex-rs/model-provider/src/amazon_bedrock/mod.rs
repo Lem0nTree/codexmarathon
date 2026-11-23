@@ -4,6 +4,7 @@ mod catalog;
 mod credential_export;
 mod error;
 mod mantle;
+mod region;
 mod runtime;
 mod runtime_catalog;
 
@@ -27,8 +28,13 @@ use codex_models_manager::manager::StaticModelsManager;
 use codex_protocol::account::ProviderAccount;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result;
+use codex_protocol::models::ContentItem;
+use codex_protocol::models::MessagePhase;
+use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ModelsResponse;
 
+use crate::ProviderCapabilities;
+use crate::RemoteCompactionSupport;
 use crate::auth::auth_manager_for_provider;
 use crate::auth::resolve_provider_auth as resolve_configured_provider_auth;
 use crate::provider::ModelProvider;
@@ -36,9 +42,7 @@ use crate::provider::ModelProviderFuture;
 use crate::provider::ProviderAccountResult;
 use crate::provider::ProviderAccountState;
 use crate::provider::ProviderAuthRecoveryMessages;
-use crate::provider::ProviderCapabilities;
 use crate::provider::ProviderUnauthorizedRecovery;
-use crate::provider::RemoteCompactionSupport;
 use crate::shared_state::process_shared_state;
 use auth::resolve_provider_auth as resolve_bedrock_provider_auth;
 pub(crate) use auth_refresh::AwsAuthRecovery;
@@ -47,7 +51,9 @@ use catalog::static_gov_model_catalog;
 pub(crate) use catalog::static_model_catalog;
 pub(crate) use credential_export::AwsCredentialExport;
 use mantle::bedrock_mantle_runtime_base_url;
+pub use mantle::is_amazon_bedrock_gov_cloud_region;
 pub use mantle::is_supported_amazon_bedrock_region;
+pub use region::resolve_amazon_bedrock_region;
 use runtime::bedrock_runtime_base_url;
 use runtime_catalog::static_runtime_model_catalog;
 
@@ -274,9 +280,31 @@ impl ModelProvider for AmazonBedrockModelProvider {
         &self.info
     }
 
+    fn normalize_completed_output_item(&self, item: &mut ResponseItem) {
+        // Mantle's reasoning prefix omits empty annotations on commentary.
+        // Capture that form before the first replay so the prefix stays stable.
+        if self.endpoint == BedrockEndpoint::Mantle
+            && let ResponseItem::Message {
+                role,
+                phase: Some(MessagePhase::Commentary),
+                content,
+                ..
+            } = item
+            && role == "assistant"
+        {
+            for part in content {
+                if let ContentItem::OutputText { annotations, .. } = part
+                    && annotations.as_ref().is_some_and(Vec::is_empty)
+                {
+                    *annotations = None;
+                }
+            }
+        }
+    }
+
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities {
-            namespace_tools: true,
+            reasoning_summaries: true,
             image_generation: false,
             web_search: self.endpoint == BedrockEndpoint::Mantle,
             external_web_access: false,
@@ -427,10 +455,16 @@ impl ModelProvider for AmazonBedrockModelProvider {
         _codex_home: PathBuf,
         config_model_catalog: Option<ModelsResponse>,
     ) -> SharedModelsManager {
+        let origin = if config_model_catalog.is_some() {
+            codex_models_manager::ModelOrigin::ExplicitConfig
+        } else {
+            codex_models_manager::ModelOrigin::Provider
+        };
         Arc::new(StaticModelsManager::new(
             /*auth_manager*/ None,
             config_model_catalog
                 .map_or_else(|| self.default_model_catalog(), normalize_bedrock_catalog),
+            origin,
         ))
     }
 
@@ -438,11 +472,7 @@ impl ModelProvider for AmazonBedrockModelProvider {
         &self,
         config_model_catalog: Option<ModelsResponse>,
     ) -> SharedModelsManager {
-        Arc::new(StaticModelsManager::new(
-            /*auth_manager*/ None,
-            config_model_catalog
-                .map_or_else(|| self.default_model_catalog(), normalize_bedrock_catalog),
-        ))
+        self.models_manager(PathBuf::new(), config_model_catalog)
     }
 }
 
@@ -607,6 +637,7 @@ mod tests {
                 .await
                 .expect("managed Bedrock auth should resolve")
                 .to_auth_headers()
+                .unwrap()
                 .get(http::header::AUTHORIZATION),
             Some(&HeaderValue::from_static("Bearer managed-bedrock-api-key"))
         );
@@ -653,6 +684,7 @@ mod tests {
                     .await
                     .expect("configured AWS profile auth should resolve")
                     .to_auth_headers()
+                    .unwrap()
                     .get(http::header::AUTHORIZATION)
                     .is_none()
             );
@@ -692,7 +724,7 @@ mod tests {
         assert_eq!(
             provider.capabilities(),
             ProviderCapabilities {
-                namespace_tools: true,
+                reasoning_summaries: true,
                 image_generation: false,
                 web_search: true,
                 external_web_access: false,
@@ -711,7 +743,7 @@ mod tests {
         assert_eq!(
             provider.capabilities(),
             ProviderCapabilities {
-                namespace_tools: true,
+                reasoning_summaries: true,
                 image_generation: false,
                 web_search: false,
                 external_web_access: false,

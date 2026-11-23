@@ -5,6 +5,7 @@ pub(crate) enum StatusAccountDisplay {
     ChatGpt {
         email: Option<String>,
         plan: Option<String>,
+        workspace: Option<String>,
     },
     ApiKey,
 }
@@ -15,7 +16,7 @@ pub(crate) fn format_account_label(
     plan_type: Option<PlanType>,
 ) -> Option<String> {
     match account {
-        Some(StatusAccountDisplay::ChatGpt { email, plan }) => match (email, plan) {
+        Some(StatusAccountDisplay::ChatGpt { email, plan, .. }) => match (email, plan) {
             (Some(email), Some(plan)) => Some(format!("{email}({plan})")),
             (Some(email), None) => Some(format!(
                 "{email}({})",

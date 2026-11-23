@@ -1,11 +1,10 @@
 use std::sync::Arc;
 
-use codex_code_mode_protocol::CellId;
-use codex_code_mode_protocol::CodeModeSessionCellExecutionLimits;
 use codex_code_mode_protocol::CodeModeSessionDelegate;
-use codex_code_mode_protocol::ExecuteRequest;
+use codex_code_mode_protocol::CodeModeSessionOptions;
 use codex_code_mode_protocol::RuntimeResponse;
 use codex_code_mode_protocol::StartedCell;
+use codex_code_mode_protocol::TerminateRequest;
 use codex_code_mode_protocol::WaitOutcome;
 use codex_code_mode_protocol::WaitRequest;
 use codex_code_mode_protocol::host::DelegateRequestId;
@@ -14,6 +13,7 @@ use codex_code_mode_protocol::host::HostToClient;
 use codex_code_mode_protocol::host::RequestId;
 use codex_code_mode_protocol::host::SessionId;
 use codex_code_mode_protocol::host::WireCellId;
+use codex_code_mode_protocol::host::WireExecuteRequest;
 use codex_code_mode_protocol::host::WireWaitRequest;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
@@ -31,7 +31,7 @@ pub(in crate::remote_session) struct RemoteSession {
 pub(in crate::remote_session::connection) enum DriverCommand {
     OpenSession {
         session: RemoteSession,
-        limits: CodeModeSessionCellExecutionLimits,
+        options: CodeModeSessionOptions,
         cleanup: SessionCleanup,
         caller_cancellation: CancellationToken,
         response_tx: oneshot::Sender<Result<(), String>>,
@@ -39,7 +39,7 @@ pub(in crate::remote_session::connection) enum DriverCommand {
     Execute {
         session: RemoteSession,
         delegate: Arc<dyn CodeModeSessionDelegate>,
-        request: ExecuteRequest,
+        request: WireExecuteRequest,
         caller_cancellation: CancellationToken,
         yield_signal: Option<CancellationToken>,
         response_tx: oneshot::Sender<Result<DeliveredExecute, String>>,
@@ -53,7 +53,7 @@ pub(in crate::remote_session::connection) enum DriverCommand {
     },
     Terminate {
         session: RemoteSession,
-        cell_id: CellId,
+        request: TerminateRequest,
         response_tx: oneshot::Sender<Result<WaitOutcome, String>>,
     },
     ShutdownSession {
@@ -200,6 +200,7 @@ pub(super) enum PendingRequest {
 pub(super) struct DeferredWait {
     pub(super) session: RemoteSession,
     pub(super) request: WireWaitRequest,
+    pub(super) max_output_tokens: Option<usize>,
     pub(super) caller_cancellation: CancellationToken,
     pub(super) yield_signal: Option<CancellationToken>,
     pub(super) response_tx: oneshot::Sender<Result<WaitOutcome, String>>,

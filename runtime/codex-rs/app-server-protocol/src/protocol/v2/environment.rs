@@ -43,16 +43,32 @@ pub struct EnvironmentAddParams {
     #[ts(type = "string | null")]
     #[ts(optional = nullable)]
     pub auth_bearer_token: Option<RedactedString>,
+    /// Optional X-Request-ID for the direct WebSocket upgrade, including reconnects.
+    /// Requires a secure transport or a loopback destination.
+    #[ts(optional = nullable)]
+    pub websocket_request_id: Option<String>,
     /// Optional WebSocket connection timeout. The server default applies when omitted.
     #[ts(type = "number | null")]
     #[ts(optional = nullable)]
     pub connect_timeout_ms: Option<u64>,
+    /// Required skills supplied by this environment, checked before model inference.
+    #[ts(optional = nullable)]
+    pub skills: Option<EnvironmentSkillsParams>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct EnvironmentAddResponse {}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct EnvironmentSkillsParams {
+    /// Exact catalog names that must be available from this environment.
+    #[ts(optional = nullable)]
+    pub required: Option<Vec<String>>,
+}
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]

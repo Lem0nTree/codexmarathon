@@ -7,7 +7,7 @@
 //! adapter and keeps the shared Codex auth-transition lock across a reload and
 //! its transport invalidation.
 
-use crate::{NativeCodexRuntime, NativeRecoveryBridge};
+use crate::{NativeCodexRuntime, NativeRecoveryBridge, NativeTransitionBridge};
 use codex_backend_client::Client as BackendClient;
 use codex_core::ThreadManager;
 use codex_http_client::{HttpClientFactory, OutboundProxyPolicy};
@@ -87,6 +87,7 @@ pub struct CodexNativeRuntime {
     auth_config: NativeAuthConfig,
     runtime_handle: Handle,
     recovery_bridge: Option<Arc<dyn NativeRecoveryBridge>>,
+    transition_bridge: Option<Arc<dyn NativeTransitionBridge>>,
 }
 
 impl CodexNativeRuntime {
@@ -133,7 +134,13 @@ impl CodexNativeRuntime {
             auth_config,
             runtime_handle,
             recovery_bridge,
+            transition_bridge: None,
         }
+    }
+
+    pub fn with_transition_bridge(mut self, bridge: Arc<dyn NativeTransitionBridge>) -> Self {
+        self.transition_bridge = Some(bridge);
+        self
     }
 
     /// Construct the bridge using the current Tokio runtime handle.
@@ -569,6 +576,9 @@ impl NativeCodexRuntime for CodexNativeRuntime {
     }
 
     fn reload_auth_and_invalidate(&mut self) -> Result<BackendReload, BackendError> {
+        if let Some(bridge) = self.transition_bridge.clone() {
+            return self.run_async(async move { bridge.reload().await });
+        }
         let auth_manager = Arc::clone(&self.auth_manager);
         let thread_manager = Arc::clone(&self.thread_manager);
         let running_turns = self.running_turns.clone();
@@ -583,6 +593,9 @@ impl NativeCodexRuntime for CodexNativeRuntime {
 
     #[allow(clippy::await_holding_lock)]
     fn invalidate_model_transports(&mut self) -> Result<(), BackendError> {
+        if let Some(bridge) = self.transition_bridge.clone() {
+            return self.run_async(async move { bridge.invalidate().await });
+        }
         let thread_manager = Arc::clone(&self.thread_manager);
         let running_turns = self.running_turns.clone();
         let auth_transition_lock = Arc::clone(&self.auth_transition_lock);

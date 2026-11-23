@@ -12,10 +12,128 @@ use tokio::sync::oneshot;
 use tokio::sync::watch;
 use tokio::time::timeout;
 
+/// Roots stay attached through config changes and retain API ordering across environment states.
 #[tokio::test]
-async fn unpolled_snapshot_does_not_delay_canceling_a_removed_environment() {
+async fn capability_roots_follow_attachments_through_configuration_changes() {
+    let manager = Arc::new(EnvironmentManager::default_for_tests());
+    manager
+        .upsert_environment(
+            "other".to_string(),
+            "http://example.com".to_string(),
+            /*connect_timeout*/ None,
+        )
+        .expect("register other environment");
+    let cwd = PathUri::from_abs_path(&AbsolutePathBuf::current_dir().expect("cwd"));
+    let mut local = TurnEnvironmentSelection {
+        selected_capability_roots: Default::default(),
+        environment_id: LOCAL_ENVIRONMENT_ID.to_string(),
+        cwd: cwd.clone(),
+        workspace_roots: Vec::new(),
+        config: EnvironmentConfigState::Pending,
+    };
+    let mut other = TurnEnvironmentSelection {
+        environment_id: "other".to_string(),
+        config: EnvironmentConfigState::Failed("offline".to_string()),
+        ..local.clone()
+    };
+    let roots = [(&other, "first"), (&local, "second"), (&other, "third")]
+        .into_iter()
+        .map(|(selection, id)| SelectedCapabilityRoot {
+            id: id.to_string(),
+            location: CapabilityRootLocation::Environment {
+                environment_id: selection.environment_id.clone(),
+                path: cwd.clone(),
+            },
+        })
+        .collect::<Vec<_>>();
+    local.selected_capability_roots =
+        EnvironmentCapabilityRoots::for_environment(&local.environment_id, &roots);
+    other.selected_capability_roots =
+        EnvironmentCapabilityRoots::for_environment(&other.environment_id, &roots);
+    let parent = ThreadEnvironments::new(
+        Arc::clone(&manager),
+        crate::shell::default_user_shell(),
+        ThreadEnvironmentDefaults::new(tests::test_environment_config(), SandboxType::None),
+        ShellSnapshot::disabled(),
+        TurnEnvironmentSnapshot::default(),
+        /*non_blocking_snapshots*/ false,
+    );
+    parent.update_selections(&[local.clone(), other.clone()]);
+    let snapshot = parent.snapshot().await;
+    assert_eq!(snapshot.selected_capability_roots(), roots);
+    assert!(matches!(
+        &snapshot.environments[0],
+        TurnEnvironmentState::Starting(_)
+    ));
+    assert!(matches!(
+        &snapshot.environments[1],
+        TurnEnvironmentState::Failed { .. }
+    ));
+    let starting = Arc::clone(&snapshot.starting().next().unwrap().attachment);
+
+    let child = ThreadEnvironments::new(
+        Arc::clone(&manager),
+        crate::shell::default_user_shell(),
+        ThreadEnvironmentDefaults::new(tests::test_environment_config(), SandboxType::None),
+        ShellSnapshot::disabled(),
+        snapshot,
+        /*non_blocking_snapshots*/ false,
+    );
+    child.activate_configured(async_channel::unbounded().0);
+    assert_eq!(
+        child.snapshot().await.selected_capability_roots(),
+        vec![roots[1].clone()]
+    );
+
+    local.config = EnvironmentConfigState::Ready(tests::test_environment_config());
+    parent.update_selections(&[local.clone(), other.clone()]);
+    let ready = parent.snapshot().await;
+    assert!(matches!(
+        &ready.environments[0],
+        TurnEnvironmentState::Ready(_)
+    ));
+    assert_eq!(ready.selected_capability_roots(), roots);
+
+    local.cwd = cwd.join("changed-cwd").expect("changed cwd");
+    parent.update_selections(&[other.clone(), local.clone()]);
+    assert_eq!(parent.snapshot().await.selected_capability_roots(), roots);
+
+    // A second thread selects different roots on the same executor without changing the parent.
+    let independent_roots = vec![SelectedCapabilityRoot {
+        id: "independent".to_string(),
+        ..roots[1].clone()
+    }];
+    local.selected_capability_roots =
+        EnvironmentCapabilityRoots::for_environment(&local.environment_id, &independent_roots);
+    child.update_selections(std::slice::from_ref(&local));
+    assert_eq!(
+        child.snapshot().await.selected_capability_roots(),
+        independent_roots
+    );
+    assert_eq!(parent.snapshot().await.selected_capability_roots(), roots);
+    let child_snapshot = child.snapshot().await;
+    let child_local = child_snapshot.primary().expect("child executor");
+    let parent_snapshot = parent.snapshot().await;
+    let parent_local = parent_snapshot.primary().expect("parent executor");
+    assert!(Arc::ptr_eq(
+        child_local.environment(),
+        parent_local.environment()
+    ));
+    assert!(Arc::ptr_eq(&starting, &parent_local.attachment));
+    parent.update_selections(std::slice::from_ref(&local));
+    assert!(!parent_local.attachment.detached.is_cancelled());
+    drop(parent);
+    assert!(parent_local.attachment.detached.is_cancelled());
+    assert!(!child_local.attachment.detached.is_cancelled());
+}
+
+#[test_case::test_case(false; "standalone startup")]
+#[test_case::test_case(true; "configured startup")]
+#[tokio::test]
+async fn unpolled_snapshot_does_not_delay_canceling_a_removed_environment(shared_startup: bool) {
     let cwd = PathUri::from_abs_path(&AbsolutePathBuf::current_dir().expect("cwd"));
     let selection = TurnEnvironmentSelection {
+        selected_capability_roots: Default::default(),
         environment_id: LOCAL_ENVIRONMENT_ID.to_string(),
         cwd: cwd.clone(),
         workspace_roots: vec![cwd],
@@ -29,7 +147,10 @@ async fn unpolled_snapshot_does_not_delay_canceling_a_removed_environment() {
         TurnEnvironmentSnapshot::default(),
         /*non_blocking_snapshots*/ false,
     );
-    environments.update_selections(&[selection]);
+    if shared_startup {
+        environments.update_configured_selections(std::slice::from_ref(&selection));
+    }
+    environments.update_selections(std::slice::from_ref(&selection));
     let starting = environments
         .snapshot()
         .await
@@ -38,8 +159,10 @@ async fn unpolled_snapshot_does_not_delay_canceling_a_removed_environment() {
         .unwrap()
         .clone();
     let held_snapshot = environments.snapshot();
+    let original = Arc::downgrade(&starting.attachment);
 
     environments.update_selections(&[]);
+    assert!(starting.attachment.detached.is_cancelled());
 
     let error = timeout(Duration::from_secs(5), starting.wait_until_ready())
         .await
@@ -54,6 +177,19 @@ async fn unpolled_snapshot_does_not_delay_canceling_a_removed_environment() {
         held_snapshot.await.environments.as_slice(),
         [TurnEnvironmentState::Failed { .. }]
     ));
+
+    environments.update_selections(&[selection]);
+    let snapshot = environments.snapshot_now();
+    let reattached = &snapshot.starting().next().unwrap().attachment;
+    assert!(Arc::ptr_eq(
+        &reattached.environment,
+        &starting.attachment.environment
+    ));
+    assert!(!Arc::ptr_eq(reattached, &starting.attachment));
+    environments.update_configured_selections(&[]);
+    assert!(!reattached.detached.is_cancelled());
+    drop(starting);
+    assert!(original.upgrade().is_none());
 }
 
 #[tokio::test]
@@ -68,6 +204,7 @@ async fn updating_another_environment_retries_the_executor_without_canceling_pen
         .unwrap();
     let cwd = PathUri::from_abs_path(&AbsolutePathBuf::current_dir().unwrap());
     let mut local = TurnEnvironmentSelection {
+        selected_capability_roots: Default::default(),
         environment_id: LOCAL_ENVIRONMENT_ID.to_string(),
         cwd,
         workspace_roots: Vec::new(),
@@ -92,7 +229,7 @@ async fn updating_another_environment_retries_the_executor_without_canceling_pen
         (
             failing.resolution.clone(),
             failing.pending_completion.as_ref().unwrap().subscribe(),
-            failing.owner_config_result.clone().unwrap(),
+            pending_configuration(failing.pending_completion.as_ref().unwrap()),
         )
     };
 
@@ -102,9 +239,9 @@ async fn updating_another_environment_retries_the_executor_without_canceling_pen
 
     local.config = EnvironmentConfigState::Ready(tests::test_environment_config());
     environments.update_selections(&[local.clone(), pending.clone()]);
-    let (second_attempt, _, second_owner) = current();
+    let (second_attempt, second_config, _) = current();
     assert!(!first_attempt.ptr_eq(&second_attempt));
-    assert!(original_owner.ptr_eq(&second_owner));
+    assert!(original_config.same_channel(&second_config));
     assert!(second_attempt.await.is_err());
     assert!(original_config.borrow().is_none());
 
@@ -159,6 +296,7 @@ async fn credential_refresh_does_not_restore_a_removed_environment() {
         /*non_blocking_snapshots*/ false,
     ));
     environments.update_selections(&[TurnEnvironmentSelection {
+        selected_capability_roots: Default::default(),
         environment_id: LOCAL_ENVIRONMENT_ID.to_string(),
         cwd: cwd_uri.clone(),
         workspace_roots: vec![cwd_uri],

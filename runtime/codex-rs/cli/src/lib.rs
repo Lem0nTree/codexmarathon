@@ -1,5 +1,7 @@
+pub mod cloud_config;
 pub(crate) mod debug_sandbox;
 mod exit_status;
+mod git_credential;
 pub(crate) mod login;
 
 use clap::Args;
@@ -12,6 +14,8 @@ use std::path::PathBuf;
 pub use debug_sandbox::run_command_under_landlock;
 pub use debug_sandbox::run_command_under_seatbelt;
 pub use debug_sandbox::run_command_under_windows_sandbox;
+pub use git_credential::GitCredentialArgs;
+pub use git_credential::run_git_credential;
 /// In-process CodexMarathon runtime integration points.  The CLI owns the
 /// native Codex authorities while this module exposes the typed adapter seam;
 /// no second Codex process or donor checkout is required.
@@ -25,14 +29,14 @@ pub use login::read_api_key_from_stdin;
 pub use login::run_login_status;
 pub use login::run_login_with_access_token;
 pub use login::run_login_with_api_key;
-pub use login::run_login_with_chatgpt;
+pub use login::run_login_with_browser;
 pub use login::run_login_with_device_code;
 pub use login::run_login_with_device_code_fallback_to_browser;
 pub use login::run_logout;
 
 #[derive(Debug, Default, Args)]
 pub struct SandboxStateArgs {
-    /// JSON value from `codex/sandbox-state-meta` to apply directly.
+    /// Opaque JSON value from `codex/sandbox-state` to apply directly.
     #[arg(
         long = "sandbox-state-json",
         value_name = "JSON",
@@ -113,6 +117,10 @@ fn parse_absolute_path(raw: &str) -> Result<AbsolutePathBuf, String> {
 
 #[derive(Debug, Parser)]
 pub struct LandlockCommand {
+    /// Route outbound TCP through the managed SOCKS proxy.
+    #[arg(long)]
+    pub transparent_tcp: bool,
+
     #[command(flatten)]
     pub sandbox_state: SandboxStateArgs,
 

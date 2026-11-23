@@ -2,7 +2,6 @@
 
 use super::*;
 use codex_protocol::openai_models::ConfigShellToolType;
-use codex_protocol::openai_models::ModelInstructionsVariables;
 use codex_protocol::openai_models::ModelMessages;
 use codex_protocol::openai_models::ModelVisibility;
 use codex_protocol::openai_models::TruncationPolicyConfig;
@@ -35,6 +34,7 @@ fn test_model(model_messages: Option<ModelMessages>) -> ModelInfo {
         default_verbosity: None,
         apply_patch_tool_type: None,
         web_search_tool_type: Default::default(),
+        web_search_provider: None,
         truncation_policy: TruncationPolicyConfig::bytes(/*limit*/ 10_000),
         supports_image_detail_original: false,
         context_window: None,
@@ -44,7 +44,6 @@ fn test_model(model_messages: Option<ModelMessages>) -> ModelInfo {
         effective_context_window_percent: 95,
         experimental_supported_tools: vec![],
         input_modalities: vec![],
-        used_fallback_model_metadata: false,
         supports_search_tool: false,
         supports_experimental_context: false,
         use_responses_lite: false,
@@ -57,19 +56,15 @@ fn test_model(model_messages: Option<ModelMessages>) -> ModelInfo {
         tool_mode: None,
         multi_agent_version: None,
         multi_agent_reasoning_effort: None,
+        multi_agent_tools_in_code_mode: None,
     }
 }
 
 #[test]
-fn renders_literal_templates_with_legacy_personality_inputs() {
+fn renders_literal_templates() {
     let template = "Hello {{ personality }}\n\n# Personality\n\nFixed instructions";
     let model = test_model(Some(ModelMessages {
         instructions_template: Some(template.to_string()),
-        instructions_variables: Some(ModelInstructionsVariables {
-            personality_default: Some("default".to_string()),
-            personality_friendly: Some("friendly".to_string()),
-            personality_pragmatic: Some("pragmatic".to_string()),
-        }),
         ..Default::default()
     }));
     assert_eq!(

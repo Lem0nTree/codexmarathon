@@ -223,7 +223,9 @@ pub fn create_client_with_chatgpt_cookies(http_client_factory: &HttpClientFactor
     let builder = default_http_client_builder()
         .with_chatgpt_cookies(http_client_factory)
         .without_request_logging();
-    if !http_client_factory.network_policy().is_managed() {
+    if !http_client_factory.network_policy().is_managed()
+        && !http_client_factory.protects_sensitive_headers()
+    {
         return build_default_client(builder);
     }
     let mut pool = RouteAwareClientPool::with_builder(
@@ -261,11 +263,19 @@ pub fn create_client_for_route(
     route_class: ClientRouteClass,
     redirect_policy: ClientRedirectPolicy,
 ) -> Result<HttpClient, BuildRouteAwareHttpClientError> {
+    let legacy_fallback = redirect_policy == ClientRedirectPolicy::Default
+        || !http_client_factory.protects_sensitive_headers();
     let builder = match redirect_policy {
         ClientRedirectPolicy::Default => default_http_client_builder(),
         ClientRedirectPolicy::Reject => default_http_client_builder().without_redirects(),
     };
-    create_client_for_route_with_builder(http_client_factory, request_url, route_class, builder)
+    create_client_for_route_with_builder(
+        http_client_factory,
+        request_url,
+        route_class,
+        builder,
+        legacy_fallback,
+    )
 }
 
 fn create_client_for_route_with_builder(
@@ -273,19 +283,29 @@ fn create_client_for_route_with_builder(
     request_url: &str,
     route_class: ClientRouteClass,
     builder: HttpClientBuilder,
+    legacy_fallback: bool,
 ) -> Result<HttpClient, BuildRouteAwareHttpClientError> {
-    if http_client_factory.network_policy().is_managed() {
+    if http_client_factory.network_policy().is_managed()
+        || http_client_factory.protects_sensitive_headers()
+        || !legacy_fallback
+    {
         let mut pool = codex_http_client::RouteAwareClientPool::with_builder(
             http_client_factory.clone(),
             route_class,
             builder,
         );
         if is_sandboxed() {
-            pool = pool.with_legacy_direct_proxy_and_custom_ca_fallback();
-        } else if matches!(
-            http_client_factory.outbound_proxy_policy(),
-            OutboundProxyPolicy::ReqwestDefault
-        ) {
+            pool = if legacy_fallback {
+                pool.with_legacy_direct_proxy_and_custom_ca_fallback()
+            } else {
+                pool.with_direct_proxy()
+            };
+        } else if legacy_fallback
+            && matches!(
+                http_client_factory.outbound_proxy_policy(),
+                OutboundProxyPolicy::ReqwestDefault
+            )
+        {
             pool = pool.with_legacy_custom_ca_fallback();
         }
         return Ok(pool.into_client());
@@ -320,6 +340,8 @@ pub async fn create_client_for_route_async(
     route_class: ClientRouteClass,
     redirect_policy: ClientRedirectPolicy,
 ) -> std::io::Result<HttpClient> {
+    let legacy_fallback = redirect_policy == ClientRedirectPolicy::Default
+        || !http_client_factory.protects_sensitive_headers();
     create_client_for_route_async_with_builder(
         http_client_factory,
         request_url,
@@ -328,6 +350,7 @@ pub async fn create_client_for_route_async(
             ClientRedirectPolicy::Default => default_http_client_builder(),
             ClientRedirectPolicy::Reject => default_http_client_builder().without_redirects(),
         },
+        legacy_fallback,
     )
     .await
 }
@@ -343,6 +366,7 @@ pub async fn create_client_for_route_without_request_logging_async(
         request_url,
         route_class,
         || default_http_client_builder().without_request_logging(),
+        /*legacy_fallback*/ true,
     )
     .await
 }
@@ -352,6 +376,7 @@ async fn create_client_for_route_async_with_builder(
     request_url: String,
     route_class: ClientRouteClass,
     builder: impl FnOnce() -> HttpClientBuilder + Send + 'static,
+    legacy_fallback: bool,
 ) -> std::io::Result<HttpClient> {
     let permit = ROUTE_AWARE_CLIENT_BUILD_PERMIT
         .acquire()
@@ -364,6 +389,7 @@ async fn create_client_for_route_async_with_builder(
             &request_url,
             route_class,
             builder(),
+            legacy_fallback,
         )
         .map_err(std::io::Error::from)
     })
@@ -379,6 +405,7 @@ async fn create_client_for_route_async_with_builder(
 pub async fn create_transport_for_routes_async(
     http_client_factory: HttpClientFactory,
     route_class: ClientRouteClass,
+    redirect_policy: ClientRedirectPolicy,
 ) -> std::io::Result<ReqwestTransport> {
     let permit = ROUTE_AWARE_CLIENT_BUILD_PERMIT
         .acquire()
@@ -391,7 +418,9 @@ pub async fn create_transport_for_routes_async(
             http_client_factory.outbound_proxy_policy(),
             OutboundProxyPolicy::ReqwestDefault
         );
-        if !http_client_factory.network_policy().is_managed()
+        if redirect_policy == ClientRedirectPolicy::Default
+            && !http_client_factory.network_policy().is_managed()
+            && !http_client_factory.protects_sensitive_headers()
             && (transport_default_proxy || sandboxed)
         {
             return ReqwestTransport::from_http_client(create_client());
@@ -400,11 +429,19 @@ pub async fn create_transport_for_routes_async(
         let mut pool = RouteAwareClientPool::with_builder(
             http_client_factory,
             route_class,
-            default_http_client_builder(),
+            match redirect_policy {
+                ClientRedirectPolicy::Default => default_http_client_builder(),
+                ClientRedirectPolicy::Reject => default_http_client_builder().without_redirects(),
+            },
         );
         if sandboxed {
-            pool = pool.with_legacy_direct_proxy_and_custom_ca_fallback();
-        } else if transport_default_proxy {
+            pool = match redirect_policy {
+                ClientRedirectPolicy::Default => {
+                    pool.with_legacy_direct_proxy_and_custom_ca_fallback()
+                }
+                ClientRedirectPolicy::Reject => pool.with_direct_proxy(),
+            };
+        } else if transport_default_proxy && redirect_policy == ClientRedirectPolicy::Default {
             pool = pool.with_legacy_custom_ca_fallback();
         }
         ReqwestTransport::from_route_aware_client_pool(pool)

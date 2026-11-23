@@ -102,7 +102,7 @@ pub(super) use codex_app_server_protocol::ServerNotification;
 pub(super) use codex_app_server_protocol::SkillMetadata;
 pub(super) use codex_app_server_protocol::SkillSummary;
 pub(super) use codex_app_server_protocol::ThreadClosedNotification;
-pub(super) use codex_app_server_protocol::ThreadItem as AppServerThreadItem;
+pub(super) use codex_app_server_protocol::ThreadItemPayload as AppServerThreadItemPayload;
 pub(super) use codex_app_server_protocol::ToolRequestUserInputOption;
 pub(super) use codex_app_server_protocol::ToolRequestUserInputParams;
 pub(super) use codex_app_server_protocol::ToolRequestUserInputQuestion;
@@ -139,7 +139,6 @@ pub(super) use codex_protocol::approvals::GuardianRiskLevel;
 pub(super) use codex_protocol::approvals::GuardianUserAuthorization;
 pub(super) use codex_protocol::config_types::CollaborationMode;
 pub(super) use codex_protocol::config_types::ModeKind;
-pub(super) use codex_protocol::config_types::Personality;
 pub(super) use codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE;
 pub(super) use codex_protocol::config_types::ServiceTier;
 pub(super) use codex_protocol::models::ActivePermissionProfile;
@@ -276,6 +275,8 @@ mod plan_mode;
 #[path = "tests/plugin_catalog_tests.rs"]
 mod plugin_catalog;
 mod popups_and_settings;
+#[path = "tests/program_status.rs"]
+mod program_status;
 #[path = "tests/rate_limit_recovery_tests.rs"]
 mod rate_limit_recovery_tests;
 #[path = "tests/reasoning_status_tests.rs"]
@@ -288,6 +289,8 @@ mod review_picker_tests;
 #[path = "tests/session_model_selection_tests.rs"]
 mod session_model_selection_tests;
 mod side;
+#[path = "tests/skills_summary_tests.rs"]
+mod skills_summary_tests;
 mod slash_commands;
 #[path = "tests/sparkle_submission_tests.rs"]
 mod sparkle_submission_tests;
@@ -295,9 +298,15 @@ mod sparkle_submission_tests;
 mod startup_submission_tests;
 mod status_and_layout;
 mod status_command_tests;
+#[path = "tests/status_surface_command_tests.rs"]
+mod status_surface_command_tests;
 mod status_surface_previews;
+#[path = "tests/statusline_state_tests.rs"]
+mod statusline_state;
 #[path = "tests/subagent_activity_tests.rs"]
 mod subagent_activity;
+#[path = "tests/terminal_program_status.rs"]
+mod terminal_program_status;
 mod terminal_title;
 #[path = "tests/tool_activity_tests.rs"]
 mod tool_activity_tests;
@@ -306,6 +315,7 @@ mod usage;
 mod worktree_picker;
 
 pub(crate) use helpers::make_chatwidget_manual_with_sender;
+pub(crate) use helpers::render_bottom_popup;
 pub(crate) use helpers::set_chatgpt_auth;
 pub(crate) use helpers::set_fast_mode_test_catalog;
 pub(super) use helpers::*;
@@ -324,3 +334,6 @@ mod question_notifications_tests;
 
 #[path = "tests/security_setup_tests.rs"]
 mod security_setup_tests;
+
+#[path = "tests/quick_dials_tests.rs"]
+mod quick_dials_tests;

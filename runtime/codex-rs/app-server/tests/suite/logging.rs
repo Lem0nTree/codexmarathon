@@ -4,29 +4,38 @@ use app_test_support::ChatGptIdTokenClaims;
 use app_test_support::MockResponsesConfig;
 use app_test_support::TestAppServer;
 use app_test_support::app_server_json_shutdown_event;
+use app_test_support::create_escalated_command_execution_sse_response;
 use app_test_support::create_exec_command_sse_response;
 use app_test_support::create_final_assistant_message_sse_response;
 use app_test_support::create_mock_responses_server_sequence;
 use app_test_support::encode_id_token;
 use app_test_support::write_models_cache;
+use codex_app_server_protocol::ApprovalsReviewer;
+use codex_app_server_protocol::AskForApproval;
 use codex_app_server_protocol::ClientInfo;
 use codex_app_server_protocol::ClientRequest;
+use codex_app_server_protocol::ConfigValueWriteParams;
+use codex_app_server_protocol::ConfigWriteResponse;
 use codex_app_server_protocol::InitializeCapabilities;
 use codex_app_server_protocol::JSONRPCMessage;
 use codex_app_server_protocol::LoginAccountResponse;
+use codex_app_server_protocol::MergeStrategy;
 use codex_app_server_protocol::RequestId;
+use codex_app_server_protocol::SandboxPolicy;
 use codex_app_server_protocol::ServerRequest;
+use codex_app_server_protocol::ThreadApproveGuardianDeniedActionParams;
+use codex_app_server_protocol::ThreadApproveGuardianDeniedActionResponse;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::TurnStartResponse;
 use codex_app_server_protocol::UserInput;
 use codex_features::Feature;
 use codex_state::LogQuery;
-use codex_state::SqliteConfig;
 use codex_state::StateRuntime;
-use codex_utils_absolute_path::test_support::PathExt;
+use core_test_support::load_default_config_for_test;
 use core_test_support::responses;
 use core_test_support::skip_if_no_network;
+use core_test_support::skip_if_wine_exec;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
 use serde_json::json;
@@ -43,10 +52,160 @@ use tokio::time::timeout;
 use wiremock::Mock;
 use wiremock::MockServer;
 use wiremock::ResponseTemplate;
+use wiremock::matchers::header;
 use wiremock::matchers::method;
 use wiremock::matchers::path;
 
 const READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[tokio::test]
+async fn submission_metadata_reaches_persisted_and_feedback_logs() -> Result<()> {
+    skip_if_wine_exec!(
+        Ok(()),
+        "command approval routing requires a host-native cwd under Wine-exec"
+    );
+    skip_if_no_network!(Ok(()));
+
+    let server = create_mock_responses_server_sequence(vec![
+        create_escalated_command_execution_sse_response(
+            vec!["echo".into(), "hello".into()],
+            /*workdir*/ None,
+            /*timeout_ms*/ Some(5000),
+            "call-approval",
+        )?,
+        create_final_assistant_message_sse_response("done")?,
+    ])
+    .await;
+    let codex_home = TempDir::new()?;
+    MockResponsesConfig::new(&server.uri())
+        .with_approval_policy("on-request")
+        .with_provider_config("supports_websockets = false")
+        .write(codex_home.path())?;
+    let mut app_server = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        // SQLite and feedback diagnostics must remain safe independently of stderr.
+        .with_env_overrides(&[("RUST_LOG", Some("off"))])
+        .build()
+        .await?;
+    app_server.initialize().await?;
+    let thread = app_server
+        .start_thread(ThreadStartParams::default())
+        .await?
+        .thread;
+    let _: ThreadApproveGuardianDeniedActionResponse = app_server
+        .request(
+            |request_id| ClientRequest::ThreadApproveGuardianDeniedAction {
+                request_id,
+                params: ThreadApproveGuardianDeniedActionParams {
+                    thread_id: thread.id.clone(),
+                    event: json!({
+                        "id": "guardian-review",
+                        "target_item_id": "guardian-item",
+                        "turn_id": "guardian-turn",
+                        "status": "denied",
+                        "action": {
+                            "type": "mcp_tool_call",
+                            "server": "example",
+                            "tool_name": "write",
+                        },
+                    }),
+                },
+            },
+        )
+        .await?;
+    let _: TurnStartResponse = app_server
+        .request(|request_id| ClientRequest::TurnStart {
+            request_id,
+            params: TurnStartParams {
+                thread_id: thread.id.clone(),
+                input: vec![UserInput::Text {
+                    text: "run echo".into(),
+                    text_elements: Vec::new(),
+                }],
+                approval_policy: Some(AskForApproval::OnRequest),
+                approvals_reviewer: Some(ApprovalsReviewer::User),
+                sandbox_policy: Some(SandboxPolicy::ReadOnly {
+                    network_access: false,
+                }),
+                ..Default::default()
+            },
+        })
+        .await?;
+    let server_request =
+        timeout(READ_TIMEOUT, app_server.read_stream_until_request_message()).await??;
+    let ServerRequest::CommandExecutionRequestApproval { request_id, params } = server_request
+    else {
+        anyhow::bail!("expected command approval request");
+    };
+    let approval_id = params.approval_id.unwrap_or(params.item_id);
+    app_server
+        .send_response(request_id, json!({ "decision": "decline" }))
+        .await?;
+    timeout(
+        READ_TIMEOUT,
+        app_server.read_stream_until_notification_message("turn/completed"),
+    )
+    .await??;
+
+    let state = StateRuntime::init(
+        load_default_config_for_test(&codex_home).await.sqlite,
+        "mock_provider".into(),
+    )
+    .await?;
+    // Feedback is read from SQLite, so this also verifies persistence.
+    let feedback = timeout(Duration::from_secs(/*secs*/ 60), async {
+        loop {
+            let logs =
+                String::from_utf8(state.query_feedback_logs_for_threads(&[&thread.id]).await?)?;
+            if logs
+                .lines()
+                .any(|line| line.contains("Submission") && line.contains("exec_approval"))
+            {
+                break Ok::<_, anyhow::Error>(logs);
+            }
+            tokio::time::sleep(Duration::from_millis(/*millis*/ 50)).await;
+        }
+    })
+    .await??;
+    state.close().await;
+    for (operation, fields) in [
+        (
+            "exec_approval",
+            vec![
+                format!("thread_id={}", thread.id),
+                format!("id: \"{approval_id}\""),
+                format!("turn_id: Some(\"{}\")", params.turn_id),
+                "decision: denied".into(),
+            ],
+        ),
+        (
+            "approve_guardian_denied_action",
+            vec![
+                "review_id: \"guardian-review\"".into(),
+                "target_item_id: Some(\"guardian-item\")".into(),
+                "turn_id: \"guardian-turn\"".into(),
+                "status: Denied".into(),
+            ],
+        ),
+        (
+            "turn_input",
+            vec![
+                "approval_policy: Some(OnRequest)".into(),
+                "approvals_reviewer: Some(User)".into(),
+                "sandbox_policy: Some(read-only)".into(),
+            ],
+        ),
+    ] {
+        let line = feedback
+            .lines()
+            .find(|line| line.contains("Submission") && line.contains(operation))
+            .with_context(|| format!("missing {operation} submission"))?;
+        for field in fields {
+            anyhow::ensure!(line.contains(&field), "missing {field}: {line}");
+        }
+    }
+    Ok(())
+}
 
 #[tokio::test]
 async fn credentials_stay_out_of_persisted_and_feedback_logs() -> Result<()> {
@@ -134,6 +293,16 @@ supports_websockets = false
 
     let mut thread_ids = Vec::new();
     for provider in ["bearer_provider", "mock_provider"] {
+        let config_id = app_server
+            .send_config_value_write_request(ConfigValueWriteParams {
+                file_path: None,
+                key_path: "model_provider".into(),
+                value: json!(provider),
+                merge_strategy: MergeStrategy::Replace,
+                expected_version: None,
+            })
+            .await?;
+        let _: ConfigWriteResponse = app_server.read_response(config_id).await?;
         let thread = app_server
             .start_thread(ThreadStartParams {
                 model_provider: Some(provider.into()),
@@ -212,7 +381,7 @@ supports_websockets = false
         .send_response(RequestId::String(barrier.into()), json!({}))
         .await?;
     let state = StateRuntime::init(
-        SqliteConfig::new_for_testing(codex_home.path().abs()),
+        load_default_config_for_test(&codex_home).await.sqlite,
         "mock_provider".into(),
     )
     .await?;
@@ -269,6 +438,131 @@ fn standalone_app_server_emits_json_info_events() -> Result<()> {
         })
     );
 
+    Ok(())
+}
+
+async fn metrics_collector_expecting_helper_headers() -> (MockServer, wiremock::MockGuard) {
+    let collector = MockServer::start().await;
+    let export = Mock::given(method("POST"))
+        .and(path("/v1/metrics"))
+        .and(header("x-collector-auth", "from-helper"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1..)
+        .mount_as_scoped(&collector)
+        .await;
+    (collector, export)
+}
+
+fn metrics_helper_config(command: &str, collector: &MockServer) -> String {
+    let endpoint = collector.uri();
+    format!(
+        r#"[otel]
+headers_helper = '{command}'
+headers_helper_refresh_interval_ms = 100
+[otel.metrics_exporter.otlp-http]
+endpoint = "{endpoint}/v1/metrics"
+protocol = "json"
+headers = {{ "x-collector-auth" = "static" }}
+"#
+    )
+}
+
+fn install_otel_test_helper(dir: &std::path::Path) -> Result<&'static str> {
+    #[cfg(unix)]
+    let name = {
+        codex_utils_cargo_bin::write_executable(
+            &dir.join("otel-auth"),
+            "#!/bin/sh\ncat headers.json\n",
+        )?;
+        "otel-auth"
+    };
+    #[cfg(windows)]
+    let name = {
+        std::fs::write(dir.join("otel-auth.cmd"), "@type headers.json\r\n")?;
+        "otel-auth.cmd"
+    };
+    std::fs::write(
+        dir.join("headers.json"),
+        r#"{"x-collector-auth":"from-helper"}"#,
+    )?;
+    Ok(name)
+}
+
+#[tokio::test]
+async fn user_otel_helper_runs_from_codex_home_with_managed_environment() -> Result<()> {
+    let home = TempDir::new()?;
+    let name = install_otel_test_helper(home.path())?;
+    let (collector, export) = metrics_collector_expecting_helper_headers().await;
+    std::fs::write(
+        home.path().join("config.toml"),
+        metrics_helper_config(name, &collector),
+    )?;
+    std::fs::write(
+        home.path().join("requirements.toml"),
+        "[otel]\nenvironment = 'managed'",
+    )?;
+    let _server = TestAppServer::builder()
+        .with_codex_home(home.path())
+        .without_auto_env()
+        .with_env_overrides(&[("OTEL_METRIC_EXPORT_INTERVAL", Some("100"))])
+        .build_initialized_with_timeout(READ_TIMEOUT)
+        .await?;
+    timeout(READ_TIMEOUT, export.wait_until_satisfied()).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn managed_otel_helper_runs_from_its_install_directory() -> Result<()> {
+    let home = TempDir::new()?;
+    let install = tempfile::Builder::new()
+        .prefix("managed helpers ")
+        .tempdir()?;
+    let name = install_otel_test_helper(install.path())?;
+    let executable = install.path().join(name);
+    let decoy = home.path().join(name);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        codex_utils_cargo_bin::write_executable(&decoy, "#!/bin/sh\ntouch decoy-ran\n")?;
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o644))?;
+    }
+    #[cfg(windows)]
+    std::fs::write(&decoy, "@echo decoy>decoy-ran")?;
+    let (collector, export) = metrics_collector_expecting_helper_headers().await;
+    let command = executable.to_str().context("UTF-8 helper path")?;
+    std::fs::write(
+        home.path().join("requirements.toml"),
+        metrics_helper_config(command, &collector),
+    )?;
+    let mut server = TestAppServer::builder()
+        .with_codex_home(home.path())
+        .without_auto_env()
+        .with_env_overrides(&[("OTEL_METRIC_EXPORT_INTERVAL", Some("100"))])
+        .build_initialized_with_timeout(READ_TIMEOUT)
+        .await?;
+    #[cfg(unix)]
+    {
+        let error = std::io::Error::from_raw_os_error(libc::EACCES);
+        server
+            .wait_for_stderr_line(
+                &format!("managed OTel helper {command}: headers helper failed to start: {error}"),
+                READ_TIMEOUT,
+            )
+            .await?;
+    }
+    let request = server.send_config_requirements_read_request().await?;
+    let _: Value = timeout(READ_TIMEOUT, server.read_response(request)).await??;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755))?;
+    }
+    timeout(READ_TIMEOUT, export.wait_until_satisfied()).await?;
+    assert!(!home.path().join("decoy-ran").exists());
+    assert!(!install.path().join("decoy-ran").exists());
+    for request in collector.received_requests().await.unwrap() {
+        assert_eq!(request.headers["x-collector-auth"], "from-helper");
+    }
     Ok(())
 }
 
@@ -424,7 +718,7 @@ async fn sqlite_log_metrics_exports_do_not_create_log_cycles() -> Result<()> {
         }
 
         let state = codex_state::StateRuntime::init(
-            codex_state::SqliteConfig::new_for_testing(codex_home.path().abs()),
+            load_default_config_for_test(&codex_home).await.sqlite,
             "test-provider".to_string(),
         )
         .await?;
@@ -625,7 +919,7 @@ async fn app_server_emits_structured_tool_call_timing_event() -> Result<()> {
     .await??;
 
     let mut tool_call = app_server
-        .wait_for_json_log_event("codex.tool_call")
+        .wait_for_json_log_event("codex.tool_call", Duration::from_secs(/*secs*/ 10))
         .await?;
     let tool_call_object = tool_call
         .as_object_mut()

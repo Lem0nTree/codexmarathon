@@ -149,17 +149,17 @@ async fn live_review_prompt_item_is_not_rendered() {
 async fn live_app_server_review_prompt_item_is_not_rendered() {
     let (mut chat, mut rx, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
 
-    let review_mode_item = AppServerThreadItem::EnteredReviewMode {
+    let review_mode_item = AppServerThreadItemPayload::EnteredReviewMode {
         id: "review-start".to_string(),
         review: "changes against 'main'".to_string(),
     };
     chat.handle_server_notification(
-        ServerNotification::ItemStarted(ItemStartedNotification {
-            thread_id: "thread-1".to_string(),
-            turn_id: "turn-1".to_string(),
-            started_at_ms: 0,
-            item: review_mode_item.clone(),
-        }),
+        ServerNotification::ItemStarted(ItemStartedNotification::new(
+            "thread-1".to_string(),
+            "turn-1".to_string(),
+            review_mode_item.clone(),
+            /*started_at_ms*/ 0,
+        )),
         /*replay_kind*/ None,
     );
     let cells = drain_insert_history(&mut rx);
@@ -167,22 +167,22 @@ async fn live_app_server_review_prompt_item_is_not_rendered() {
     assert!(lines_to_single_string(&cells[0]).contains("Code review started"));
 
     chat.handle_server_notification(
-        ServerNotification::ItemCompleted(ItemCompletedNotification {
-            thread_id: "thread-1".to_string(),
-            turn_id: "turn-1".to_string(),
-            completed_at_ms: 0,
-            item: review_mode_item,
-        }),
+        ServerNotification::ItemCompleted(ItemCompletedNotification::new(
+            "thread-1".to_string(),
+            "turn-1".to_string(),
+            review_mode_item,
+            /*started_at_ms*/ None,
+            /*completed_at_ms*/ 0,
+        )),
         /*replay_kind*/ None,
     );
     assert!(drain_insert_history(&mut rx).is_empty());
 
     chat.handle_server_notification(
-        ServerNotification::ItemCompleted(ItemCompletedNotification {
-            thread_id: "thread-1".to_string(),
-            turn_id: "turn-1".to_string(),
-            completed_at_ms: 0,
-            item: AppServerThreadItem::UserMessage {
+        ServerNotification::ItemCompleted(ItemCompletedNotification::new(
+            "thread-1".to_string(),
+            "turn-1".to_string(),
+            AppServerThreadItemPayload::UserMessage {
                 id: "review-prompt".to_string(),
                 client_id: None,
                 content: vec![AppServerUserInput::Text {
@@ -190,7 +190,9 @@ async fn live_app_server_review_prompt_item_is_not_rendered() {
                     text_elements: Vec::new(),
                 }],
             },
-        }),
+            /*started_at_ms*/ None,
+            /*completed_at_ms*/ 0,
+        )),
         /*replay_kind*/ None,
     );
 
@@ -360,6 +362,44 @@ async fn review_restores_context_window_indicator() {
 }
 
 #[tokio::test]
+async fn failed_turn_completion_preserves_queued_review_start() {
+    const ERROR: &str = "Selected model is at capacity. Please try a different model.";
+
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.thread_id = Some(ThreadId::new());
+    handle_turn_started(&mut chat, "turn-1");
+    assert!(chat.queue_user_message_with_options(
+        UserMessage::from("/review check regressions"),
+        QueuedInputAction::ParseSlash,
+        Vec::new(),
+    ));
+    handle_error(&mut chat, ERROR, Some(CodexErrorInfo::ServerOverloaded));
+    assert_matches!(op_rx.try_recv(), Ok(Op::Review { .. }));
+    assert!(chat.input_queue.user_turn_pending_start);
+    assert!(chat.bottom_pane.is_task_running());
+
+    chat.handle_server_notification(
+        ServerNotification::TurnCompleted(TurnCompletedNotification {
+            thread_id: chat.thread_id.map(|id| id.to_string()).unwrap_or_default(),
+            turn: app_server_turn(
+                "turn-1",
+                AppServerTurnStatus::Failed,
+                /*duration_ms*/ None,
+                Some(AppServerTurnError {
+                    message: ERROR.to_string(),
+                    codex_error_info: Some(CodexErrorInfo::ServerOverloaded),
+                    additional_details: None,
+                    misalignment: None,
+                }),
+            ),
+        }),
+        /*replay_kind*/ None,
+    );
+
+    assert!(chat.bottom_pane.is_task_running());
+}
+
+#[tokio::test]
 async fn restore_thread_input_state_restores_pending_steers_without_downgrading_them() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     let expected_compare_key = PendingSteerCompareKey {
@@ -378,8 +418,11 @@ async fn restore_thread_input_state_restores_pending_steers_without_downgrading_
 
     chat.restore_thread_input_state(
         Some(ThreadInputState {
+            provider_error: None,
             pending_thread_settings: None,
             questions: None,
+            initial_user_message: None,
+            startup_submission: None,
             composer: None,
             safety_buffering_prompt: None,
             safety_buffering_source: UserMessageSource::Prompt,
@@ -397,6 +440,7 @@ async fn restore_thread_input_state_restores_pending_steers_without_downgrading_
             current_collaboration_mode: chat.current_collaboration_mode.clone(),
             active_collaboration_mask: chat.active_collaboration_mask.clone(),
             plan_mode_reasoning_effort: chat.config.plan_mode_reasoning_effort.clone(),
+            status_surface_overrides: StatusSurfaceOverrides::default(),
             task_running: false,
             agent_turn_running: false,
         }),
@@ -426,7 +470,7 @@ async fn identical_steer_receipts_only_acknowledge_the_matching_submission() {
         (pending.client_id.as_str(), VecDeque::new()),
     ] {
         chat.handle_thread_item(
-            AppServerThreadItem::UserMessage {
+            AppServerThreadItemPayload::UserMessage {
                 id: client_id.to_string(),
                 client_id: Some(client_id.to_string()),
                 content: vec![UserInput::Text {
@@ -945,6 +989,7 @@ async fn manual_interrupt_restores_pending_steer_mention_bindings_to_composer() 
         )],
         Vec::new(),
         mention_bindings.clone(),
+        crate::bottom_pane::ShellPrefixHandling::Interpret,
     );
     chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
@@ -1260,6 +1305,7 @@ async fn interrupted_turn_after_goal_budget_limited_uses_budget_message_snapshot
                 thread_id: "thread-1".to_string(),
                 turn: codex_app_server_protocol::Turn {
                     id: "turn-1".to_string(),
+                    root_turn_id: None,
                     items_view: codex_app_server_protocol::TurnItemsView::Full,
                     items: Vec::new(),
                     status: codex_app_server_protocol::TurnStatus::InProgress,
@@ -1297,6 +1343,7 @@ async fn interrupted_turn_after_goal_budget_limited_uses_budget_message_snapshot
                 thread_id: "thread-1".to_string(),
                 turn: codex_app_server_protocol::Turn {
                     id: "turn-1".to_string(),
+                    root_turn_id: None,
                     items_view: codex_app_server_protocol::TurnItemsView::Full,
                     items: Vec::new(),
                     status: codex_app_server_protocol::TurnStatus::Interrupted,

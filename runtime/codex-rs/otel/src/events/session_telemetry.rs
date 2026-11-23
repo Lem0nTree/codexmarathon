@@ -12,6 +12,8 @@ use crate::metrics::MetricsConfig;
 use crate::metrics::MetricsError;
 use crate::metrics::PLUGIN_INSTALL_ELICITATION_SENT_METRIC;
 use crate::metrics::PLUGIN_INSTALL_SUGGESTION_METRIC;
+use crate::metrics::REASONING_ITEMS_REMOVED_METRIC;
+use crate::metrics::REASONING_REPLAY_COUNT_METRIC;
 use crate::metrics::RESPONSES_API_ENGINE_IAPI_TBT_DURATION_METRIC;
 use crate::metrics::RESPONSES_API_ENGINE_IAPI_TTFT_DURATION_METRIC;
 use crate::metrics::RESPONSES_API_ENGINE_SERVICE_TBT_DURATION_METRIC;
@@ -27,6 +29,8 @@ use crate::metrics::TOOL_CALL_COUNT_METRIC;
 use crate::metrics::TOOL_CALL_DURATION_METRIC;
 use crate::metrics::TURN_COST_MICROUSD_METRIC;
 use crate::metrics::TURN_TTFT_DURATION_METRIC;
+use crate::metrics::WEBSOCKET_CONNECT_COUNT_METRIC;
+use crate::metrics::WEBSOCKET_CONNECT_DURATION_METRIC;
 use crate::metrics::WEBSOCKET_EVENT_COUNT_METRIC;
 use crate::metrics::WEBSOCKET_EVENT_DURATION_METRIC;
 use crate::metrics::WEBSOCKET_REQUEST_COUNT_METRIC;
@@ -38,18 +42,20 @@ use crate::sanitize_metric_tag_value;
 use crate::tool_result::ToolResultEvent;
 use crate::tool_result::emit_tool_result;
 use codex_api::AgentIdentityTelemetry;
-use codex_api::ApiError;
+use codex_api::ReasoningRemovalReason;
 use codex_api::ResponseEvent;
 use codex_protocol::AgentPath;
 use codex_protocol::ThreadId;
 use codex_protocol::ToolName;
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::config_types::ToolResultLogConfig;
+use codex_protocol::error::CodexErr;
+use codex_protocol::error::CodexErrKind;
+use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::ReviewDecision;
-use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::TokenUsage;
 use codex_protocol::user_input::UserInput;
@@ -59,6 +65,7 @@ use opentelemetry_sdk::metrics::data::ResourceMetrics;
 use reqwest::Error;
 use reqwest::Response;
 use std::future::Future;
+use std::path::Path;
 use std::time::Duration;
 use std::time::Instant;
 use tokio::time::error::Elapsed;
@@ -100,6 +107,7 @@ pub struct SessionTelemetryMetadata {
     pub(crate) auth_mode: Option<String>,
     pub(crate) auth_env: AuthEnvTelemetryMetadata,
     pub(crate) account_id: Option<String>,
+    pub(crate) user_id: Option<String>,
     pub(crate) account_email: Option<String>,
     pub(crate) originator: String,
     pub(crate) product_sku: Option<&'static str>,
@@ -117,12 +125,35 @@ pub struct SessionTelemetryMetadata {
 #[derive(Debug, Clone)]
 pub struct SessionTelemetry {
     tool_result_log_config: ToolResultLogConfig,
+    log_sse_deltas: bool,
     pub(crate) metadata: SessionTelemetryMetadata,
     pub(crate) metrics: Option<MetricsClient>,
     pub(crate) metrics_use_metadata_tags: bool,
 }
 
+/// Bounds product SKU attribution before it is used in telemetry dimensions.
+pub fn bounded_product_sku(product_sku: Option<&str>) -> Option<&'static str> {
+    const KNOWN_PRODUCT_SKUS: &[&str] = &["codex"];
+
+    match product_sku {
+        None | Some("") => None,
+        Some(sku) => Some(
+            KNOWN_PRODUCT_SKUS
+                .iter()
+                .copied()
+                .find(|known| *known == sku)
+                .unwrap_or("other"),
+        ),
+    }
+}
+
 impl SessionTelemetry {
+    /// Suppress successful SSE delta logs while retaining errors and all metrics.
+    pub fn without_sse_delta_logs(mut self) -> Self {
+        self.log_sse_deltas = false;
+        self
+    }
+
     pub fn with_tool_result_log_config(mut self, config: ToolResultLogConfig) -> Self {
         self.tool_result_log_config = config;
         self
@@ -156,18 +187,7 @@ impl SessionTelemetry {
 
     /// Attributes bounded telemetry without turning arbitrary configuration into metric labels.
     pub fn with_product_sku(mut self, product_sku: Option<&str>) -> Self {
-        const KNOWN_PRODUCT_SKUS: &[&str] = &["codex"];
-
-        self.metadata.product_sku = match product_sku {
-            None | Some("") => None,
-            Some(sku) => Some(
-                KNOWN_PRODUCT_SKUS
-                    .iter()
-                    .copied()
-                    .find(|known| *known == sku)
-                    .unwrap_or("other"),
-            ),
-        };
+        self.metadata.product_sku = bounded_product_sku(product_sku);
         self
     }
 
@@ -285,14 +305,34 @@ impl SessionTelemetry {
     pub fn record_multi_agent_spawn_failure(
         &self,
         reason: &'static str,
+        err: &CodexErr,
+        call_id: &str,
+        turn_id: &str,
         fork_mode: &'static str,
         multi_agent_version: &'static str,
     ) {
+        let detail = err.agent_context().map_or("unknown", <&str>::from);
+        let error_kind: &'static str = CodexErrKind::from(err).into();
+        // Only bounded classifications and correlation IDs belong in trace-safe diagnostics.
+        trace_event!(
+            self,
+            event.name = MULTI_AGENT_SPAWN_FAILURE_METRIC,
+            reason,
+            detail,
+            error_kind,
+            call_id,
+            turn_id,
+            fork_mode,
+            multi_agent_version,
+            product_sku = self.metadata.product_sku,
+        );
         let Some(metrics) = &self.metrics else {
             return;
         };
         let mut tags = self.multi_agent_spawn_tags(fork_mode, multi_agent_version);
         tags.push(("reason", reason));
+        tags.push(("detail", detail));
+        tags.push(("error_kind", error_kind));
         let _ = metrics.counter(MULTI_AGENT_SPAWN_FAILURE_METRIC, /*inc*/ 1, &tags);
     }
 
@@ -581,12 +621,14 @@ impl SessionTelemetry {
             });
         Self {
             tool_result_log_config: ToolResultLogConfig::default(),
+            log_sse_deltas: true,
             metadata: SessionTelemetryMetadata {
                 conversation_id,
                 agent_name,
                 auth_mode: auth_mode.map(|m| m.to_string()),
                 auth_env: AuthEnvTelemetryMetadata::default(),
                 account_id,
+                user_id: None,
                 account_email,
                 originator: sanitize_metric_tag_value(originator.as_str()),
                 product_sku: None,
@@ -607,6 +649,37 @@ impl SessionTelemetry {
 
     pub fn record_responses(&self, handle_responses_span: &Span, event: &ResponseEvent) {
         handle_responses_span.record("otel.name", SessionTelemetry::responses_type(event));
+
+        if let ResponseEvent::Completed {
+            reasoning_removals, ..
+        } = event
+        {
+            let report = match reasoning_removals {
+                None => "unavailable",
+                Some(counts) if counts.is_empty() => "no_removals_reported",
+                Some(counts) if counts.contains_key(&ReasoningRemovalReason::PrefixMismatch) => {
+                    "prefix_mismatch_reported"
+                }
+                Some(_) => "removals_reported",
+            };
+            let mut tags = vec![("report", report)];
+            if let Some(product_sku) = self.metadata.product_sku {
+                tags.push(("product_sku", product_sku));
+            }
+            self.counter(REASONING_REPLAY_COUNT_METRIC, /*inc*/ 1, &tags);
+            if let Some(counts) = reasoning_removals {
+                for reason in ReasoningRemovalReason::ALL {
+                    let count = counts.get(&reason).copied().unwrap_or_default();
+                    tags[0] = ("reason", reason.as_str());
+                    self.histogram_with_boundaries(
+                        REASONING_ITEMS_REMOVED_METRIC,
+                        count,
+                        &[0.0, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0],
+                        &tags,
+                    );
+                }
+            }
+        }
 
         match event {
             ResponseEvent::OutputItemDone(item) => {
@@ -655,13 +728,21 @@ impl SessionTelemetry {
         context_window: Option<i64>,
         auto_compact_token_limit: Option<i64>,
         approval_policy: AskForApproval,
-        sandbox_policy: SandboxPolicy,
+        permission_profile: &PermissionProfile,
+        cwd: &Path,
         mcp_servers: Vec<&str>,
+        legacy_multi_agent_disabled_sources: &[&str],
     ) {
+        let sandbox_policy = permission_profile.legacy_sandbox_policy_label(cwd);
         log_and_trace_event!(
             self,
             common: {
                 event.name = "codex.conversation_starts",
+                config.legacy_multi_agent_disabled_sources = if legacy_multi_agent_disabled_sources.is_empty() {
+                    "none".to_string()
+                } else {
+                    legacy_multi_agent_disabled_sources.join(",")
+                },
                 provider_name = %provider_name,
                 auth.env_openai_api_key_present = self.metadata.auth_env.openai_api_key_env_present,
                 auth.env_codex_api_key_present = self.metadata.auth_env.codex_api_key_env_present,
@@ -797,7 +878,7 @@ impl SessionTelemetry {
         recovery_mode: Option<&str>,
         recovery_phase: Option<&str>,
         endpoint: &str,
-        connection_reused: bool,
+        reauth: bool,
         request_id: Option<&str>,
         cf_ray: Option<&str>,
         auth_error: Option<&str>,
@@ -809,6 +890,15 @@ impl SessionTelemetry {
                 .map(|code| (200..=299).contains(&code))
                 .unwrap_or(true);
         let success_str = if success { "true" } else { "false" };
+        let mut tags = vec![
+            ("success", success_str),
+            ("reauth", if reauth { "true" } else { "false" }),
+        ];
+        if let Some(product_sku) = self.metadata.product_sku {
+            tags.push(("product_sku", product_sku));
+        }
+        self.counter(WEBSOCKET_CONNECT_COUNT_METRIC, /*inc*/ 1, &tags);
+        self.record_duration(WEBSOCKET_CONNECT_DURATION_METRIC, duration, &tags);
         log_and_trace_event!(
             self,
             common: {
@@ -829,7 +919,8 @@ impl SessionTelemetry {
                 auth.env_provider_key_name = self.metadata.auth_env.provider_env_key_name.as_deref(),
                 auth.env_provider_key_present = self.metadata.auth_env.provider_env_key_present,
                 auth.env_refresh_token_url_override_present = self.metadata.auth_env.refresh_token_url_override_present,
-                auth.connection_reused = connection_reused,
+                auth.connection_reused = false,
+                auth.reauth = reauth,
                 auth.request_id = request_id,
                 auth.cf_ray = cf_ray,
                 auth.error = auth_error,
@@ -914,62 +1005,52 @@ impl SessionTelemetry {
         );
     }
 
-    pub fn record_websocket_event(
+    pub fn record_websocket_receive_failure(&self, duration: Duration) {
+        self.record_websocket_event_metrics(
+            WEBSOCKET_UNKNOWN_KIND,
+            /*success*/ false,
+            duration,
+        );
+    }
+
+    /// Records the transport's decoded event kind. Timing events also carry metric values.
+    pub fn record_websocket_text_event(
         &self,
-        result: &Result<
-            Option<
-                Result<
-                    tokio_tungstenite::tungstenite::Message,
-                    tokio_tungstenite::tungstenite::Error,
-                >,
-            >,
-            ApiError,
-        >,
+        text: &str,
+        parsed_kind: Option<&str>,
         duration: Duration,
     ) {
-        let mut kind = None;
-        let mut success = true;
-
-        match result {
-            Ok(Some(Ok(message))) => match message {
-                tokio_tungstenite::tungstenite::Message::Text(text) => {
-                    match serde_json::from_str::<serde_json::Value>(text) {
-                        Ok(value) => {
-                            kind = value
-                                .get("type")
-                                .and_then(|value| value.as_str())
-                                .map(std::string::ToString::to_string);
-                            if kind.as_deref() == Some(RESPONSES_WEBSOCKET_TIMING_KIND) {
-                                self.record_responses_websocket_timing_metrics(&value);
-                            }
-                            if kind.as_deref() == Some("response.failed") {
-                                success = false;
-                            }
-                        }
-                        Err(_) => {
-                            kind = Some("parse_error".to_string());
-                            success = false;
-                        }
+        let value;
+        let kind = match parsed_kind {
+            Some(kind) if kind != RESPONSES_WEBSOCKET_TIMING_KIND => kind,
+            _ => {
+                // Valid JSON with an unknown or malformed stream shape still contributes its kind.
+                value = match serde_json::from_str::<serde_json::Value>(text) {
+                    Ok(value) => value,
+                    Err(_) => {
+                        return self.record_websocket_event_metrics(
+                            "parse_error",
+                            /*success*/ false,
+                            duration,
+                        );
                     }
+                };
+                let kind = value
+                    .get("type")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(WEBSOCKET_UNKNOWN_KIND);
+                if kind == RESPONSES_WEBSOCKET_TIMING_KIND {
+                    self.record_responses_websocket_timing_metrics(&value);
                 }
-                tokio_tungstenite::tungstenite::Message::Ping(_)
-                | tokio_tungstenite::tungstenite::Message::Pong(_) => {
-                    return;
-                }
-                tokio_tungstenite::tungstenite::Message::Binary(_)
-                | tokio_tungstenite::tungstenite::Message::Close(_)
-                | tokio_tungstenite::tungstenite::Message::Frame(_) => {
-                    success = false;
-                }
-            },
-            Ok(Some(Err(_))) | Ok(None) | Err(_) => {
-                success = false;
+                kind
             }
-        }
+        };
+        self.record_websocket_event_metrics(kind, kind != "response.failed", duration);
+    }
 
-        let kind_str = kind.as_deref().unwrap_or(WEBSOCKET_UNKNOWN_KIND);
+    fn record_websocket_event_metrics(&self, kind: &str, success: bool, duration: Duration) {
         let success_str = if success { "true" } else { "false" };
-        let tags = [("kind", kind_str), ("success", success_str)];
+        let tags = [("kind", kind), ("success", success_str)];
         self.counter(WEBSOCKET_EVENT_COUNT_METRIC, /*inc*/ 1, &tags);
         self.record_duration(WEBSOCKET_EVENT_DURATION_METRIC, duration, &tags);
     }
@@ -1036,6 +1117,9 @@ impl SessionTelemetry {
             duration,
             &[("kind", kind), ("success", "true")],
         );
+        if !self.log_sse_deltas && kind.ends_with(".delta") {
+            return;
+        }
         log_event!(
             self,
             event.name = "codex.sse_event",
@@ -1380,6 +1464,7 @@ impl SessionTelemetry {
             ResponseEvent::ServerModel(_) => "server_model".into(),
             ResponseEvent::ModelVerifications(_) => "model_verifications".into(),
             ResponseEvent::TurnModerationMetadata(_) => "turn_moderation_metadata".into(),
+            ResponseEvent::GuardianAssessment(_) => "guardian_assessment".into(),
             ResponseEvent::SafetyBuffering(_) => "safety_buffering".into(),
             ResponseEvent::ServerReasoningIncluded(_) => "server_reasoning_included".into(),
             ResponseEvent::RateLimits(_) => "rate_limits".into(),

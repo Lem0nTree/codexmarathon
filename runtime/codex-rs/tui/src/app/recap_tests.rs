@@ -45,6 +45,7 @@ use uuid::Uuid;
 fn turn(status: TurnStatus) -> Turn {
     Turn {
         id: "turn".to_string(),
+        root_turn_id: None,
         items: Vec::new(),
         items_view: Default::default(),
         status,
@@ -58,7 +59,7 @@ fn turn(status: TurnStatus) -> Turn {
 fn user_history_cell(message: &str) -> Arc<dyn HistoryCell> {
     Arc::new(UserHistoryCell {
         message: message.to_string(),
-        spoken: false,
+        presentation: Default::default(),
         text_elements: Vec::new(),
         local_image_paths: Vec::new(),
         remote_image_urls: Vec::new(),
@@ -951,7 +952,7 @@ fn track_in_flight_recap(app: &mut App, thread_id: ThreadId) -> (RecapRequest, T
     (request, temporary_thread_id)
 }
 
-async fn app_with_visible_thread(thread_id: ThreadId) -> App {
+async fn app_with_visible_thread(thread_id: ThreadId) -> Box<App> {
     let mut app = make_test_app().await;
     app.active_thread_id = Some(thread_id);
     app

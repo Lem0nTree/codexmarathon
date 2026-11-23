@@ -23,16 +23,18 @@ use codex_protocol::error::CodexErr;
 use codex_protocol::exec_output::ExecToolCallOutput;
 use codex_protocol::models::PermissionProfile;
 pub use codex_protocol::models::SandboxPermissions;
+use codex_protocol::sandbox::SandboxOverride;
 use codex_sandboxing::SandboxExecRequest;
+use codex_sandboxing::SandboxManager;
+use codex_sandboxing::SandboxTransformRequest;
 use codex_sandboxing::SandboxType;
 use codex_sandboxing::WindowsSandboxFilesystemOverrides;
-use codex_sandboxing::resolve_windows_elevated_filesystem_overrides;
-use codex_sandboxing::resolve_windows_restricted_token_filesystem_overrides;
-use codex_sandboxing::windows_sandbox_uses_elevated_backend;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
 use codex_utils_string::truncate_middle_with_token_budget;
 use std::collections::HashMap;
+use std::ffi::OsStr;
+use std::ffi::OsString;
 
 #[derive(Debug)]
 pub(crate) struct ExecOptions {
@@ -49,6 +51,7 @@ pub(crate) struct ExecServerEnvConfig {
 #[derive(Debug)]
 pub struct ExecRequest {
     pub command: Vec<String>,
+    pub(crate) native_program: Option<OsString>,
     pub cwd: PathUri,
     pub env: HashMap<String, String>,
     pub(crate) exec_server_env_config: Option<ExecServerEnvConfig>,
@@ -73,6 +76,17 @@ pub struct ExecRequest {
 }
 
 impl ExecRequest {
+    /// Borrow the host executable and arguments for a local launch.
+    pub fn program_and_args(&self) -> Option<(&OsStr, &[String])> {
+        let (program, args) = self.command.split_first()?;
+        Some((
+            self.native_program
+                .as_deref()
+                .unwrap_or_else(|| OsStr::new(program)),
+            args,
+        ))
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         command: Vec<String>,
@@ -92,6 +106,7 @@ impl ExecRequest {
         let windows_sandbox_policy_cwd = cwd.clone();
         Self {
             command,
+            native_program: None,
             cwd,
             env,
             exec_server_env_config: None,
@@ -114,13 +129,42 @@ impl ExecRequest {
         }
     }
 
-    pub(crate) fn from_sandbox_exec_request(
+    /// Prepare an authorized local attempt for a launcher that owns its pipes or terminal.
+    pub(crate) async fn prepare_local_sandbox(
+        manager: &SandboxManager,
+        request: SandboxTransformRequest<'_>,
+        options: ExecOptions,
+        sandbox_override: SandboxOverride,
+    ) -> Result<Self, CodexErr> {
+        let workspace_roots = request.workspace_roots.unwrap_or_default();
+        let mut request = manager.transform(request)?.into_command_request()?;
+        request.sandbox_override = sandbox_override;
+        Self::from_sandbox_exec_request(request, options, workspace_roots).await
+    }
+
+    pub(crate) async fn from_sandbox_exec_request(
         request: SandboxExecRequest,
         options: ExecOptions,
-        windows_sandbox_workspace_roots: Vec<AbsolutePathBuf>,
+        workspace_roots: &[PathUri],
     ) -> Result<Self, CodexErr> {
+        let windows_sandbox_workspace_roots =
+            if request.sandbox == SandboxType::WindowsRestrictedToken {
+                workspace_roots
+                    .iter()
+                    .map(PathUri::to_abs_path)
+                    .collect::<std::io::Result<Vec<_>>>()
+                    .map_err(|err| {
+                        CodexErr::InvalidRequest(format!(
+                            "invalid Windows sandbox workspace roots: {err}"
+                        ))
+                    })?
+            } else {
+                Vec::new()
+            };
+        codex_exec_server::run_integrity_checks((&request).into()).await;
         let SandboxExecRequest {
             command,
+            native_program,
             cwd,
             sandbox_policy_cwd: windows_sandbox_policy_cwd,
             mut env,
@@ -141,23 +185,13 @@ impl ExecRequest {
             let sandbox_policy_cwd = windows_sandbox_policy_cwd
                 .to_abs_path()
                 .map_err(|err| CodexErr::InvalidRequest(format!("invalid sandbox cwd: {err}")))?;
-            let use_windows_elevated_backend =
-                windows_sandbox_uses_elevated_backend(windows_sandbox_level);
-            if use_windows_elevated_backend {
-                resolve_windows_elevated_filesystem_overrides(
-                    sandbox,
-                    &permission_profile,
-                    &sandbox_policy_cwd,
-                    use_windows_elevated_backend,
-                )
-            } else {
-                resolve_windows_restricted_token_filesystem_overrides(
-                    sandbox,
-                    &permission_profile,
-                    &sandbox_policy_cwd,
-                    windows_sandbox_level,
-                )
-            }
+            WindowsSandboxFilesystemOverrides::resolve(
+                sandbox,
+                &permission_profile,
+                &sandbox_policy_cwd,
+                windows_sandbox_level,
+                &env,
+            )
             .map_err(|error| {
                 CodexErr::UnsupportedOperation(
                     truncate_middle_with_token_budget(&error, /*max_tokens*/ 900).0,
@@ -179,6 +213,7 @@ impl ExecRequest {
         }
         Ok(Self {
             command,
+            native_program,
             cwd,
             env,
             exec_server_env_config: None,

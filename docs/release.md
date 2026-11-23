@@ -39,9 +39,9 @@ owner-private `$XDG_CONFIG_HOME/codexmarathon/config.json` (falling back to
 It does not alter shell startup files.
 
 Linux ARM64 uses the unmodified `codex-code-mode-host-aarch64-unknown-linux-musl`
-asset from upstream Codex `rust-v0.160.0` because the local V8 archive is not
+asset from upstream Codex `rust-v0.171.0` because the local V8 archive is not
 available for that target. The release build verifies SHA-256
-`94066fdf13ffecd2f58776ec5cb8fc3040283a642e3d6ff25c5d82048c41038e` before
+`7669c881b78669b5f13ddb99996b5cef3fb10dab5b69f43be31d19e82e9cd62b` before
 extracting the required archive entry. The installer requires
 `codex-code-mode-host` during its preflight and fails before changing the user
 installation when it is absent.

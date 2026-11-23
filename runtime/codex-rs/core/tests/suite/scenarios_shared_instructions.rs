@@ -12,6 +12,7 @@ use codex_extension_api::Instructions;
 use codex_extension_api::ToolLifecycleContributor;
 use codex_extension_api::ToolLifecycleFuture;
 use codex_extension_api::ToolStartInput;
+use codex_history::InitialHistory;
 use codex_protocol::config_types::ApprovalsReviewer;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::SessionSource;
@@ -34,7 +35,7 @@ async fn running_descendants_refresh_only_shared_thread_instructions(shared: boo
     let root = test
         .thread_manager
         .start_thread(StartThreadOptions {
-            environments: Some(vec![test.executor_environment().selection().clone()]),
+            environments: Some(vec![test.executor_environment().request()]),
             thread_instructions_provider: Some(provider.clone()),
             ..StartThreadOptions::new(test.config.clone())
         })
@@ -45,7 +46,7 @@ async fn running_descendants_refresh_only_shared_thread_instructions(shared: boo
         let child = test
             .thread_manager
             .start_thread(StartThreadOptions {
-                environments: Some(vec![test.executor_environment().selection().clone()]),
+                environments: Some(vec![test.executor_environment().request()]),
                 session_source: Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
                     parent_thread_id: parent_id,
                     depth,
@@ -64,8 +65,8 @@ async fn running_descendants_refresh_only_shared_thread_instructions(shared: boo
     let other_root = test
         .thread_manager
         .start_thread(StartThreadOptions {
-            environments: Some(vec![test.executor_environment().selection().clone()]),
-            thread_instructions_provider: Some(other_provider),
+            environments: Some(vec![test.executor_environment().request()]),
+            thread_instructions_provider: Some(other_provider.clone()),
             ..StartThreadOptions::new(test.config.clone())
         })
         .await?;
@@ -94,7 +95,7 @@ async fn running_descendants_refresh_only_shared_thread_instructions(shared: boo
         .thread_manager
         .start_thread(StartThreadOptions {
             initial_history: history,
-            environments: Some(vec![test.executor_environment().selection().clone()]),
+            environments: Some(vec![test.executor_environment().request()]),
             thread_instructions_provider: Some(provider.clone()),
             ..StartThreadOptions::new(test.config.clone())
         })
@@ -150,10 +151,34 @@ async fn running_descendants_refresh_only_shared_thread_instructions(shared: boo
         )]
     );
     if shared {
+        let mut history = InitialHistory::New;
+        for text in [INITIAL, ""] {
+            let mut options = StartThreadOptions {
+                environments: Some(vec![test.executor_environment().request()]),
+                initial_history: history,
+                thread_instructions_provider: Some(other_provider.clone()),
+                ..StartThreadOptions::new(test.config.clone())
+            };
+            options.set_inherited_thread_instructions(Instructions {
+                text: text.to_owned(),
+                source: None,
+            });
+            let child = test.thread_manager.start_thread(options).await?;
+            let response = mount_sse_once(&server, responses::sse_completed("inherited")).await;
+            submit_thread_turn(&child.thread, "use the inherited instructions").await?;
+            request_history.push(response.single_request());
+            if text.is_empty() {
+                break;
+            }
+            (_, history) =
+                persisted_resume_history(&child.thread, test.thread_store.as_ref()).await?;
+            child.thread.shutdown_and_wait().await?;
+            test.thread_manager.remove_thread(&child.thread_id).await;
+        }
         insta::assert_snapshot!(
             "shared_instructions_update_running_descendants",
             context_snapshot::format_request_history_snapshot(
-                "A host replaces the provider after the parent restarts, then updates and clears instructions for surviving children and grandchildren.",
+                "A host updates and clears shared instructions for surviving descendants. A separately started thread uses captured instructions over its live provider, then resumes with them explicitly cleared.",
                 &request_history,
                 &ContextSnapshotOptions::default(),
             )
@@ -202,7 +227,7 @@ async fn guardian_tracks_shared_instruction_updates_in_running_descendants() -> 
     let root = test
         .thread_manager
         .start_thread(StartThreadOptions {
-            environments: Some(vec![test.executor_environment().selection().clone()]),
+            environments: Some(vec![test.executor_environment().request()]),
             thread_instructions_provider: Some(provider),
             ..StartThreadOptions::new(test.config.clone())
         })
@@ -212,7 +237,7 @@ async fn guardian_tracks_shared_instruction_updates_in_running_descendants() -> 
         descendant = test
             .thread_manager
             .start_thread(StartThreadOptions {
-                environments: Some(vec![test.executor_environment().selection().clone()]),
+                environments: Some(vec![test.executor_environment().request()]),
                 session_source: Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
                     parent_thread_id: descendant.thread_id,
                     depth,

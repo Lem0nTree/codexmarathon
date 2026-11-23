@@ -112,7 +112,7 @@ fn thread_spawn_agent_path(source: &SessionSource) -> Option<String> {
     }
 }
 
-fn thread_spawn_parent_thread_id(source: &SessionSource) -> Option<ThreadId> {
+pub(super) fn thread_spawn_parent_thread_id(source: &SessionSource) -> Option<ThreadId> {
     match source {
         SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
             parent_thread_id, ..
@@ -141,6 +141,7 @@ mod tests {
             extra: None,
             session_id: thread_id.to_string(),
             forked_from_id: None,
+            attached_to_thread_id: None,
             parent_thread_id: None,
             preview: String::new(),
             ephemeral: false,

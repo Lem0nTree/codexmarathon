@@ -38,6 +38,7 @@ impl SessionStartAction {
         local_settings: &LocalSettings,
         target: &SessionTarget,
     ) -> Result<AppServerStartedThread> {
+        target.ensure_backend(app_server.backend_id())?;
         match self {
             Self::Resume(settings, permissions) => {
                 app_server
@@ -81,12 +82,12 @@ pub(crate) struct SessionStartConfig<'a> {
 pub(crate) async fn complete_session_start(
     app_server: &mut AppServerSession,
     config: SessionStartConfig<'_>,
-    app_server_target: &crate::AppServerTarget,
     target: &SessionTarget,
     action: SessionStartAction,
     initial_result: Result<AppServerStartedThread>,
     confirm: impl AsyncFnOnce() -> Result<UnarchiveChoice>,
 ) -> Result<SessionStartOutcome> {
+    target.ensure_backend(app_server.backend_id())?;
     match initial_result {
         Ok(started) => return Ok(SessionStartOutcome::Started(Box::new(started))),
         Err(err) => {
@@ -102,13 +103,7 @@ pub(crate) async fn complete_session_start(
     }
 
     match confirm().await? {
-        UnarchiveChoice::Cancel => {
-            return Ok(match app_server_target {
-                crate::AppServerTarget::LocalDaemon { .. }
-                | crate::AppServerTarget::Remote { .. } => SessionStartOutcome::CommandCenter,
-                crate::AppServerTarget::Embedded => SessionStartOutcome::Exit,
-            });
-        }
+        UnarchiveChoice::Cancel => return Ok(SessionStartOutcome::CommandCenter),
         UnarchiveChoice::Quit => return Ok(SessionStartOutcome::Exit),
         UnarchiveChoice::Unarchive => {}
     }
@@ -133,6 +128,7 @@ pub(crate) async fn cancel_session_start(app_server: AppServerSession) -> AppExi
         token_usage: Default::default(),
         thread_id: None,
         resume_hint: None,
+        archive_warnings: Vec::new(),
         disconnect_info: None,
         update_action: None,
         exit_reason: ExitReason::UserRequested,

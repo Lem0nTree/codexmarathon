@@ -1,9 +1,13 @@
 use super::*;
 use crate::SortDirection;
+use crate::sqlite::SqlitePoolWriteExt;
+use crate::sqlite::SqliteWriteQueryExt;
 use codex_protocol::SanitizedGitUrl;
 use codex_protocol::protocol::SessionSource;
 use std::sync::atomic::AtomicI64;
 use std::sync::atomic::Ordering;
+
+const EXCLUDE_ATTACHED_THREADS: &str = " AND threads.attached_thread_parent_id IS NULL";
 
 impl StateRuntime {
     pub async fn get_thread(&self, id: ThreadId) -> anyhow::Result<Option<crate::ThreadMetadata>> {
@@ -11,6 +15,7 @@ impl StateRuntime {
             r#"
 SELECT
     threads.id,
+    threads.attached_thread_parent_id,
     threads.rollout_path,
     threads.created_at_ms AS created_at,
     threads.updated_at_ms AS updated_at,
@@ -94,7 +99,7 @@ WHERE id = ?
         .bind(crate::GUARDIAN_THREAD_TITLE)
         .bind(legacy_name)
         .bind(thread_id.to_string())
-        .execute(self.pool.as_ref())
+        .execute_with_busy_retry(self.pool.as_ref())
         .await?;
         Ok(result.rows_affected() > 0)
     }
@@ -124,9 +129,25 @@ WHERE id = ? AND preview = ''
         )
         .bind(preview)
         .bind(thread_id.to_string())
-        .execute(self.pool.as_ref())
+        .execute_with_busy_retry(self.pool.as_ref())
         .await?;
         Ok(result.rows_affected() > 0)
+    }
+
+    /// List saved threads attached directly to the given parent, including archived threads.
+    pub async fn list_attached_thread_ids(
+        &self,
+        parent: ThreadId,
+    ) -> anyhow::Result<Vec<ThreadId>> {
+        let ids = sqlx::query_scalar::<_, String>(
+            "SELECT id FROM threads WHERE attached_thread_parent_id = ?",
+        )
+        .bind(parent.to_string())
+        .fetch_all(self.pool.as_ref())
+        .await?;
+        ids.into_iter()
+            .map(|id| ThreadId::try_from(id).map_err(Into::into))
+            .collect()
     }
 
     /// Persist or replace the directional parent-child edge for a spawned thread.
@@ -151,7 +172,7 @@ ON CONFLICT(child_thread_id) DO UPDATE SET
         .bind(parent_thread_id.to_string())
         .bind(child_thread_id.to_string())
         .bind(status.as_ref())
-        .execute(self.pool.as_ref())
+        .execute_with_busy_retry(self.pool.as_ref())
         .await?;
         Ok(())
     }
@@ -165,7 +186,7 @@ ON CONFLICT(child_thread_id) DO UPDATE SET
         sqlx::query("UPDATE thread_spawn_edges SET status = ? WHERE child_thread_id = ?")
             .bind(status.as_ref())
             .bind(child_thread_id.to_string())
-            .execute(self.pool.as_ref())
+            .execute_with_busy_retry(self.pool.as_ref())
             .await?;
         Ok(())
     }
@@ -362,7 +383,7 @@ ON CONFLICT(child_thread_id) DO NOTHING
         .bind(parent_thread_id.to_string())
         .bind(child_thread_id.to_string())
         .bind(crate::DirectionalThreadSpawnEdgeStatus::Open.as_ref())
-        .execute(self.pool.as_ref())
+        .execute_with_busy_retry(self.pool.as_ref())
         .await?;
         Ok(())
     }
@@ -418,7 +439,7 @@ ON CONFLICT(child_thread_id) DO NOTHING
                 .bind(replacement.display().to_string())
                 .bind(id.to_string())
                 .bind(expected.display().to_string())
-                .execute(self.pool.as_ref())
+                .execute_with_busy_retry(self.pool.as_ref())
                 .await?;
         Ok(result.rows_affected() == 1)
     }
@@ -439,6 +460,7 @@ ON CONFLICT(child_thread_id) DO NOTHING
         push_thread_filters(
             &mut builder,
             ThreadFilterOptions {
+                included_thread_ids: None,
                 archived_only,
                 allowed_sources,
                 model_providers,
@@ -452,6 +474,7 @@ ON CONFLICT(child_thread_id) DO NOTHING
             },
             /*include_thread_id_tiebreaker*/ false,
         );
+        builder.push(EXCLUDE_ATTACHED_THREADS);
         builder.push(" AND threads.title = ");
         builder.push_bind(title);
         if let Some(cwd) = cwd {
@@ -537,9 +560,9 @@ ON CONFLICT(child_thread_id) DO NOTHING
             if let Some(overflow_item) = items.pop() {
                 parent_thread_ids.remove(&overflow_item.id);
             }
-            items.last().and_then(|item| {
-                anchor_from_item(item, filters.sort_key, relation_filter.is_some())
-            })
+            items
+                .last()
+                .and_then(|item| anchor_from_item(item, filters.sort_key))
         } else {
             None
         };
@@ -565,6 +588,7 @@ ON CONFLICT(child_thread_id) DO NOTHING
         push_thread_filters(
             &mut builder,
             ThreadFilterOptions {
+                included_thread_ids: None,
                 archived_only,
                 allowed_sources,
                 model_providers,
@@ -578,9 +602,12 @@ ON CONFLICT(child_thread_id) DO NOTHING
             },
             matches!(
                 sort_key,
-                crate::SortKey::RecencyAt | crate::SortKey::SectionPosition
+                crate::SortKey::CreatedAt
+                    | crate::SortKey::RecencyAt
+                    | crate::SortKey::SectionPosition
             ),
         );
+        builder.push(EXCLUDE_ATTACHED_THREADS);
         push_thread_order_and_limit(
             &mut builder,
             sort_key,
@@ -588,7 +615,9 @@ ON CONFLICT(child_thread_id) DO NOTHING
             OrderByIndex::Enabled,
             matches!(
                 sort_key,
-                crate::SortKey::RecencyAt | crate::SortKey::SectionPosition
+                crate::SortKey::CreatedAt
+                    | crate::SortKey::RecencyAt
+                    | crate::SortKey::SectionPosition
             ),
             limit,
         );
@@ -657,8 +686,9 @@ INSERT INTO threads (
     git_origin_url,
     memory_mode,
     project_id,
-    daybreak_enabled
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    daybreak_enabled,
+    attached_thread_parent_id
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(id) DO NOTHING
             "#,
         )
@@ -712,7 +742,8 @@ ON CONFLICT(id) DO NOTHING
         .bind("enabled")
         .bind(metadata.project_id.as_deref())
         .bind(metadata.daybreak_enabled)
-        .execute(self.pool.as_ref())
+        .bind(metadata.attached_thread_parent_id.map(|id| id.to_string()))
+        .execute_with_busy_retry(self.pool.as_ref())
         .await?;
         self.insert_thread_spawn_edge_from_source_if_absent(metadata.id, metadata.source.as_str())
             .await?;
@@ -728,7 +759,7 @@ ON CONFLICT(id) DO NOTHING
         let result = sqlx::query("UPDATE threads SET daybreak_enabled = ? WHERE id = ?")
             .bind(daybreak_enabled)
             .bind(thread_id.to_string())
-            .execute(self.pool.as_ref())
+            .execute_with_busy_retry(self.pool.as_ref())
             .await?;
         Ok(result.rows_affected() > 0)
     }
@@ -741,7 +772,7 @@ ON CONFLICT(id) DO NOTHING
         let result = sqlx::query("UPDATE threads SET memory_mode = ? WHERE id = ?")
             .bind(memory_mode)
             .bind(thread_id.to_string())
-            .execute(self.pool.as_ref())
+            .execute_with_busy_retry(self.pool.as_ref())
             .await?;
         Ok(result.rows_affected() > 0)
     }
@@ -754,7 +785,7 @@ ON CONFLICT(id) DO NOTHING
         let result = sqlx::query("UPDATE threads SET title = ? WHERE id = ?")
             .bind(title)
             .bind(thread_id.to_string())
-            .execute(self.pool.as_ref())
+            .execute_with_busy_retry(self.pool.as_ref())
             .await?;
         Ok(result.rows_affected() > 0)
     }
@@ -767,7 +798,7 @@ ON CONFLICT(id) DO NOTHING
         let result = sqlx::query("UPDATE threads SET name = ? WHERE id = ?")
             .bind(name)
             .bind(thread_id.to_string())
-            .execute(self.pool.as_ref())
+            .execute_with_busy_retry(self.pool.as_ref())
             .await?;
         Ok(result.rows_affected() > 0)
     }
@@ -783,8 +814,33 @@ ON CONFLICT(id) DO NOTHING
                 .bind(datetime_to_epoch_seconds(updated_at))
                 .bind(datetime_to_epoch_millis(updated_at))
                 .bind(thread_id.to_string())
-                .execute(self.pool.as_ref())
+                .execute_with_busy_retry(self.pool.as_ref())
                 .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Record a token count when the thread still matches its observed source and any
+    /// required spawn edge exists. Otherwise the caller must use normal metadata repair.
+    pub async fn update_thread_token_usage(
+        &self,
+        metadata: &crate::ThreadMetadata,
+        updated_at: DateTime<Utc>,
+        total_tokens: i64,
+    ) -> anyhow::Result<bool> {
+        let updated_at = self.allocate_thread_updated_at(updated_at)?;
+        let result = sqlx::query(
+            "UPDATE threads SET updated_at = ?, updated_at_ms = ?, tokens_used = ?
+             WHERE id = ? AND source = ?
+               AND (? OR EXISTS (SELECT 1 FROM thread_spawn_edges WHERE child_thread_id = threads.id))",
+        )
+        .bind(datetime_to_epoch_seconds(updated_at))
+        .bind(datetime_to_epoch_millis(updated_at))
+        .bind(total_tokens.max(0))
+        .bind(metadata.id.to_string())
+        .bind(metadata.source.as_str())
+        .bind(thread_spawn_parent_thread_id_from_source_str(&metadata.source).is_none())
+        .execute_with_busy_retry(self.pool.as_ref())
+        .await?;
         Ok(result.rows_affected() > 0)
     }
 
@@ -809,7 +865,7 @@ WHERE id = ?
         .bind(recency_at_millis)
         .bind(recency_at_millis)
         .bind(thread_id.to_string())
-        .execute(self.pool.as_ref())
+        .execute_with_busy_retry(self.pool.as_ref())
         .await?;
         Ok(result.rows_affected() > 0)
     }
@@ -898,9 +954,20 @@ WHERE id = ?
         .bind(git_origin_url.is_some())
         .bind(git_origin_url.flatten().map(SanitizedGitUrl::as_str))
         .bind(thread_id.to_string())
-        .execute(self.pool.as_ref())
+        .execute_with_busy_retry(self.pool.as_ref())
         .await?;
         Ok(result.rows_affected() > 0)
+    }
+
+    /// Apply observed metadata, memory preference, and recency in one commit.
+    pub async fn upsert_thread_with_observed_metadata(
+        &self,
+        metadata: &crate::ThreadMetadata,
+        memory_mode: Option<&str>,
+        recency_at: Option<DateTime<Utc>>,
+    ) -> anyhow::Result<()> {
+        self.upsert_thread_metadata(metadata, memory_mode, memory_mode, recency_at)
+            .await
     }
 
     async fn upsert_thread_with_creation_memory_mode(
@@ -908,6 +975,25 @@ WHERE id = ?
         metadata: &crate::ThreadMetadata,
         creation_memory_mode: Option<&str>,
     ) -> anyhow::Result<()> {
+        self.upsert_thread_metadata(
+            metadata,
+            creation_memory_mode,
+            /*memory_mode*/ None,
+            /*recency_at*/ None,
+        )
+        .await
+    }
+
+    async fn upsert_thread_metadata(
+        &self,
+        metadata: &crate::ThreadMetadata,
+        creation_memory_mode: Option<&str>,
+        memory_mode: Option<&str>,
+        recency_at: Option<DateTime<Utc>>,
+    ) -> anyhow::Result<()> {
+        let recency_at = recency_at
+            .map(|at| self.allocate_thread_recency_at(at))
+            .transpose()?;
         let updated_at = self.allocate_thread_updated_at(metadata.updated_at)?;
         let insert_recency_at = self.allocate_thread_recency_at(metadata.recency_at)?;
         let preview = metadata_preview(metadata);
@@ -957,16 +1043,20 @@ INSERT INTO threads (
     git_origin_url,
     memory_mode,
     project_id,
-    daybreak_enabled
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    daybreak_enabled,
+    attached_thread_parent_id
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(id) DO UPDATE SET
+    attached_thread_parent_id = COALESCE(excluded.attached_thread_parent_id, threads.attached_thread_parent_id),
     rollout_path = excluded.rollout_path,
     created_at = excluded.created_at,
     updated_at = excluded.updated_at,
-    recency_at = threads.recency_at,
+    recency_at = CASE WHEN ? IS NULL THEN threads.recency_at
+        ELSE MAX(?, MAX(?, threads.recency_at_ms + 1) / 1000) END,
     created_at_ms = excluded.created_at_ms,
     updated_at_ms = excluded.updated_at_ms,
-    recency_at_ms = threads.recency_at_ms,
+    recency_at_ms = CASE WHEN ? IS NULL THEN threads.recency_at_ms
+        ELSE MAX(?, threads.recency_at_ms + 1) END,
     source = excluded.source,
     originator = COALESCE(threads.originator, excluded.originator),
     creator_user_id = COALESCE(threads.creator_user_id, excluded.creator_user_id),
@@ -995,7 +1085,8 @@ ON CONFLICT(id) DO UPDATE SET
     archived_at = excluded.archived_at,
     git_sha = COALESCE(threads.git_sha, excluded.git_sha),
     git_branch = COALESCE(threads.git_branch, excluded.git_branch),
-    git_origin_url = COALESCE(threads.git_origin_url, excluded.git_origin_url)
+    git_origin_url = COALESCE(threads.git_origin_url, excluded.git_origin_url),
+    memory_mode = COALESCE(?, threads.memory_mode)
             "#,
         )
         .bind(metadata.id.to_string())
@@ -1048,17 +1139,30 @@ ON CONFLICT(id) DO UPDATE SET
         .bind(creation_memory_mode.unwrap_or("enabled"))
         .bind(metadata.project_id.as_deref())
         .bind(metadata.daybreak_enabled)
-        .execute(self.pool.as_ref())
+        .bind(metadata.attached_thread_parent_id.map(|id| id.to_string()))
+        .bind(recency_at.map(datetime_to_epoch_seconds))
+        .bind(recency_at.map(datetime_to_epoch_seconds))
+        .bind(recency_at.map(datetime_to_epoch_millis))
+        .bind(recency_at.map(datetime_to_epoch_millis))
+        .bind(recency_at.map(datetime_to_epoch_millis))
+        .bind(memory_mode)
+        .execute_with_busy_retry(self.pool.as_ref())
         .await?;
         self.insert_thread_spawn_edge_from_source_if_absent(metadata.id, metadata.source.as_str())
             .await?;
         Ok(())
     }
 
-    /// Apply rollout items incrementally using the underlying database.
+    /// Build metadata using the provider configured for this state runtime.
+    pub fn build_thread_metadata(&self, builder: &ThreadMetadataBuilder) -> crate::ThreadMetadata {
+        builder.build(&self.default_provider)
+    }
+
+    /// Apply rollout items incrementally, keeping existing fields except the seed rollout path.
+    /// The seed stays boxed to keep callers' async frames small.
     pub async fn apply_rollout_items(
         &self,
-        builder: &ThreadMetadataBuilder,
+        mut metadata: Box<crate::ThreadMetadata>,
         items: &[RolloutItem],
         new_thread_memory_mode: Option<&str>,
         updated_at_override: Option<DateTime<Utc>>,
@@ -1066,11 +1170,13 @@ ON CONFLICT(id) DO UPDATE SET
         if items.is_empty() {
             return Ok(());
         }
-        let existing_metadata = self.get_thread(builder.id).await?;
-        let mut metadata = existing_metadata
-            .clone()
-            .unwrap_or_else(|| builder.build(&self.default_provider));
-        metadata.rollout_path = builder.rollout_path.clone();
+        let thread_id = metadata.id;
+        let existing_metadata = self.get_thread(thread_id).await?;
+        if let Some(existing) = existing_metadata.as_ref() {
+            let rollout_path = std::mem::take(&mut metadata.rollout_path);
+            *metadata = existing.clone();
+            metadata.rollout_path = rollout_path;
+        }
         for item in items {
             apply_rollout_item(&mut metadata, item, &self.default_provider);
         }
@@ -1079,7 +1185,7 @@ ON CONFLICT(id) DO UPDATE SET
         }
         let updated_at = match updated_at_override {
             Some(updated_at) => Some(updated_at),
-            None => file_modified_time_utc(builder.rollout_path.as_path()).await,
+            None => file_modified_time_utc(metadata.rollout_path.as_path()).await,
         };
         if let Some(updated_at) = updated_at {
             metadata.updated_at = updated_at;
@@ -1093,7 +1199,7 @@ ON CONFLICT(id) DO UPDATE SET
         upsert_result?;
         if let Some(memory_mode) = extract_memory_mode(items)
             && let Err(err) = self
-                .set_thread_memory_mode(builder.id, memory_mode.as_str())
+                .set_thread_memory_mode(thread_id, memory_mode.as_str())
                 .await
         {
             return Err(err);
@@ -1169,14 +1275,14 @@ ON CONFLICT(id) DO UPDATE SET
         for (thread_id, thread_id_string) in thread_ids.iter().zip(&thread_id_strings) {
             sqlx::query("DELETE FROM logs WHERE thread_id = ?")
                 .bind(thread_id_string)
-                .execute(self.logs_pool.as_ref())
+                .execute_with_busy_retry(self.diagnostic_logs_pool()?)
                 .await?;
             self.thread_queue.delete_thread_queue(*thread_id).await?;
             self.delete_versioned_thread_memory(*thread_id).await?;
             self.thread_goals.delete_thread_goal(*thread_id).await?;
         }
 
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_immediate().await?;
         for thread_id_string in &thread_id_strings {
             sqlx::query("DELETE FROM thread_dynamic_tools WHERE thread_id = ?")
                 .bind(thread_id_string)
@@ -1194,6 +1300,11 @@ ON CONFLICT(id) DO UPDATE SET
         }
         let mut rows_affected = 0;
         for thread_id_string in &thread_id_strings {
+            super::model_ids::delete_session(&mut tx, thread_id_string).await?;
+            sqlx::query("DELETE FROM thread_read_receipts WHERE thread_id = ?")
+                .bind(thread_id_string)
+                .execute(&mut *tx)
+                .await?;
             rows_affected += sqlx::query("DELETE FROM threads WHERE id = ?")
                 .bind(thread_id_string)
                 .execute(&mut *tx)
@@ -1232,7 +1343,17 @@ fn push_list_threads_query(
     relation_filter: Option<crate::ThreadRelationFilter>,
     limit: usize,
 ) {
-    if let Some(crate::ThreadRelationFilter::DescendantsOf(ancestor_thread_id)) = relation_filter {
+    if let Some(ids) = filters.included_thread_ids {
+        // Materialize only the requested primary keys before SQLite considers a scope or sort index.
+        builder.push("WITH threads AS MATERIALIZED (SELECT * FROM main.threads WHERE id IN (");
+        let mut separated = builder.separated(", ");
+        for id in ids {
+            separated.push_bind(id.to_string());
+        }
+        builder.push(")) ");
+    } else if let Some(crate::ThreadRelationFilter::DescendantsOf(ancestor_thread_id)) =
+        relation_filter
+    {
         builder.push(
             r#"
 WITH RECURSIVE subtree(child_thread_id, parent_thread_id) AS (
@@ -1253,55 +1374,119 @@ WITH RECURSIVE subtree(child_thread_id, parent_thread_id) AS (
         );
     }
     push_thread_select_columns(builder);
-    // SQLite may otherwise reorder these joins and scan the global timestamp index before
-    // checking the relationship. CROSS JOIN keeps the selective edge/subtree traversal first.
+    // CROSS JOIN keeps the requested IDs, direct children, or subtree first in the query plan.
     match relation_filter {
+        Some(crate::ThreadRelationFilter::DirectChildrenOf(_) | crate::ThreadRelationFilter::DescendantsOf(_))
+            if filters.included_thread_ids.is_some() => builder.push(
+            ", listed_edge.parent_thread_id AS parent_thread_id\nFROM threads\nCROSS JOIN thread_spawn_edges AS listed_edge ON listed_edge.child_thread_id = threads.id",
+        ),
         Some(crate::ThreadRelationFilter::DirectChildrenOf(_)) => builder.push(
             ", listed_edge.parent_thread_id AS parent_thread_id\nFROM thread_spawn_edges AS listed_edge\nCROSS JOIN threads ON threads.id = listed_edge.child_thread_id",
         ),
         Some(crate::ThreadRelationFilter::DescendantsOf(_)) => builder.push(
             ", subtree.parent_thread_id AS parent_thread_id\nFROM subtree\nCROSS JOIN threads ON threads.id = subtree.child_thread_id",
         ),
+        Some(crate::ThreadRelationFilter::AttachedThreadsOf(_) | crate::ThreadRelationFilter::IncludeAttached) => {
+            builder.push(", NULL AS parent_thread_id\nFROM threads")
+        }
         None => builder.push(" FROM threads"),
     };
-    let include_thread_id_tiebreaker = relation_filter.is_some()
-        || matches!(
-            filters.sort_key,
-            SortKey::RecencyAt | SortKey::SectionPosition
-        );
+    // Keep the stored source values and their order in sync with migration 0063.
+    // SQLite needs a literal IN list to recognize the partial-index predicate.
+    const INDEXED_INTERACTIVE_SOURCES: [&str; 4] = [
+        "cli",
+        "vscode",
+        r#"{"custom":"atlas"}"#,
+        r#"{"custom":"chatgpt"}"#,
+    ];
+    let use_interactive_source_literals = relation_filter.is_none()
+        && !filters.archived_only
+        && filters.cwd_filters.is_none()
+        && filters.section.is_none()
+        && filters.project_id.is_none()
+        && filters.search_term.is_none()
+        && filters.allowed_sources.len() == INDEXED_INTERACTIVE_SOURCES.len()
+        && INDEXED_INTERACTIVE_SOURCES.iter().all(|source| {
+            filters
+                .allowed_sources
+                .iter()
+                .any(|allowed| allowed.as_str() == *source)
+        });
+    let allowed_sources = if use_interactive_source_literals {
+        &[]
+    } else {
+        filters.allowed_sources
+    };
     push_thread_filters_with_preview(
         builder,
-        filters,
-        include_thread_id_tiebreaker,
-        /*include_empty_preview*/ relation_filter.is_some(),
+        ThreadFilterOptions {
+            allowed_sources,
+            ..filters
+        },
+        /*include_thread_id_tiebreaker*/ true,
+        relation_filter,
     );
+    if use_interactive_source_literals {
+        builder.push(" AND threads.source IN (");
+        let mut separated = builder.separated(", ");
+        for source in INDEXED_INTERACTIVE_SOURCES {
+            separated.push(format_args!("'{source}'"));
+        }
+        separated.push_unseparated(")");
+    }
+    if !matches!(
+        relation_filter,
+        Some(
+            crate::ThreadRelationFilter::AttachedThreadsOf(_)
+                | crate::ThreadRelationFilter::IncludeAttached
+        )
+    ) {
+        builder.push(EXCLUDE_ATTACHED_THREADS);
+    }
     match relation_filter {
         Some(crate::ThreadRelationFilter::DirectChildrenOf(parent_thread_id)) => {
             builder.push(" AND listed_edge.parent_thread_id = ");
             builder.push_bind(parent_thread_id.to_string());
         }
         Some(crate::ThreadRelationFilter::DescendantsOf(ancestor_thread_id)) => {
-            builder.push(" AND subtree.child_thread_id != ");
+            if filters.included_thread_ids.is_some() {
+                builder.push(
+                    " AND EXISTS (WITH RECURSIVE ancestors(id) AS (
+                        SELECT listed_edge.parent_thread_id
+                        UNION
+                        SELECT edge.parent_thread_id FROM ancestors
+                        JOIN thread_spawn_edges AS edge ON edge.child_thread_id = ancestors.id
+                    ) SELECT 1 FROM ancestors WHERE id = ",
+                );
+                builder.push_bind(ancestor_thread_id.to_string()).push(")");
+            }
+            builder.push(" AND threads.id != ");
             builder.push_bind(ancestor_thread_id.to_string());
         }
-        None => {}
+        Some(crate::ThreadRelationFilter::AttachedThreadsOf(parent)) => {
+            builder.push(" AND threads.attached_thread_parent_id = ");
+            builder.push_bind(parent.to_string());
+        }
+        Some(crate::ThreadRelationFilter::IncludeAttached) | None => {}
     }
     let order_by_index = match (relation_filter, filters.cwd_filters) {
         // Relationship listings are expected to be much smaller than the global thread table.
-        // Prefer the spawn-edge index and sort the matching subtree instead of scanning the
+        // Prefer the relationship index and sort the matches instead of scanning the
         // timestamp index until enough related threads happen to be found.
-        (Some(_), _) => OrderByIndex::Disabled,
+        (Some(relation), _) if relation != crate::ThreadRelationFilter::IncludeAttached => {
+            OrderByIndex::Disabled
+        }
         // Multi-cwd listing is supported but at the time of writing has no current use in production.
         // Preserve its query plan so the global timestamp index does not regress cwd filtering into a scan.
-        (None, Some(cwd_filters)) if cwd_filters.len() > 1 => OrderByIndex::Disabled,
-        (None, Some(_) | None) => OrderByIndex::Enabled,
+        (_, Some(cwd_filters)) if cwd_filters.len() > 1 => OrderByIndex::Disabled,
+        (_, Some(_) | None) => OrderByIndex::Enabled,
     };
     push_thread_order_and_limit(
         builder,
         filters.sort_key,
         filters.sort_direction,
         order_by_index,
-        include_thread_id_tiebreaker,
+        /*include_thread_id_tiebreaker*/ true,
         limit,
     );
 }
@@ -1311,6 +1496,7 @@ pub(super) fn push_thread_select_columns(builder: &mut QueryBuilder<Sqlite>) {
         r#"
 SELECT
     threads.id,
+    threads.attached_thread_parent_id,
     threads.rollout_path,
     threads.created_at_ms AS created_at,
     threads.updated_at_ms AS updated_at,
@@ -1370,6 +1556,7 @@ pub(super) fn extract_memory_mode(items: &[RolloutItem]) -> Option<String> {
         | RolloutItem::WorldState(_)
         | RolloutItem::RealtimeItem(_)
         | RolloutItem::RetainedContext(_)
+        | RolloutItem::DynamicToolsUpdated { .. }
         | RolloutItem::SecurityRiskScore(_)
         | RolloutItem::TokenUsageRecord(_)
         | RolloutItem::EventMsg(_) => None,
@@ -1384,6 +1571,7 @@ fn thread_spawn_parent_thread_id_from_source_str(source: &str) -> Option<ThreadI
 
 #[derive(Clone, Copy)]
 pub struct ThreadFilterOptions<'a> {
+    pub included_thread_ids: Option<&'a [ThreadId]>,
     pub archived_only: bool,
     pub allowed_sources: &'a [String],
     pub model_providers: Option<&'a [String]>,
@@ -1405,7 +1593,7 @@ pub(super) fn push_thread_filters<'a>(
         builder,
         options,
         include_thread_id_tiebreaker,
-        /*include_empty_preview*/ false,
+        /*relation_filter*/ None,
     );
 }
 
@@ -1413,9 +1601,10 @@ fn push_thread_filters_with_preview<'a>(
     builder: &mut QueryBuilder<Sqlite>,
     options: ThreadFilterOptions<'a>,
     include_thread_id_tiebreaker: bool,
-    include_empty_preview: bool,
+    relation_filter: Option<crate::ThreadRelationFilter>,
 ) {
     let ThreadFilterOptions {
+        included_thread_ids: _,
         archived_only,
         allowed_sources,
         model_providers,
@@ -1433,8 +1622,18 @@ fn push_thread_filters_with_preview<'a>(
     } else {
         builder.push(" AND threads.archived = 0");
     }
-    if !archived_only && !include_empty_preview && !matches!(section, Some(Some(_))) {
-        builder.push(" AND threads.preview <> ''");
+    if !archived_only && !matches!(section, Some(Some(_))) {
+        match relation_filter {
+            None => {
+                builder.push(" AND threads.preview <> ''");
+            }
+            Some(crate::ThreadRelationFilter::IncludeAttached) => {
+                builder.push(
+                    " AND (threads.preview <> '' OR threads.attached_thread_parent_id IS NOT NULL)",
+                );
+            }
+            Some(_) => {}
+        }
     }
     match section {
         Some(Some(section)) => {
@@ -1509,6 +1708,11 @@ fn push_thread_filters_with_preview<'a>(
             SortDirection::Asc => ">",
             SortDirection::Desc => "<",
         };
+        if include_thread_id_tiebreaker && anchor.id.is_some() {
+            // Keep the timestamp index range despite the UUID tie-breaker's OR predicate.
+            builder.push(format!(" AND {column} {operator}= "));
+            builder.push_bind(anchor_ts);
+        }
         builder.push(" AND (");
         builder.push(column);
         builder.push(" ");
@@ -1694,6 +1898,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn attached_thread_discovery_preserves_parent_lifecycle_and_cwd() -> anyhow::Result<()> {
+        let home = unique_temp_dir();
+        let config = crate::SqliteConfig::new_for_testing(home.as_path().abs());
+        let runtime = StateRuntime::init(config, "test-provider".to_string()).await?;
+        let parent = ThreadId::new();
+        let child = ThreadId::new();
+        let mut parent_metadata = test_thread_metadata(&home, parent, home.clone());
+        parent_metadata.preview = Some("parent".into());
+        parent_metadata.title = "shared title".into();
+        let mut child_metadata = test_thread_metadata(&home, child, home.join("original"));
+        child_metadata.attached_thread_parent_id = Some(parent);
+        child_metadata.preview = Some("saved child".into());
+        child_metadata.created_at = Utc::now() + chrono::Duration::seconds(5);
+        child_metadata.updated_at = child_metadata.created_at;
+        child_metadata.title = parent_metadata.title.clone();
+        runtime.upsert_thread(&parent_metadata).await?;
+        assert!(runtime.insert_thread_if_absent(&child_metadata).await?);
+        let filters = ThreadFilterOptions {
+            included_thread_ids: None,
+            archived_only: false,
+            allowed_sources: &[],
+            model_providers: None,
+            cwd_filters: None,
+            section: None,
+            project_id: None,
+            anchor: None,
+            sort_key: SortKey::CreatedAt,
+            sort_direction: SortDirection::Desc,
+            search_term: None,
+        };
+        let named = runtime
+            .find_thread_by_exact_title(
+                "shared title",
+                &[],
+                /*model_providers*/ None,
+                /*archived_only*/ false,
+                /*cwd*/ None,
+            )
+            .await?;
+        assert_eq!(named.map(|thread| thread.id), Some(parent));
+        let ids = runtime
+            .list_thread_ids(
+                /*limit*/ 1,
+                /*anchor*/ None,
+                SortKey::UpdatedAt,
+                &[],
+                /*model_providers*/ None,
+                /*archived_only*/ false,
+            )
+            .await?;
+        assert_eq!(ids.len(), 1);
+        assert_ne!(ids[0], child);
+        parent_metadata.cwd = home.join("moved");
+        runtime.upsert_thread(&parent_metadata).await?;
+        runtime
+            .mark_archived(parent, &parent_metadata.rollout_path, Utc::now())
+            .await?;
+        let saved = runtime
+            .list_threads_by_relation(
+                /*page_size*/ 10,
+                crate::ThreadRelationFilter::AttachedThreadsOf(parent),
+                filters,
+            )
+            .await?;
+        assert_eq!(
+            saved
+                .items
+                .iter()
+                .map(|t| (t.id, t.cwd.clone()))
+                .collect::<Vec<_>>(),
+            vec![(child, child_metadata.cwd)]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn archived_threads_without_previews_remain_listed() {
         let codex_home = unique_temp_dir();
         let runtime = StateRuntime::init(
@@ -1708,6 +1988,7 @@ mod tests {
         metadata.first_user_message = None;
         runtime.upsert_thread(&metadata).await.unwrap();
         let filters = |archived_only| ThreadFilterOptions {
+            included_thread_ids: None,
             archived_only,
             allowed_sources: &[],
             model_providers: None,
@@ -1794,6 +2075,7 @@ mod tests {
         }
 
         let filters = |anchor, section| ThreadFilterOptions {
+            included_thread_ids: None,
             archived_only: false,
             allowed_sources: &[],
             model_providers: None,
@@ -1927,6 +2209,7 @@ mod tests {
         }
 
         let filters = |anchor| ThreadFilterOptions {
+            included_thread_ids: None,
             archived_only: false,
             allowed_sources: &[],
             model_providers: None,
@@ -2064,7 +2347,7 @@ mod tests {
             .await?;
         seed_thread_cleanup_state(&runtime, thread_id, child_thread_id).await?;
 
-        runtime.logs_pool.close().await;
+        runtime.diagnostic_logs_pool().unwrap().close().await;
         runtime
             .delete_thread(thread_id)
             .await
@@ -2101,7 +2384,7 @@ mod tests {
             .await?;
         sqlx::query("INSERT INTO logs (ts, ts_nanos, level, target, feedback_log_body, thread_id) VALUES (1, 0, 'INFO', 'test', 'feedback log', ?)")
             .bind(thread_id.to_string())
-            .execute(runtime.logs_pool.as_ref())
+            .execute(runtime.diagnostic_logs_pool().unwrap())
             .await?;
         Ok(())
     }
@@ -2175,6 +2458,7 @@ mod tests {
             .list_threads(
                 /*page_size*/ 1,
                 ThreadFilterOptions {
+                    included_thread_ids: None,
                     archived_only: false,
                     allowed_sources: &[],
                     model_providers: Some(&model_providers),
@@ -2197,7 +2481,7 @@ mod tests {
             Some(Anchor {
                 ts: DateTime::<Utc>::from_timestamp_millis(1_700_000_200_000)
                     .expect("valid timestamp"),
-                id: None,
+                id: Some(newer_id),
             })
         );
 
@@ -2205,6 +2489,7 @@ mod tests {
             .list_threads(
                 /*page_size*/ 1,
                 ThreadFilterOptions {
+                    included_thread_ids: None,
                     archived_only: false,
                     allowed_sources: &[],
                     model_providers: Some(&model_providers),
@@ -2250,6 +2535,8 @@ mod tests {
             (other_id, other_cwd, 1_700_000_500),
         ] {
             let mut metadata = test_thread_metadata(&codex_home, thread_id, cwd);
+            metadata.created_at =
+                DateTime::<Utc>::from_timestamp(1_700_000_300, 0).expect("valid timestamp");
             metadata.updated_at =
                 DateTime::<Utc>::from_timestamp(updated_at, 0).expect("valid timestamp");
             runtime
@@ -2263,6 +2550,7 @@ mod tests {
             .list_threads(
                 /*page_size*/ 1,
                 ThreadFilterOptions {
+                    included_thread_ids: None,
                     archived_only: false,
                     allowed_sources: &[],
                     model_providers: None,
@@ -2289,7 +2577,7 @@ mod tests {
             Some(Anchor {
                 ts: DateTime::<Utc>::from_timestamp_millis(1_700_000_300_000)
                     .expect("valid timestamp"),
-                id: None,
+                id: Some(second_id),
             })
         );
 
@@ -2297,6 +2585,7 @@ mod tests {
             .list_threads(
                 /*page_size*/ 1,
                 ThreadFilterOptions {
+                    included_thread_ids: None,
                     archived_only: false,
                     allowed_sources: &[],
                     model_providers: None,
@@ -2324,6 +2613,7 @@ mod tests {
             .list_threads(
                 /*page_size*/ 10,
                 ThreadFilterOptions {
+                    included_thread_ids: None,
                     archived_only: false,
                     allowed_sources: &[],
                     model_providers: None,
@@ -2340,6 +2630,102 @@ mod tests {
             .expect("list with empty cwd filters should succeed");
 
         assert_eq!(page.items, Vec::new());
+
+        let anchor = Anchor {
+            ts: DateTime::<Utc>::from_timestamp(1_700_000_300, 0).expect("valid timestamp"),
+            id: Some(second_id),
+        };
+        // Activity must not move the unread thread ahead of the creation cursor.
+        runtime
+            .touch_thread_updated_at(first_id, Utc::now())
+            .await
+            .unwrap();
+        runtime
+            .touch_thread_recency_at(first_id, Utc::now())
+            .await
+            .unwrap();
+        let page = runtime
+            .list_threads(
+                /*page_size*/ 1,
+                ThreadFilterOptions {
+                    included_thread_ids: None,
+                    archived_only: false,
+                    allowed_sources: &[],
+                    model_providers: None,
+                    cwd_filters: Some(cwd_filters.as_slice()),
+                    section: None,
+                    project_id: None,
+                    anchor: Some(&anchor),
+                    sort_key: SortKey::CreatedAt,
+                    sort_direction: SortDirection::Desc,
+                    search_term: None,
+                },
+            )
+            .await
+            .expect("creation-time continuation should succeed");
+        assert_eq!(
+            page.items.iter().map(|item| item.id).collect::<Vec<_>>(),
+            vec![first_id]
+        );
+        assert_eq!(page.next_anchor, None);
+    }
+
+    #[tokio::test]
+    async fn included_thread_ids_use_primary_key_lookups_across_scopes() -> Result<()> {
+        let home = unique_temp_dir();
+        let runtime = StateRuntime::init(
+            crate::SqliteConfig::new_for_testing(home.as_path().abs()),
+            "test-provider".into(),
+        )
+        .await?;
+        let ids: Vec<_> = (0..100).map(|_| ThreadId::new()).collect();
+        for relation in [
+            None,
+            Some(crate::ThreadRelationFilter::DescendantsOf(ids[0])),
+        ] {
+            let mut builder = QueryBuilder::<Sqlite>::new("EXPLAIN QUERY PLAN ");
+            push_list_threads_query(
+                &mut builder,
+                ThreadFilterOptions {
+                    included_thread_ids: Some(&ids),
+                    archived_only: false,
+                    allowed_sources: &[],
+                    model_providers: None,
+                    cwd_filters: Some(std::slice::from_ref(&home)),
+                    section: Some(Some(CUSTOM_THREAD_SECTION_ID)),
+                    project_id: Some(Some("project")),
+                    anchor: None,
+                    sort_key: SortKey::SectionPosition,
+                    sort_direction: SortDirection::Asc,
+                    search_term: None,
+                },
+                relation,
+                /*limit*/ 2,
+            );
+            let plan: Vec<String> = builder
+                .build()
+                .fetch_all(runtime.pool.as_ref())
+                .await?
+                .iter()
+                .map(|row| row.get("detail"))
+                .collect();
+            assert!(
+                plan.iter()
+                    .any(|step| step.contains("SEARCH main.threads") && step.contains("(id=?)")),
+                "{plan:?}"
+            );
+            if relation.is_some() {
+                for edge in ["listed_edge", "edge"] {
+                    assert!(
+                        plan.iter()
+                            .any(|step| step.starts_with(&format!("SEARCH {edge} "))
+                                && step.contains("child_thread_id=?")),
+                        "{plan:?}"
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 
     #[tokio::test]
@@ -2359,7 +2745,7 @@ mod tests {
         ];
         let anchor = Anchor {
             ts: DateTime::<Utc>::from_timestamp(1_700_000_000, 0).expect("valid timestamp"),
-            id: None,
+            id: Some(ThreadId::new()),
         };
         for (sort_key, visible_index, cwd_index) in [
             (
@@ -2380,6 +2766,7 @@ mod tests {
         ] {
             for (cwd_filters, anchor, expected_index, expect_temp_sort) in [
                 (None, None, visible_index, false),
+                (None, Some(&anchor), visible_index, false),
                 (Some(&cwd_filters[..1]), None, cwd_index, false),
                 (
                     Some(&cwd_filters[..]),
@@ -2393,6 +2780,7 @@ mod tests {
                 push_list_threads_query(
                     &mut builder,
                     ThreadFilterOptions {
+                        included_thread_ids: None,
                         archived_only: false,
                         allowed_sources: &[],
                         model_providers: Some(&model_providers),
@@ -2422,15 +2810,93 @@ mod tests {
                         .any(|detail| detail.contains(expected_index)),
                     "query plan did not use {expected_index}: {plan_details:?}"
                 );
+                if anchor.is_some() && cwd_filters.is_none() {
+                    let timestamp_column = match sort_key {
+                        SortKey::CreatedAt => "created_at_ms",
+                        SortKey::UpdatedAt => "updated_at_ms",
+                        SortKey::RecencyAt => "recency_at_ms",
+                        SortKey::SectionPosition => unreachable!(),
+                    };
+                    assert!(
+                        plan_details
+                            .iter()
+                            .any(|detail| { detail.contains(&format!("{timestamp_column}<?")) }),
+                        "cursor query lost its timestamp index range: {plan_details:?}"
+                    );
+                }
+                // The visible creation/update indexes cover timestamps, so only ties need sorting.
+                let expect_tie_sort = matches!(sort_key, SortKey::CreatedAt | SortKey::UpdatedAt)
+                    && cwd_filters.is_none();
+                if expect_tie_sort {
+                    assert!(
+                        plan_details.iter().any(|detail| {
+                            detail.contains("TEMP B-TREE FOR LAST TERM OF ORDER BY")
+                        }),
+                        "unexpected tie sorting plan: {plan_details:?}"
+                    );
+                }
                 assert_eq!(
                     plan_details
                         .iter()
                         .any(|detail| detail.contains("TEMP B-TREE")),
-                    expect_temp_sort,
+                    expect_temp_sort || expect_tie_sort,
                     "unexpected sorting plan: {plan_details:?}"
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn default_sidebar_listing_uses_the_interactive_timestamp_index() -> anyhow::Result<()> {
+        let codex_home = unique_temp_dir();
+        let runtime = StateRuntime::init(
+            crate::SqliteConfig::new_for_testing(codex_home.as_path().abs()),
+            "test-provider".to_string(),
+        )
+        .await?;
+        let allowed_sources = [
+            SessionSource::VSCode,
+            SessionSource::Custom("chatgpt".to_string()),
+            SessionSource::Cli,
+            SessionSource::Custom("atlas".to_string()),
+        ]
+        .iter()
+        .map(crate::extract::enum_to_string)
+        .collect::<Vec<_>>();
+        let model_providers = ["test-provider".to_string()];
+
+        let mut builder = QueryBuilder::<Sqlite>::new("EXPLAIN QUERY PLAN ");
+        push_list_threads_query(
+            &mut builder,
+            ThreadFilterOptions {
+                included_thread_ids: None,
+                archived_only: false,
+                allowed_sources: &allowed_sources,
+                model_providers: Some(&model_providers),
+                cwd_filters: None,
+                section: None,
+                project_id: None,
+                anchor: None,
+                sort_key: SortKey::UpdatedAt,
+                sort_direction: SortDirection::Desc,
+                search_term: None,
+            },
+            /*relation_filter*/ None,
+            /*limit*/ 56,
+        );
+        let plan = builder
+            .build()
+            .fetch_all(runtime.pool.as_ref())
+            .await?
+            .into_iter()
+            .map(|row| row.get::<String, _>("detail"))
+            .collect::<Vec<_>>();
+        assert!(
+            plan.iter()
+                .any(|detail| detail.contains("idx_threads_interactive_updated_at_ms")),
+            "the sidebar listing should skip unrelated sources: {plan:?}"
+        );
+        Ok(())
     }
 
     #[tokio::test]
@@ -2457,6 +2923,7 @@ mod tests {
                     push_list_threads_query(
                         &mut builder,
                         ThreadFilterOptions {
+                            included_thread_ids: None,
                             archived_only: true,
                             allowed_sources: &[],
                             model_providers: None,
@@ -2554,6 +3021,7 @@ mod tests {
         push_list_threads_query(
             &mut builder,
             ThreadFilterOptions {
+                included_thread_ids: None,
                 archived_only: false,
                 allowed_sources: &[],
                 model_providers: None,
@@ -2584,6 +3052,7 @@ mod tests {
         );
 
         let filters = |anchor| ThreadFilterOptions {
+            included_thread_ids: None,
             archived_only: false,
             allowed_sources: &[],
             model_providers: None,
@@ -2727,8 +3196,10 @@ mod tests {
             metadata.created_at,
             SessionSource::Cli,
         );
-        let items = vec![RolloutItem::SessionMeta(SessionMetaLine {
+        let items = vec![RolloutItem::SessionMeta(Box::new(SessionMetaLine {
             meta: SessionMeta {
+                account_scoped: false,
+                attached_thread: false,
                 creator_user_id: None,
                 creator_account_id: None,
                 session_id: thread_id.into(),
@@ -2758,11 +3229,13 @@ mod tests {
                 context_window: None,
             },
             git: None,
-        })];
+        }))];
 
         runtime
             .apply_rollout_items(
-                &builder, &items, /*new_thread_memory_mode*/ None,
+                Box::new(runtime.build_thread_metadata(&builder)),
+                &items,
+                /*new_thread_memory_mode*/ None,
                 /*updated_at_override*/ None,
             )
             .await
@@ -2801,8 +3274,10 @@ mod tests {
             metadata.created_at,
             SessionSource::Cli,
         );
-        let items = vec![RolloutItem::SessionMeta(SessionMetaLine {
+        let items = vec![RolloutItem::SessionMeta(Box::new(SessionMetaLine {
             meta: SessionMeta {
+                account_scoped: false,
+                attached_thread: false,
                 creator_user_id: None,
                 creator_account_id: None,
                 session_id: thread_id.into(),
@@ -2839,11 +3314,13 @@ mod tests {
                         .expect("valid git remote URL"),
                 ),
             }),
-        })];
+        }))];
 
         runtime
             .apply_rollout_items(
-                &builder, &items, /*new_thread_memory_mode*/ None,
+                Box::new(runtime.build_thread_metadata(&builder)),
+                &items,
+                /*new_thread_memory_mode*/ None,
                 /*updated_at_override*/ None,
             )
             .await
@@ -3221,6 +3698,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn token_usage_preserves_concurrent_edits_and_requires_current_spawn_metadata()
+    -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let runtime = StateRuntime::init(
+            crate::SqliteConfig::new_for_testing(home.path().abs()),
+            "test-provider".to_string(),
+        )
+        .await?;
+        let thread_id = ThreadId::new();
+        let parent = ThreadId::new();
+        let mut metadata = test_thread_metadata(home.path(), thread_id, home.path().to_path_buf());
+        metadata.tokens_used = 42;
+        metadata.source = serde_json::json!({
+            "subagent": { "thread_spawn": { "parent_thread_id": parent, "depth": 1 } }
+        })
+        .to_string();
+        runtime.upsert_thread(&metadata).await?;
+        runtime.update_thread_title(thread_id, "new title").await?;
+        let mut expected = runtime.get_thread(thread_id).await?.expect("thread");
+        let updated_at = expected.updated_at + chrono::Duration::seconds(2);
+        assert!(
+            runtime
+                .update_thread_token_usage(&metadata, updated_at, /*total_tokens*/ -1)
+                .await?
+        );
+        expected.updated_at = updated_at;
+        expected.tokens_used = 0;
+        assert_eq!(runtime.get_thread(thread_id).await?, Some(expected.clone()));
+
+        sqlx::query("DELETE FROM thread_spawn_edges WHERE child_thread_id = ?")
+            .bind(thread_id.to_string())
+            .execute(runtime.pool.as_ref())
+            .await?;
+        assert!(
+            !runtime
+                .update_thread_token_usage(&metadata, updated_at, /*total_tokens*/ 123)
+                .await?
+        );
+        metadata.source = "cli".to_string();
+        assert!(
+            !runtime
+                .update_thread_token_usage(&metadata, updated_at, /*total_tokens*/ 123)
+                .await?
+        );
+        assert_eq!(runtime.get_thread(thread_id).await?, Some(expected));
+        assert!(runtime.list_thread_spawn_children(parent).await?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn touch_thread_recency_at_is_monotonic_and_survives_stale_upsert() {
         let codex_home = unique_temp_dir();
         let runtime = StateRuntime::init(
@@ -3319,6 +3846,7 @@ mod tests {
             .list_threads(
                 /*page_size*/ 1,
                 ThreadFilterOptions {
+                    included_thread_ids: None,
                     archived_only: false,
                     allowed_sources: &[],
                     model_providers: None,
@@ -3353,6 +3881,7 @@ mod tests {
             .list_threads(
                 /*page_size*/ 1,
                 ThreadFilterOptions {
+                    included_thread_ids: None,
                     archived_only: false,
                     allowed_sources: &[],
                     model_providers: None,
@@ -3387,6 +3916,7 @@ mod tests {
             .list_threads(
                 /*page_size*/ 1,
                 ThreadFilterOptions {
+                    included_thread_ids: None,
                     archived_only: false,
                     allowed_sources: &[],
                     model_providers: None,
@@ -3559,6 +4089,7 @@ mod tests {
                         total_tokens: 321,
                         codex_rollout_budget_units: None,
                     },
+                    last_usage_includes_reasoning: None,
                     last_token_usage: codex_protocol::protocol::TokenUsage::default(),
                     model_context_window: None,
                 }),
@@ -3570,7 +4101,7 @@ mod tests {
 
         runtime
             .apply_rollout_items(
-                &builder,
+                Box::new(runtime.build_thread_metadata(&builder)),
                 &items,
                 /*new_thread_memory_mode*/ None,
                 Some(override_updated_at),

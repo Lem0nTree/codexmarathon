@@ -11,6 +11,45 @@ fn map_api_error_maps_server_overloaded() {
     assert!(matches!(err.details(), CodexErrorDetails::ServerOverloaded));
 }
 
+#[tokio::test(start_paused = true)]
+async fn http_policy_capacity_preserves_retry_advice_and_terminal_behavior() {
+    use std::time::Duration;
+    for (code, expected) in [
+        (
+            "policy_capacity_unavailable",
+            CodexErrorInfo::PolicyCapacityUnavailable,
+        ),
+        ("server_is_overloaded", CodexErrorInfo::ServerOverloaded),
+    ] {
+        for advice in [RetryAfter::from_delay(Duration::from_secs(3)), None] {
+            let error = map_api_error(ApiError::Transport(TransportError::Http {
+                status: http::StatusCode::SERVICE_UNAVAILABLE,
+                url: None,
+                headers: None,
+                body: Some(
+                    serde_json::json!({"error": {
+                        "code": code, "type": "service_unavailable_error",
+                    }})
+                    .to_string(),
+                ),
+                retry_after: advice,
+            }));
+            assert_eq!(
+                (
+                    error.to_codex_protocol_error(),
+                    error.retry_after(),
+                    error.retry_delay(/*retry_count*/ 1)
+                ),
+                (
+                    expected.clone(),
+                    advice,
+                    advice.map(|_| Duration::from_secs(3))
+                )
+            );
+        }
+    }
+}
+
 #[test]
 fn map_api_error_preserves_content_filter_retry_and_public_error() {
     let err = map_api_error(ApiError::ContentFilter);
@@ -74,32 +113,106 @@ async fn map_api_error_preserves_retry_delay() {
     }
 }
 
+/// Mapping a new error category preserves elapsed advice without making hard failures retryable.
+#[tokio::test(start_paused = true)]
+async fn http_retry_deadline_survives_mapping_and_respects_terminal_errors() {
+    use std::time::Duration;
+
+    let advice = RetryAfter::from_delay(Duration::from_secs(10)).expect("retry advice");
+    tokio::time::advance(Duration::from_secs(4)).await;
+    for (status, code, retryable) in [
+        (503, "server_is_overloaded", true),
+        (429, "rate_limit_exceeded", true),
+        (429, "insufficient_quota", false),
+        (429, "usage_limit_reached", false),
+        (400, "cyber_policy", false),
+    ] {
+        let error = map_api_error(ApiError::Transport(TransportError::Http {
+            status: http::StatusCode::from_u16(status).unwrap(),
+            url: None,
+            headers: None,
+            body: Some(serde_json::json!({"error": {"type": code, "code": code, "message": "sensitive upstream detail"}}).to_string()),
+            retry_after: Some(advice),
+        }));
+        assert_eq!(
+            (error.retry_after(), error.server_retry_delay()),
+            (Some(advice), Some(Duration::from_secs(6))),
+            "{code}",
+        );
+        assert_eq!(
+            error.retry_delay(/*retry_count*/ 1),
+            retryable.then_some(Duration::from_secs(6)),
+            "{code}",
+        );
+        if status == 429 && retryable {
+            assert_eq!(
+                (
+                    error.to_codex_protocol_error(),
+                    error.http_status_code_value(),
+                    error.to_string()
+                ),
+                (
+                    CodexErrorInfo::ResponseTooManyFailedAttempts {
+                        http_status_code: Some(429),
+                    },
+                    Some(429),
+                    "exceeded retry limit, last status: 429 Too Many Requests".to_string(),
+                ),
+            );
+        }
+    }
+}
+
 #[test]
-fn map_api_error_distinguishes_capacity_from_slow_down() {
-    for (code, expected, retryable) in [
+fn map_http_error_classifies_provider_codes() {
+    use CodexErrorInfo::ModelNotFound;
+
+    for (status, code, expected, retryable) in [
         (
+            503,
             "server_is_overloaded",
             CodexErrorInfo::ServerOverloaded,
             false,
         ),
-        ("slow_down", CodexErrorInfo::RateLimitExceeded, true),
+        (503, "slow_down", CodexErrorInfo::RateLimitExceeded, true),
         (
+            503,
             "unknown_error",
             CodexErrorInfo::HttpConnectionFailed {
                 http_status_code: Some(503),
             },
             true,
         ),
+        (400, "model_not_found", ModelNotFound, false),
+        (
+            400,
+            "budget_reached",
+            CodexErrorInfo::SessionBudgetExceeded,
+            false,
+        ),
+        (403, "model_not_found", ModelNotFound, false),
+        (404, "model_not_found", ModelNotFound, false),
+        (
+            404,
+            "resource_not_found",
+            CodexErrorInfo::HttpConnectionFailed {
+                http_status_code: Some(404),
+            },
+            true,
+        ),
     ] {
         let err = map_api_error(ApiError::Transport(TransportError::Http {
             retry_after: None,
-            status: http::StatusCode::SERVICE_UNAVAILABLE,
+            status: http::StatusCode::from_u16(status).unwrap(),
             url: None,
             headers: None,
             body: Some(
                 serde_json::json!({"error": {"code": code, "message": "retry later"}}).to_string(),
             ),
         }));
+        if expected == ModelNotFound {
+            assert_eq!(err.http_status_code_value(), Some(status));
+        }
         assert_eq!(
             (
                 err.to_codex_protocol_error(),
@@ -223,6 +336,12 @@ fn map_api_error_preserves_typed_errors() {
     let message = "This request was rejected.";
     for (error, expected_info) in [
         (
+            ApiError::InferenceHookDenied {
+                message: message.to_string(),
+            },
+            CodexErrorInfo::InferenceHookDenied,
+        ),
+        (
             ApiError::BioPolicy {
                 message: message.to_string(),
             },
@@ -244,16 +363,30 @@ fn map_api_error_preserves_typed_errors() {
 
 #[test]
 fn map_api_error_maps_http_and_wrapped_websocket_typed_errors() {
-    for (code, expected_info, fallback) in [
+    for (status, code, expected_info, fallback) in [
         (
+            http::StatusCode::BAD_REQUEST,
+            "content_policy_violation",
+            CodexErrorInfo::InvalidPrompt,
+            "The input was rejected by the content policy.",
+        ),
+        (
+            http::StatusCode::BAD_REQUEST,
             "bio_policy",
             CodexErrorInfo::BioPolicy,
             "This content was flagged for possible biological risk.",
         ),
         (
+            http::StatusCode::BAD_REQUEST,
             "invalid_prompt",
             CodexErrorInfo::InvalidPrompt,
             "Invalid request.",
+        ),
+        (
+            http::StatusCode::FORBIDDEN,
+            "inference_hook_denied",
+            CodexErrorInfo::InferenceHookDenied,
+            "Your workspace inference hook blocked this request.",
         ),
     ] {
         for wrapped in [false, true] {
@@ -272,11 +405,11 @@ fn map_api_error_maps_http_and_wrapped_websocket_typed_errors() {
                 }
                 if wrapped {
                     body["type"] = serde_json::json!("error");
-                    body["status"] = serde_json::json!(400);
+                    body["status"] = serde_json::json!(status.as_u16());
                 }
                 let err = map_api_error(ApiError::Transport(TransportError::Http {
                     retry_after: None,
-                    status: http::StatusCode::BAD_REQUEST,
+                    status,
                     url: None,
                     headers: None,
                     body: Some(body.to_string()),
@@ -337,6 +470,7 @@ fn map_api_error_preserves_misalignment_details_from_403_body() {
             "code": "misalignment_policy_violation",
             "misalignment": {
                 "error_type": "unauthorized_data_transfer",
+                "review_target": " RB/opaque== ",
                 "detailed_explanation": "The agent attempted an external transfer.",
                 "steer": { "message": "Do not transfer the user's files." }
             }
@@ -363,6 +497,7 @@ fn map_api_error_preserves_misalignment_details_from_403_body() {
         misalignment,
         &Some(MisalignmentErrorDetails {
             error_type: Some("unauthorized_data_transfer".to_string()),
+            review_target: Some(" RB/opaque== ".to_string()),
             detailed_explanation: Some("The agent attempted an external transfer.".to_string()),
             steer: Some(codex_protocol::protocol::MisalignmentSteer {
                 message: "Do not transfer the user's files.".to_string(),
@@ -382,6 +517,7 @@ fn map_api_error_preserves_misalignment_details_from_wrapped_websocket_error() {
             "code": "misalignment_policy_violation",
             "misalignment": {
                 "error_type": "future_safety_category",
+                "review_target": " RB/opaque== ",
                 "detailed_explanation": "The agent attempted an external transfer.",
                 "steer": { "message": "Do not transfer the user's files." }
             }
@@ -411,6 +547,7 @@ fn map_api_error_preserves_misalignment_details_from_wrapped_websocket_error() {
         misalignment,
         &Some(MisalignmentErrorDetails {
             error_type: Some("future_safety_category".to_string()),
+            review_target: Some(" RB/opaque== ".to_string()),
             detailed_explanation: Some("The agent attempted an external transfer.".to_string()),
             steer: Some(codex_protocol::protocol::MisalignmentSteer {
                 message: "Do not transfer the user's files.".to_string(),
@@ -688,6 +825,59 @@ fn map_api_error_ignores_unparseable_rate_limit_reached_type_headers() {
 }
 
 #[test]
+fn only_an_explicit_workspace_403_stops_retries() {
+    use http::StatusCode;
+    let provider = r#"{"error":{"code":"invalid_workspace_selected"}}"#;
+    let detail = r#"{"detail":{"code":"invalid_workspace_selected"}}"#;
+    let access_denied = r#"{"detail":{"code":"codex_workspace_access_denied"}}"#;
+    let other = r#"{"detail":{"code":"route_rate_limited"}}"#;
+    let workspace_header =
+        http::HeaderValue::from_str(&base64::engine::general_purpose::STANDARD.encode(provider))
+            .unwrap();
+    for (status, body, with_header, terminal) in [
+        (StatusCode::FORBIDDEN, detail, false, true),
+        (StatusCode::FORBIDDEN, access_denied, false, true),
+        (StatusCode::SERVICE_UNAVAILABLE, access_denied, false, false),
+        (StatusCode::FORBIDDEN, provider, false, true),
+        (StatusCode::FORBIDDEN, "", true, true),
+        (StatusCode::FORBIDDEN, "", false, false),
+        (
+            StatusCode::FORBIDDEN,
+            "invalid_workspace_selected",
+            false,
+            false,
+        ),
+        (StatusCode::FORBIDDEN, other, true, false),
+        (StatusCode::UNAUTHORIZED, detail, true, false),
+    ] {
+        let mut headers = HeaderMap::new();
+        headers.insert(REQUEST_ID_HEADER, http::HeaderValue::from_static("req-403"));
+        if with_header {
+            headers.insert(X_ERROR_JSON_HEADER, workspace_header.clone());
+        }
+        let err = map_api_error(ApiError::Transport(TransportError::Http {
+            status,
+            headers: Some(headers),
+            body: Some(body.to_owned()),
+            url: None,
+            retry_after: None,
+        }));
+        assert_eq!(
+            matches!(err.details(), CodexErrorDetails::WorkspaceAccessDenied(_)),
+            terminal,
+            "{err}"
+        );
+        assert_eq!(
+            err.retry_delay(/*retry_count*/ 1).is_none(),
+            terminal,
+            "{err}"
+        );
+        assert_eq!(err.http_status_code_value(), Some(status.as_u16()));
+        assert!(err.to_string().contains("req-403"));
+    }
+}
+
+#[test]
 fn map_api_error_extracts_identity_auth_details_from_headers() {
     let mut headers = HeaderMap::new();
     headers.insert(REQUEST_ID_HEADER, http::HeaderValue::from_static("req-401"));
@@ -721,4 +911,58 @@ fn map_api_error_extracts_identity_auth_details_from_headers() {
         Some("missing_authorization_header")
     );
     assert_eq!(err.identity_error_code.as_deref(), Some("token_expired"));
+}
+
+#[test]
+fn runtime_auth_denials_stop_retries_without_losing_http_diagnostics() {
+    for (status, code, retryable) in [
+        (403, "runtime_assertion_invalid", false),
+        (403, "runtime_instance_paused", false),
+        (403, "runtime_instance_revoked", false),
+        (401, "invalid_agent_instance_assertion", false),
+        (503, "runtime_verification_unavailable", true),
+        (503, "agent_instance_authentication_unavailable", true),
+        (401, "token_expired", true),
+        (403, "ordinary_policy_denial", true),
+    ] {
+        for in_header in [false, true] {
+            let status = http::StatusCode::from_u16(status).unwrap();
+            let details = serde_json::json!({"error": {"code": code}}).to_string();
+            let mut headers = http::HeaderMap::from_iter([(
+                "x-request-id".parse().unwrap(),
+                "request-runtime".parse().unwrap(),
+            )]);
+            let body = if in_header {
+                headers.insert(
+                    X_ERROR_JSON_HEADER,
+                    base64::engine::general_purpose::STANDARD
+                        .encode(details)
+                        .parse()
+                        .unwrap(),
+                );
+                r#"{"detail":"Unauthorized"}"#.to_owned()
+            } else {
+                details
+            };
+            let error = map_api_error(ApiError::Transport(TransportError::Http {
+                status,
+                retry_after: None,
+                url: Some("https://api.openai.com/v1/responses".into()),
+                headers: Some(headers),
+                body: Some(body.clone()),
+            }));
+            assert_eq!(
+                error.retry_delay(/*retry_count*/ 1).is_some(),
+                retryable,
+                "{code}, in_header={in_header}"
+            );
+            let CodexErrorDetails::UnexpectedStatus(details) = error.details() else {
+                panic!("missing HTTP diagnostics: {error:?}");
+            };
+            assert_eq!(
+                (&details.body, details.status, details.request_id.as_deref()),
+                (&body, status, Some("request-runtime"))
+            );
+        }
+    }
 }

@@ -422,6 +422,7 @@ async fn status_command_renders_immediately_and_updates_first_card_without_statu
         thread_id,
         request_id,
         Ok(ThreadUsageOutcome::Available(ThreadUsage {
+            native_usage_usd_micros: None,
             thread_id: thread_id.to_string(),
             estimated_usage_credits_micros: 50_000_000,
             estimated_usage_usd_micros: Some(1_820_000),
@@ -481,10 +482,9 @@ async fn status_command_renders_immediately_and_updates_first_card_without_statu
 }
 
 #[tokio::test]
-async fn status_command_omits_thread_usage_for_non_cbp_enterprise_plans() {
+async fn status_command_omits_thread_usage_for_unsupported_plans() {
     for plan_type in [
         Some(PlanType::Enterprise),
-        Some(PlanType::Ent26),
         Some(PlanType::Pro),
         Some(PlanType::Edu),
         Some(PlanType::SelfServeBusinessUsageBased),
@@ -552,6 +552,7 @@ async fn status_command_stays_visible_and_updates_after_thread_usage_retry() {
         thread_id,
         retry_request_id,
         Ok(ThreadUsageOutcome::Available(ThreadUsage {
+            native_usage_usd_micros: None,
             thread_id: thread_id.to_string(),
             estimated_usage_credits_micros: 50_000_000,
             estimated_usage_usd_micros: Some(1_820_000),
@@ -589,6 +590,7 @@ async fn status_command_renders_credits_and_breakdowns_without_usd_estimate() {
         thread_id,
         request_id,
         Ok(ThreadUsageOutcome::Available(ThreadUsage {
+            native_usage_usd_micros: None,
             thread_id: thread_id.to_string(),
             estimated_usage_credits_micros: 50_000_000,
             estimated_usage_usd_micros: None,
@@ -654,6 +656,7 @@ async fn status_command_drops_stale_usd_when_updated_usage_has_only_credits() {
         thread_id,
         request_id,
         Ok(ThreadUsageOutcome::Available(ThreadUsage {
+            native_usage_usd_micros: None,
             thread_id: thread_id.to_string(),
             estimated_usage_credits_micros: 40_000_000,
             estimated_usage_usd_micros: Some(1_820_000),
@@ -679,6 +682,7 @@ async fn status_command_drops_stale_usd_when_updated_usage_has_only_credits() {
         thread_id,
         request_id,
         Ok(ThreadUsageOutcome::Available(ThreadUsage {
+            native_usage_usd_micros: None,
             thread_id: thread_id.to_string(),
             estimated_usage_credits_micros: 50_000_000,
             estimated_usage_usd_micros: None,
@@ -712,6 +716,7 @@ async fn status_command_requests_thread_usage_for_remote_connection_metadata() {
         address: "wss://remote.example.com".to_string(),
         version: "v1.0.0".to_string(),
         is_local_daemon: false,
+        is_managed_daemon: false,
     });
 
     chat.dispatch_command(SlashCommand::Status);
@@ -763,6 +768,7 @@ async fn status_command_remains_visible_when_account_changes_during_usage_refres
         thread_id,
         request_id,
         Ok(ThreadUsageOutcome::Available(ThreadUsage {
+            native_usage_usd_micros: None,
             thread_id: thread_id.to_string(),
             estimated_usage_credits_micros: 50_000_000,
             estimated_usage_usd_micros: Some(1_820_000),
@@ -795,6 +801,7 @@ async fn status_command_remains_visible_when_thread_changes_during_usage_refresh
         thread_id,
         request_id,
         Ok(ThreadUsageOutcome::Available(ThreadUsage {
+            native_usage_usd_micros: None,
             thread_id: thread_id.to_string(),
             estimated_usage_credits_micros: 50_000_000,
             estimated_usage_usd_micros: Some(1_820_000),
@@ -802,4 +809,26 @@ async fn status_command_remains_visible_when_thread_changes_during_usage_refresh
         })),
     ));
     assert!(drain_insert_history(&mut rx).is_empty());
+}
+
+#[tokio::test]
+async fn marathon_auth_signal_only_marks_the_recovery_parked_at_transition_start() {
+    let (mut chat, _events, _ops) = make_chatwidget_manual(None).await;
+    chat.marathon_recovery_controller_enabled = true;
+    chat.pending_usage_limit_resume_turn = Some(UserMessage::from("resume"));
+    chat.pending_usage_limit_resume_recovery_id = Some("recovery-1".into());
+    chat.usage_limit_resume_waiting_for_auth_reload = true;
+    chat.usage_limit_resume_auth_reloaded = false;
+
+    chat.on_marathon_recovery_auth_changed("other", None);
+    assert!(!chat.usage_limit_resume_auth_reloaded);
+    chat.on_marathon_recovery_auth_changed("recovery-1", None);
+    assert!(chat.usage_limit_resume_auth_reloaded);
+    assert!(chat.usage_limit_resume_waiting_for_auth_reload);
+    assert!(chat.pending_usage_limit_resume_turn.is_some());
+
+    chat.pending_usage_limit_resume_recovery_id = Some("recovery-2".into());
+    chat.usage_limit_resume_auth_reloaded = false;
+    chat.on_marathon_recovery_auth_changed("recovery-1", None);
+    assert!(!chat.usage_limit_resume_auth_reloaded);
 }

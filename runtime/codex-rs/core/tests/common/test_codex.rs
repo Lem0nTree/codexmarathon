@@ -1,3 +1,5 @@
+use codex_protocol::protocol::TurnEnvironmentRequest;
+use codex_protocol::protocol::TurnEnvironmentRequests;
 use std::future::Future;
 use std::io::ErrorKind;
 use std::mem::swap;
@@ -13,19 +15,22 @@ use std::time::Duration;
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
+use codex_agent_graph_store::AgentGraphStore;
 use codex_analytics::AnalyticsEventsClient;
 use codex_attachment_store::AttachmentStore;
 use codex_config::CloudConfigBundleLoader;
+use codex_config::ConfigLayerSource;
+use codex_config::ConfigLayerStack;
 use codex_core::CodexThread;
 pub use codex_core::StartThreadOptions;
 use codex_core::ThreadManager;
+use codex_core::ThreadStoreBuilder;
 use codex_core::TimeProvider;
 pub use codex_core::TurnInputRequest;
 use codex_core::config::Config;
 use codex_core::resolve_installation_id;
 use codex_core::shell::Shell;
 use codex_core::shell::get_shell_by_model_provided_path;
-use codex_core::thread_store_from_config;
 use codex_core::windows_sandbox::WindowsSandboxLevelExt;
 use codex_exec_server::CreateDirectoryOptions;
 use codex_exec_server::ExecutorFileSystem;
@@ -41,6 +46,7 @@ use codex_login::CodexAuth;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::built_in_model_providers;
 use codex_models_manager::bundled_models_response;
+use codex_models_manager::manager::ModelCatalogSettings;
 use codex_models_manager::manager::SharedModelsManager;
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::ModeKind;
@@ -127,13 +133,18 @@ impl UserInstructionsProvider for RecordingUserInstructionsProvider {
     }
 }
 
-pub fn local(cwd: AbsolutePathBuf) -> TurnEnvironmentSelection {
-    TurnEnvironmentSelection {
+/// Builds environment input without attaching any thread's capability roots.
+pub fn local_request(cwd: AbsolutePathBuf) -> TurnEnvironmentRequest {
+    TurnEnvironmentRequest {
         environment_id: codex_exec_server::LOCAL_ENVIRONMENT_ID.to_string(),
         cwd: PathUri::from_abs_path(&cwd),
         workspace_roots: vec![PathUri::from_abs_path(&cwd)],
         config: EnvironmentConfigState::FromThread,
     }
+}
+
+pub fn local(cwd: AbsolutePathBuf) -> TurnEnvironmentSelection {
+    TurnEnvironmentSelection::new(local_request(cwd), &[])
 }
 
 /// Builds explicit environment configuration with the test thread's permissions and shell settings.
@@ -152,6 +163,7 @@ pub fn environment_config_for_selection(
         None => PermissionProfileSnapshot::legacy(profile),
     };
     EnvironmentConfig {
+        environment_hooks: Default::default(),
         allow_login_shell: permissions.allow_login_shell,
         workspace_roots: selection.workspace_roots.clone(),
         permission_profile,
@@ -185,6 +197,11 @@ pub fn local_selections(cwd: AbsolutePathBuf) -> TurnEnvironmentSelections {
     TurnEnvironmentSelections::new(cwd.clone(), vec![local(cwd)])
 }
 
+/// Builds thread-settings input using the local test environment.
+pub fn local_requests(cwd: AbsolutePathBuf) -> TurnEnvironmentRequests {
+    TurnEnvironmentRequests::new(cwd.clone(), vec![local_request(cwd)])
+}
+
 #[derive(Debug)]
 pub struct TestEnv {
     environment: codex_exec_server::Environment,
@@ -207,6 +224,7 @@ impl TestEnv {
         let cwd = local_cwd_temp_dir.abs();
         let selection = match exec_server_url {
             Some(_) => TurnEnvironmentSelection {
+                selected_capability_roots: Default::default(),
                 environment_id: codex_exec_server::REMOTE_ENVIRONMENT_ID.to_string(),
                 cwd: PathUri::from_abs_path(&cwd),
                 workspace_roots: vec![PathUri::from_abs_path(&cwd)],
@@ -241,6 +259,16 @@ impl TestEnv {
     /// Returns the environment and target-native cwd selected by the test harness.
     pub fn selection(&self) -> &TurnEnvironmentSelection {
         &self.selection
+    }
+
+    /// Requests the fixture's environment without copying a thread's root choices.
+    pub fn request(&self) -> TurnEnvironmentRequest {
+        TurnEnvironmentRequest {
+            environment_id: self.selection.environment_id.clone(),
+            cwd: self.selection.cwd.clone(),
+            workspace_roots: self.selection.workspace_roots.clone(),
+            config: self.selection.config.clone(),
+        }
     }
 
     fn local_cwd_temp_dir(&self) -> Option<Arc<TempDir>> {
@@ -279,6 +307,7 @@ pub async fn test_env() -> Result<TestEnv> {
                 )
                 .await?;
             let selection = TurnEnvironmentSelection {
+                selected_capability_roots: Default::default(),
                 environment_id: codex_exec_server::REMOTE_ENVIRONMENT_ID.to_string(),
                 cwd: cwd_uri.clone(),
                 workspace_roots: vec![cwd_uri.clone()],
@@ -380,6 +409,8 @@ impl TestAuth {
 }
 
 pub struct TestCodexBuilder {
+    request_country: codex_protocol::RequestCountry,
+    apps_tools_cache: codex_core::CodexAppsToolsCache,
     config_mutators: Vec<Box<ConfigMutator>>,
     thread_manager_configurer: Option<Box<dyn FnOnce(ThreadManager) -> ThreadManager + Send>>,
     auth: TestAuth,
@@ -397,13 +428,31 @@ pub struct TestCodexBuilder {
     code_mode_host_program: Option<PathBuf>,
     history_mode: Option<ThreadHistoryMode>,
     models_manager: Option<SharedModelsManager>,
+    model_catalog_settings: Option<ModelCatalogSettings>,
     thread_store: Option<Arc<dyn ThreadStore>>,
+    agent_graph_store: Option<Arc<dyn AgentGraphStore>>,
     image_store: Arc<dyn AttachmentStore>,
 }
 
 impl TestCodexBuilder {
+    /// Set the initial country when creating a new thread.
+    pub fn with_request_country(mut self, request_country: codex_protocol::RequestCountry) -> Self {
+        self.request_country = request_country;
+        self
+    }
+
+    pub fn with_apps_tools_cache(mut self, cache: codex_core::CodexAppsToolsCache) -> Self {
+        self.apps_tools_cache = cache;
+        self
+    }
+
     pub fn with_thread_store(mut self, thread_store: Arc<dyn ThreadStore>) -> Self {
         self.thread_store = Some(thread_store);
+        self
+    }
+
+    pub fn with_agent_graph_store(mut self, agent_graph_store: Arc<dyn AgentGraphStore>) -> Self {
+        self.agent_graph_store = Some(agent_graph_store);
         self
     }
 
@@ -438,6 +487,11 @@ impl TestCodexBuilder {
         analytics_events_client: AnalyticsEventsClient,
     ) -> Self {
         self.analytics_events_client = Some(analytics_events_client);
+        self
+    }
+
+    pub fn with_model_catalog_settings(mut self, settings: ModelCatalogSettings) -> Self {
+        self.model_catalog_settings = Some(settings);
         self
     }
 
@@ -715,6 +769,30 @@ impl TestCodexBuilder {
             .await
     }
 
+    /// Restarts without changing the executor platform selected by the test process.
+    pub async fn restart_with_auto_env(
+        &mut self,
+        server: &MockServer,
+        previous: &TestCodex,
+    ) -> Result<TestCodex> {
+        let rollout_path = previous
+            .session_configured
+            .rollout_path
+            .clone()
+            .context("rollout path")?;
+        previous.codex.shutdown_and_wait().await?;
+        let base_url = format!("{}/v1", server.uri());
+        let test_env = test_env().await?;
+        Box::pin(self.build_with_home_and_base_url(
+            base_url,
+            Arc::clone(&previous.home),
+            Some(rollout_path),
+            test_env,
+            /*include_local_environment*/ false,
+        ))
+        .await
+    }
+
     async fn build_with_home_and_base_url(
         &mut self,
         base_url: String,
@@ -782,10 +860,21 @@ impl TestCodexBuilder {
         environment_manager: Arc<codex_exec_server::EnvironmentManager>,
     ) -> anyhow::Result<TestCodex> {
         let state_db = codex_core::init_state_db(&config).await;
-        let thread_store = self
-            .thread_store
-            .clone()
-            .unwrap_or_else(|| thread_store_from_config(&config, state_db.clone()));
+        let thread_store = self.thread_store.clone().unwrap_or_else(|| {
+            let sqlite = config.sqlite_config().clone();
+            ThreadStoreBuilder::from_config(&config, state_db.clone())
+                .with_additional_cleanup(move |thread_ids| {
+                    let sqlite = sqlite.clone();
+                    Box::pin(async move {
+                        codex_agent_message_board_host::delete_agent_message_boards(
+                            &sqlite,
+                            &thread_ids,
+                        )
+                        .await
+                    })
+                })
+                .build()
+        });
         let installation_id = resolve_installation_id(&config.codex_home).await?;
         let user_instructions_provider =
             self.user_instructions_provider.clone().unwrap_or_else(|| {
@@ -794,17 +883,29 @@ impl TestCodexBuilder {
                 ))
             });
         let auth_manager = self.auth.manager_for_home(config.codex_home.as_path());
-        let models_manager = self
-            .models_manager
-            .clone()
-            .unwrap_or_else(|| codex_core::build_models_manager(&config, auth_manager.clone()));
         let code_mode_host_program = self
             .code_mode_host_program
             .take()
             .or_else(|| codex_utils_cargo_bin::cargo_bin("codex-code-mode-host").ok());
+        let factory =
+            match &self.models_manager {
+                Some(models) => codex_core::test_support::fixed_model_catalog(Arc::clone(models)),
+                None => Arc::new(self.model_catalog_settings.clone().unwrap_or_else(|| {
+                    ModelCatalogSettings::disk(config.codex_home.to_path_buf())
+                })),
+            };
+        let startup = codex_core::build_startup_models(
+            &config,
+            Arc::clone(&auth_manager),
+            installation_id,
+            factory,
+        );
         let thread_manager = Arc::new_cyclic(|manager| {
             let mut extensions = self.extensions.to_builder();
-            codex_core::install_agent_message_board(&mut extensions, manager.clone());
+            codex_agent_message_board_host::install_agent_message_board(
+                &mut extensions,
+                manager.clone(),
+            );
             if config.features.enabled(Feature::GuardianV2) {
                 codex_guardian_v2::install(&mut extensions, auth_manager.clone(), manager.clone());
             } else {
@@ -812,9 +913,8 @@ impl TestCodexBuilder {
             }
             let thread_manager = ThreadManager::new(
                 &config,
-                auth_manager.clone(),
-                models_manager,
-                codex_core::CodexAppsToolsCache::default(),
+                startup,
+                self.apps_tools_cache.clone(),
                 SessionSource::Exec,
                 Arc::clone(&environment_manager),
                 Arc::new(extensions.build()),
@@ -822,8 +922,9 @@ impl TestCodexBuilder {
                 self.analytics_events_client.clone(),
                 Arc::clone(&self.image_store),
                 Arc::clone(&thread_store),
-                codex_core::local_agent_graph_store_from_state_db(state_db.as_ref()),
-                installation_id,
+                self.agent_graph_store.clone().or_else(|| {
+                    codex_core::local_agent_graph_store_from_state_db(state_db.as_ref())
+                }),
                 /*attestation_provider*/ None,
                 /*external_time_provider*/ self.external_time_provider.clone(),
             );
@@ -889,7 +990,7 @@ impl TestCodexBuilder {
                 .await?
             }
             (None, None) => {
-                let environments = if test_env.selection().cwd.infer_path_convention()
+                let environment_requests = if test_env.selection().cwd.infer_path_convention()
                     == Some(PathConvention::Windows)
                     && PathUri::from_abs_path(&config.cwd) != test_env.selection().cwd
                 {
@@ -897,15 +998,16 @@ impl TestCodexBuilder {
                     let mut selection = test_env.selection().clone();
                     selection.cwd = cwd.clone();
                     selection.workspace_roots = vec![cwd];
-                    test_env.selection = selection.clone();
-                    Some(vec![selection])
+                    test_env.selection = selection;
+                    Some(vec![test_env.request()])
                 } else {
                     None
                 };
                 Box::pin(thread_manager.start_thread(StartThreadOptions {
+                    request_country: self.request_country.clone(),
                     history_mode: self.history_mode,
                     client_mcp_extensions: client_mcp_extensions(),
-                    environments,
+                    environments: environment_requests,
                     ..StartThreadOptions::new(config.clone())
                 }))
                 .await?
@@ -980,6 +1082,24 @@ impl TestCodexBuilder {
     }
 }
 
+pub fn configure_scenario_catalog(config: &mut Config) {
+    // Keep the fixture independent of the checkout's project configuration.
+    let stack = &config.config_layer_stack;
+    config.config_layer_stack = ConfigLayerStack::new(
+        stack
+            .all_layers_low_to_high()
+            .filter(|layer| !matches!(&layer.name, ConfigLayerSource::Project { .. }))
+            .cloned()
+            .collect(),
+        stack.requirements().clone(),
+        stack.requirements_toml().clone(),
+    )
+    .expect("fixture config layers")
+    .with_cloud_config_binding(stack.cloud_config_binding().cloned());
+    config.model_catalog = Some(bundled_models_response().expect("bundled model catalog"));
+    config.cloud_skill_enabled = false;
+}
+
 fn ensure_test_model_catalog(config: &mut Config) -> Result<()> {
     if config.model.as_deref() != Some(TEST_MODEL_WITH_EXPERIMENTAL_TOOLS)
         || config.model_catalog.is_some()
@@ -1022,6 +1142,22 @@ pub struct TestCodex {
 }
 
 impl TestCodex {
+    /// Starts another test thread with the fixture's current environments and configuration.
+    /// Keeping request construction here lets ordinary tests ignore runtime selection fields.
+    pub async fn start_thread_options(&self) -> StartThreadOptions {
+        StartThreadOptions {
+            environments: Some(
+                self.codex
+                    .environment_selections()
+                    .await
+                    .into_iter()
+                    .map(TurnEnvironmentSelection::into_request)
+                    .collect(),
+            ),
+            ..StartThreadOptions::new(self.config.clone())
+        }
+    }
+
     pub fn cwd_path(&self) -> &Path {
         self.cwd.path()
     }
@@ -1195,7 +1331,8 @@ impl TestCodex {
                     text_elements: Vec::new(),
                 }])
                 .with_thread_settings(ThreadSettingsOverrides {
-                    environments: turn_environment_selections,
+                    environments: turn_environment_selections
+                        .map(TurnEnvironmentSelections::into_requests),
                     approval_policy: Some(approval_policy),
                     sandbox_policy: Some(sandbox_policy),
                     permission_profile,
@@ -1456,6 +1593,8 @@ fn function_call_output<'a>(bodies: &'a [Value], call_id: &str) -> &'a Value {
 
 pub fn test_codex() -> TestCodexBuilder {
     TestCodexBuilder {
+        request_country: Default::default(),
+        apps_tools_cache: Default::default(),
         thread_manager_configurer: None,
         config_mutators: vec![Box::new(|config| {
             config
@@ -1484,7 +1623,9 @@ pub fn test_codex() -> TestCodexBuilder {
         // These fixtures exercise legacy-only resume/fork helpers; store-default tests opt out.
         history_mode: Some(ThreadHistoryMode::Legacy),
         models_manager: None,
+        model_catalog_settings: None,
         thread_store: None,
+        agent_graph_store: None,
         image_store: codex_core::passthrough_image_store(),
     }
 }

@@ -1,16 +1,19 @@
 use super::responses_error::parse_failed_response;
+use crate::common::ReasoningRemovalReason;
 use crate::common::ResponseEvent;
 use crate::common::ResponseStream;
 use crate::common::SafetyBuffering;
 use crate::common::SafetyBufferingTreatment;
 use crate::error::ApiError;
-use crate::error::parse_flex_unavailable;
+use crate::error::parse_terminal_provider_error;
+use crate::guardian_assessment::parse_guardian_assessment;
 use crate::rate_limits::parse_all_rate_limits;
 use crate::safety_buffering::treatment_from_headers;
 use crate::telemetry::SseTelemetry;
 use codex_client::ByteStream;
 use codex_client::StreamResponse;
 use codex_protocol::ResponseUsageMetadata;
+use codex_protocol::error::ResponseIncompleteError;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::ModelVerification;
 use codex_protocol::protocol::TokenUsage;
@@ -19,6 +22,7 @@ use eventsource_stream::Eventsource;
 use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -97,6 +101,7 @@ pub fn spawn_response_stream(
     });
 
     ResponseStream {
+        routing_affinity: None,
         rx_event,
         upstream_request_id,
         interrupt: None,
@@ -162,6 +167,7 @@ pub struct ResponsesStreamEvent {
     pub(crate) headers: Option<Value>,
     metadata: Option<Value>,
     response: Option<Value>,
+    response_id: Option<Value>,
     error: Option<Value>,
     item: Option<Value>,
     item_id: Option<String>,
@@ -215,6 +221,33 @@ impl ResponsesStreamEvent {
         self.headers
             .as_ref()
             .and_then(header_turn_state_value_from_json)
+    }
+
+    /// Collects independent typed notifications in delivery order. The transport
+    /// supplies safety buffering after applying its response-header treatment.
+    pub(crate) fn metadata_events(
+        &self,
+        safety_buffering: Option<SafetyBuffering>,
+    ) -> Vec<ResponseEvent> {
+        let guardian = if self.kind() == "response.metadata" {
+            parse_guardian_assessment(
+                self.response_id.as_ref().and_then(Value::as_str),
+                self.metadata.as_ref(),
+            )
+        } else {
+            None
+        };
+        [
+            self.model_verifications()
+                .map(ResponseEvent::ModelVerifications),
+            self.turn_moderation_metadata()
+                .map(ResponseEvent::TurnModerationMetadata),
+            safety_buffering.map(ResponseEvent::SafetyBuffering),
+            guardian.map(ResponseEvent::GuardianAssessment),
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
     }
 
     pub(crate) fn model_verifications(&self) -> Option<Vec<ModelVerification>> {
@@ -341,12 +374,37 @@ impl ResponsesEventError {
     }
 }
 
+// Diagnostic fields are optional and must never make an otherwise valid response fail.
+fn reasoning_removals(response: &Value) -> Option<BTreeMap<ReasoningRemovalReason, i64>> {
+    let transformations = response.get("input_transformations")?.as_array()?;
+    let mut counts = BTreeMap::new();
+    for transformation in transformations {
+        if transformation.get("type").and_then(Value::as_str) != Some("reasoning")
+            || transformation.get("action").and_then(Value::as_str) != Some("removed")
+        {
+            continue;
+        }
+        let reason = match transformation.get("reason").and_then(Value::as_str) {
+            Some("organization_mismatch") => ReasoningRemovalReason::OrganizationMismatch,
+            Some("end_user_mismatch") => ReasoningRemovalReason::EndUserMismatch,
+            Some("model_mismatch") => ReasoningRemovalReason::ModelMismatch,
+            Some("prefix_mismatch") => ReasoningRemovalReason::PrefixMismatch,
+            Some("turn_boundary") => ReasoningRemovalReason::TurnBoundary,
+            _ => ReasoningRemovalReason::Other,
+        };
+        *counts.entry(reason).or_default() += 1;
+    }
+    Some(counts)
+}
+
 pub fn process_responses_event(
     event: ResponsesStreamEvent,
 ) -> std::result::Result<Option<ResponseEvent>, ResponsesEventError> {
     match event.kind.as_str() {
         "error" => {
-            if let Some(error) = event.error.as_ref().and_then(parse_flex_unavailable) {
+            if let Some(error) =
+                parse_terminal_provider_error(event.error.as_ref(), /*status*/ None)
+            {
                 return Err(ResponsesEventError::Api(error));
             }
         }
@@ -429,11 +487,37 @@ pub fn process_responses_event(
                     return Err(ResponsesEventError::Api(ApiError::ContentFilter));
                 }
                 if reason != "interrupted" {
-                    let message = format!("Incomplete response returned, reason: {reason}");
-                    return Err(ResponsesEventError::Api(ApiError::Stream(message)));
+                    let response = event.response.as_ref();
+                    let response_id = response
+                        .and_then(|response| response.get("id"))
+                        .and_then(Value::as_str)
+                        .map(str::to_owned);
+                    let token_usage = response
+                        .and_then(|response| response.get("usage"))
+                        .and_then(|usage| {
+                            serde_json::from_value::<ResponseCompletedUsage>(usage.clone()).ok()
+                        })
+                        .map(Into::into);
+                    return Err(ResponsesEventError::Api(ApiError::ResponseIncomplete(
+                        Box::new(ResponseIncompleteError {
+                            partial_output: response
+                                .and_then(|r| r.get("output")?.as_array())
+                                .into_iter()
+                                .flatten()
+                                .filter(|item| {
+                                    item.get("status").and_then(Value::as_str) == Some("incomplete")
+                                })
+                                .cloned()
+                                .collect(),
+                            reason: reason.to_string(),
+                            response_id,
+                            token_usage,
+                        }),
+                    )));
                 }
             }
             if let Some(resp_val) = event.response {
+                let reasoning_removals = reasoning_removals(&resp_val);
                 let metadata = resp_val
                     .get("usage")
                     .filter(|usage| !usage.is_null())
@@ -447,6 +531,7 @@ pub fn process_responses_event(
                             response_id: resp.id,
                             token_usage: resp.usage.map(Into::into),
                             usage_metadata: resp.usage_metadata,
+                            reasoning_removals,
                             end_turn: if interrupted {
                                 Some(false)
                             } else {
@@ -585,9 +670,8 @@ async fn process_sse_with_treatment(
                 continue;
             }
         };
-        let model_verifications = event.model_verifications();
-        let turn_moderation_metadata = event.turn_moderation_metadata();
         let safety_buffering = event.safety_buffering(&safety_buffering_treatment);
+        let metadata_events = event.metadata_events(safety_buffering);
 
         if let Some(model) = event.response_model()
             && last_server_model.as_deref() != Some(model.as_str())
@@ -601,29 +685,10 @@ async fn process_sse_with_treatment(
             }
             last_server_model = Some(model);
         }
-        if let Some(verifications) = model_verifications
-            && tx_event
-                .send(Ok(ResponseEvent::ModelVerifications(verifications)))
-                .await
-                .is_err()
-        {
-            return;
-        }
-        if let Some(metadata) = turn_moderation_metadata
-            && tx_event
-                .send(Ok(ResponseEvent::TurnModerationMetadata(metadata)))
-                .await
-                .is_err()
-        {
-            return;
-        }
-        if let Some(buffering) = safety_buffering
-            && tx_event
-                .send(Ok(ResponseEvent::SafetyBuffering(buffering)))
-                .await
-                .is_err()
-        {
-            return;
+        for metadata_event in metadata_events {
+            if tx_event.send(Ok(metadata_event)).await.is_err() {
+                return;
+            }
         }
 
         match process_responses_event(event) {
@@ -639,7 +704,17 @@ async fn process_sse_with_treatment(
             Ok(None) => {}
             Err(error) => {
                 let error = error.into_api_error();
-                if matches!(error, ApiError::FlexUnavailable) {
+                if matches!(
+                    error,
+                    ApiError::FlexUnavailable
+                        | ApiError::ContextWindowExceeded
+                        | ApiError::InvalidRequest { .. }
+                        | ApiError::SessionBudgetExceeded
+                        | ApiError::InferenceHookDenied { .. }
+                        | ApiError::AccessProgramNotEnabled { .. }
+                        | ApiError::ContentPolicyViolation { .. }
+                        | ApiError::ResponseIncomplete(_)
+                ) {
                     let _ = tx_event.send(Err(error)).await;
                     return;
                 }
@@ -648,6 +723,10 @@ async fn process_sse_with_treatment(
         };
     }
 }
+
+#[cfg(test)]
+#[path = "responses_error_tests.rs"]
+mod error_tests;
 
 #[cfg(test)]
 mod tests {
@@ -731,6 +810,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn partial_answer_phase_survives_item_start_and_completion() {
+        let item = json!({
+            "id": "msg_partial",
+            "type": "message",
+            "role": "assistant",
+            "content": [],
+            "phase": "partial_answer"
+        });
+        let added = json!({"type": "response.output_item.added", "item": item});
+        let delta = json!({"type": "response.output_text.delta", "delta": "First result."});
+        let mut done_item = item;
+        done_item["content"] = json!([{"type": "output_text", "text": "First result."}]);
+        let done = json!({"type": "response.output_item.done", "item": done_item});
+        let completed = json!({
+            "type": "response.completed",
+            "response": {"id": "resp1", "end_turn": false}
+        });
+        let stream = [added, delta, done, completed]
+            .into_iter()
+            .map(|event| format!("data: {event}\n\n"))
+            .collect::<String>();
+
+        let events = collect_events(&[stream.as_bytes()]).await;
+        assert_matches!(events.as_slice(), [
+            Ok(ResponseEvent::OutputItemAdded(ResponseItem::Message {
+                phase: Some(MessagePhase::PartialAnswer), content: start_content, ..
+            })),
+            Ok(ResponseEvent::OutputTextDelta(text)),
+            Ok(ResponseEvent::OutputItemDone(ResponseItem::Message {
+                phase: Some(MessagePhase::PartialAnswer), content: done_content, ..
+            })),
+            Ok(ResponseEvent::Completed { end_turn: Some(false), .. }),
+        ] if start_content.is_empty()
+            && text == "First result."
+            && done_content == &vec![codex_protocol::models::ContentItem::OutputText {
+                annotations: None,
+                logprobs: None,
+                text: "First result.".to_string()
+            }]);
+    }
+
+    #[tokio::test]
     async fn parses_items_and_completed() {
         let item1 = json!({
             "type": "response.output_item.done",
@@ -787,6 +908,7 @@ mod tests {
                 response_id,
                 token_usage,
                 usage_metadata,
+                reasoning_removals: _,
                 end_turn,
             }) => {
                 assert_eq!(response_id, "resp1");
@@ -985,6 +1107,7 @@ mod tests {
                 response_id,
                 token_usage,
                 usage_metadata,
+                reasoning_removals: _,
                 end_turn,
             }) => {
                 assert_eq!(response_id, "resp1");
@@ -1247,6 +1370,7 @@ mod tests {
                     misalignment,
                     &Some(MisalignmentErrorDetails {
                         error_type: Some("future_safety_category".to_string()),
+                        review_target: None,
                         detailed_explanation: Some(
                             "The agent attempted an external transfer.".to_string()
                         ),
@@ -1326,6 +1450,25 @@ mod tests {
                 other => panic!("unexpected event for {code}: {other:?}"),
             }
         }
+    }
+
+    #[tokio::test]
+    async fn incomplete_response_retains_partial_output_on_the_error() {
+        let call = json!({
+            "type": "function_call", "status": "incomplete", "id": "fc_attempt",
+            "call_id": "attempt", "name": "unknown", "arguments": "{}",
+        });
+        let terminal = json!({
+            "type": "response.incomplete",
+            "response": {
+                "id": "resp_1", "incomplete_details": {"reason": "invalid_recipient"},
+                "output": [{"type": "message", "status": "completed"}, call],
+            }
+        });
+        let sse = format!("event: response.incomplete\ndata: {terminal}\n\n");
+        let events = collect_events(&[sse.as_bytes()]).await;
+        assert_matches!(events.as_slice(), [Err(ApiError::ResponseIncomplete(error))]
+            if error.reason == "invalid_recipient" && error.partial_output == [call]);
     }
 
     #[tokio::test]
@@ -1561,6 +1704,7 @@ mod tests {
                 response_id,
                 token_usage: None,
                 usage_metadata: None,
+                reasoning_removals: None,
                 end_turn: None,
             } if response_id == "resp-1"
         );
@@ -1602,6 +1746,7 @@ mod tests {
                 response_id,
                 token_usage: None,
                 usage_metadata: None,
+                reasoning_removals: None,
                 end_turn: None,
             } if response_id == "resp-1"
         );
@@ -1638,6 +1783,7 @@ mod tests {
                 response_id,
                 token_usage: None,
                 usage_metadata: None,
+                reasoning_removals: None,
                 end_turn: None,
             } if response_id == "resp-1"
         );
@@ -1674,6 +1820,7 @@ mod tests {
                 response_id,
                 token_usage: None,
                 usage_metadata: None,
+                reasoning_removals: None,
                 end_turn: None,
             } if response_id == "resp-1"
         );

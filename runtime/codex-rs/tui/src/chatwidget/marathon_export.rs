@@ -134,6 +134,7 @@ impl ChatWidget {
                     enabled: false,
                     orderable: false,
                     section_break_after: false,
+                    on_activate: None,
                 }
             })
             .collect();

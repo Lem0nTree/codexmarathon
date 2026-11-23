@@ -5,10 +5,15 @@
 
 use super::*;
 use codex_app_server_protocol::AccountRoutingOverride;
+use codex_app_server_protocol::AccountUpdateReason;
 use codex_backend_client::AccountEntry;
+use codex_config::ConfigLoadError;
+use codex_http_client::NetworkPolicyDenied;
+use codex_login::RefreshTokenError;
 use codex_login::WorkspaceRouting;
 use codex_login::WorkspaceRoutingRequest;
 use codex_login::WorkspaceRoutingResolver;
+use codex_login::auth::RefreshTokenFailedError;
 use codex_model_provider::ProviderAccount;
 use codex_model_provider::ProviderAccountError;
 use codex_model_provider::ProviderAccountState;
@@ -33,17 +38,21 @@ pub(super) type WorkspaceRoutingFetches = HashMap<WorkspaceRoutingKey, Weak<Work
 
 pub(super) struct WorkspaceRoutingFetch {
     discovery: Semaphore,
-    routing: Mutex<Option<WorkspaceRouting>>,
+    routing: Mutex<Option<CachedWorkspaceRouting>>,
 }
 
+#[derive(Clone)]
 pub(super) struct CachedWorkspaceRouting {
     key: WorkspaceRoutingKey,
     routing: WorkspaceRouting,
+    name: Option<String>,
 }
 
 pub(super) struct AccountRead {
     account_state: ProviderAccountState,
+    user_id: Option<String>,
     pub(super) workspace_routing: Option<WorkspaceRouting>,
+    workspace_name: Option<String>,
 }
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
@@ -54,11 +63,12 @@ pub(super) enum AccountReadError {
     Routing(#[from] WorkspaceRoutingError),
 }
 
-/// Routing failure categories carry no account, URL, or backend data.
+/// Routing failures carry no account, URL, or backend data. Config failures retain
+/// only a location or structured error category, never the raw config error.
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub(super) enum WorkspaceRoutingError {
-    #[error("failed to load workspace requirements")]
-    RequirementsLoad,
+    #[error("failed to load workspace requirements: {0}")]
+    RequirementsLoad(String),
     #[error("workspace routing requires a ChatGPT account id")]
     MissingAccountId,
     #[error("workspace routing discovery cancelled")]
@@ -67,14 +77,16 @@ pub(super) enum WorkspaceRoutingError {
     AccountChanged,
     #[error("workspace routing discovery unauthorized (401)")]
     DiscoveryUnauthorized,
+    #[error(transparent)]
+    RefreshTokenRejected(RefreshTokenFailedError),
     #[error("workspace routing discovery failed")]
     DiscoveryFailed,
     #[error("selected workspace missing from routing discovery")]
     MissingWorkspace,
     #[error("duplicate workspace in routing discovery")]
     DuplicateWorkspace,
-    #[error("failed to reload workspace requirements")]
-    RequirementsReload,
+    #[error("failed to reload workspace requirements: {0}")]
+    RequirementsReload(String),
     #[error("configuration changed during workspace routing discovery; retry account/read")]
     ConfigurationChanged,
     #[error("invalid model provider URL")]
@@ -97,10 +109,83 @@ pub(super) enum WorkspaceRoutingError {
     BackendIsNotOrigin,
     #[error("required ChatGPT backend conflicts with workspace routing")]
     BackendConflict,
+    #[error("Sign in to a government workspace to use the configured government backend.")]
+    GovernmentWorkspaceRequired,
     #[error("invalid workspace backend URL")]
     InvalidBackendUrl,
     #[error("workspace backend must use an HTTPS origin without credentials")]
     InvalidBackendOrigin,
+}
+
+fn workspace_config_load_reason(error: &io::Error) -> String {
+    // Parser messages and cloud bundle errors can quote secrets, even without
+    // their source snippets. Retain only structured diagnostics before these
+    // errors reach JSON-RPC clients, login notifications, or tracing.
+    let mut current = error
+        .get_ref()
+        .map(|source| source as &(dyn std::error::Error + 'static));
+    while let Some(source) = current {
+        if let Some(config) = source.downcast_ref::<ConfigLoadError>() {
+            let config = config.config_error();
+            let start = config.range.start;
+            // Non-file diagnostics store a display name, which can contain
+            // backend-supplied policy names and IDs, in this field.
+            if !config.path.is_absolute() {
+                return format!(
+                    "invalid non-file configuration at line {}, column {}",
+                    start.line, start.column
+                );
+            }
+            return format!(
+                "invalid configuration at {}:{}:{}",
+                config.path.display(),
+                start.line,
+                start.column
+            );
+        }
+        if let Some(cloud) = source.downcast_ref::<CloudConfigBundleLoadError>() {
+            let reason = match cloud.code() {
+                CloudConfigBundleLoadErrorCode::Timeout => "request timed out",
+                CloudConfigBundleLoadErrorCode::Auth
+                | CloudConfigBundleLoadErrorCode::RequestFailed => {
+                    // Cloud loading currently erases the typed denial. Match
+                    // only known safe policy messages, never forward raw text.
+                    let message = cloud.to_string();
+                    if let Some(policy) = [
+                        NetworkPolicyDenied::Unavailable,
+                        NetworkPolicyDenied::Destination,
+                        NetworkPolicyDenied::Revoked,
+                        NetworkPolicyDenied::UnsupportedTransport,
+                    ]
+                    .into_iter()
+                    .find(|policy| policy.to_string() == message)
+                    {
+                        return policy.to_string();
+                    }
+                    if cloud.code() == CloudConfigBundleLoadErrorCode::Auth {
+                        "authentication failed"
+                    } else {
+                        "request failed"
+                    }
+                }
+                CloudConfigBundleLoadErrorCode::InvalidBundle => "invalid bundle",
+                CloudConfigBundleLoadErrorCode::Internal => "internal error",
+            };
+            return match cloud.status_code() {
+                Some(status) => format!("cloud config: {reason} (HTTP {status})"),
+                None => format!("cloud config: {reason}"),
+            };
+        }
+        if let Some(policy) = source.downcast_ref::<NetworkPolicyDenied>() {
+            return policy.to_string();
+        }
+        current = source.source();
+    }
+    // Use the OS error or kind, never an untyped error's potentially secret message.
+    match error.raw_os_error() {
+        Some(code) => io::Error::from_raw_os_error(code).to_string(),
+        None => error.kind().to_string(),
+    }
 }
 
 impl WorkspaceRoutingResolver for AccountRequestProcessor {
@@ -114,6 +199,9 @@ impl WorkspaceRoutingResolver for AccountRequestProcessor {
                 .map(|account| account.workspace_routing)
                 .map_err(|error| match error {
                     AccountReadError::InvalidAccount(error) => io::Error::other(error),
+                    AccountReadError::Routing(WorkspaceRoutingError::RefreshTokenRejected(
+                        error,
+                    )) => io::Error::new(io::ErrorKind::PermissionDenied, error),
                     AccountReadError::Routing(error) => io::Error::new(
                         if error == WorkspaceRoutingError::DiscoveryUnauthorized {
                             io::ErrorKind::PermissionDenied
@@ -128,6 +216,21 @@ impl WorkspaceRoutingResolver for AccountRequestProcessor {
 }
 
 impl AccountRequestProcessor {
+    pub(super) async fn read_account_for_background_workspace_routing(
+        &self,
+    ) -> Result<Option<AccountRead>, AccountReadError> {
+        if !self
+            .auth_manager
+            .auth_cached()
+            .as_ref()
+            .is_some_and(CodexAuth::is_chatgpt_auth)
+        {
+            return Ok(None);
+        }
+
+        self.read_account(/*request*/ None).await.map(Some)
+    }
+
     pub(crate) fn notify_workspace_routing_to_connection(&self, connection_id: ConnectionId) {
         let processor = self.clone();
         let auth_changes = self.auth_manager.auth_change_state_receiver();
@@ -136,11 +239,14 @@ impl AccountRequestProcessor {
             if auth_changes.borrow().owner_generation != owner_generation {
                 return;
             }
-            if let Ok(response) = processor.read_account(/*request*/ None).await
+            if let Ok(Some(response)) = processor
+                .read_account_for_background_workspace_routing()
+                .await
                 && response.workspace_routing.is_some()
                 && auth_changes.borrow().owner_generation == owner_generation
             {
-                let notification = processor.current_account_updated_notification();
+                let mut notification = processor.current_account_updated_notification();
+                notification.reason = Some(AccountUpdateReason::WorkspaceRoutingReady);
                 processor
                     .outgoing
                     .send_account_notification(
@@ -160,31 +266,46 @@ impl AccountRequestProcessor {
     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
         let mut auth_changed = false;
         if params.reload_auth_from_storage {
-            let _auth_transition_guard = self.auth_transition_lock.lock().await;
+            // Account reads are not admitted turn work, so they may pause and
+            // drain all starts before acquiring the shared transition lock.
+            let _pause = self.turn_admission.pause().await?;
+            let _guard = self.auth_transition_lock.lock().await;
             if *self
                 .thread_watch_manager
                 .subscribe_running_turn_count()
                 .borrow()
                 == 0
             {
-                let status = self.auth_manager.reload_with_status().await;
-                match handle_auth_reload_status(
-                    status,
-                    &self.auth_manager,
-                    &self.thread_manager,
-                    &self.config_manager,
-                    &self.outgoing,
-                    &self.config.chatgpt_base_url,
-                    self.config.http_client_factory(),
-                    "account/get",
-                )
-                .await
-                {
-                    AuthReloadStatus::Reloaded { changed } => auth_changed = changed,
+                let before_owner = self
+                    .auth_manager
+                    .auth_change_state_receiver()
+                    .borrow()
+                    .owner_generation;
+                match self.auth_manager.reload_with_status().await {
+                    AuthReloadStatus::Reloaded { changed } => {
+                        if changed {
+                            let owner = *self.auth_manager.auth_change_state_receiver().borrow();
+                            // Recovery must follow an owner change, not an ordinary
+                            // refresh-token rotation within the same login.
+                            auth_changed = owner.owner_generation != before_owner;
+                            if self.marathon_validate_owner(owner).await.is_err()
+                                || self.marathon_owner_changed(owner).await.is_err()
+                            {
+                                self.turn_admission.begin_drain();
+                                return Err(internal_error(
+                                    "account validation failed after auth reload",
+                                ));
+                            }
+                        }
+                    }
                     AuthReloadStatus::Failed => {
                         return Err(internal_error("failed to reload auth from storage"));
                     }
                 }
+            } else {
+                return Err(invalid_request(
+                    "auth reload is deferred until running turns finish",
+                ));
             }
         }
         self.refresh_token_if_requested(params.refresh_token).await;
@@ -193,11 +314,26 @@ impl AccountRequestProcessor {
             .await
             .map_err(|error| match error {
                 AccountReadError::InvalidAccount(error) => invalid_request(error.to_string()),
+                AccountReadError::Routing(
+                    error @ WorkspaceRoutingError::GovernmentWorkspaceRequired,
+                ) => {
+                    let mut error = invalid_request(error.to_string());
+                    error.data = Some(serde_json::json!({
+                        "reason": "governmentWorkspaceRequired",
+                        "action": "relogin",
+                    }));
+                    error
+                }
                 AccountReadError::Routing(error) => internal_error(error.to_string()),
             })?;
+        let mut account = read.account_state.account.map(Account::from);
+        if let Some(Account::Chatgpt { workspace_name, .. }) = &mut account {
+            *workspace_name = read.workspace_name;
+        }
         Ok(Some(
             GetAccountResponse {
-                account: read.account_state.account.map(Account::from),
+                account,
+                user_id: read.user_id,
                 requires_openai_auth: read.account_state.requires_openai_auth,
                 auth_changed,
                 workspace_routing: read.workspace_routing.map(|routing| {
@@ -250,7 +386,12 @@ impl AccountRequestProcessor {
                 {
                     self.config.as_ref().clone()
                 }
-                Err(_) => return Err(WorkspaceRoutingError::RequirementsLoad.into()),
+                Err(error) => {
+                    return Err(WorkspaceRoutingError::RequirementsLoad(
+                        workspace_config_load_reason(&error),
+                    )
+                    .into());
+                }
             };
             let auth = self.auth_manager.auth_cached();
             let provider = create_model_provider(
@@ -260,6 +401,15 @@ impl AccountRequestProcessor {
             let account_state = provider
                 .account_state()
                 .map_err(AccountReadError::InvalidAccount)?;
+            let user_id = auth
+                .as_ref()
+                .filter(|_| {
+                    matches!(
+                        &account_state.account,
+                        Some(ProviderAccount::Chatgpt { .. })
+                    )
+                })
+                .and_then(CodexAuth::get_chatgpt_user_id);
             let mut workspace_routing = if let Some((auth, account_id)) = auth
                 .as_ref()
                 .filter(|auth| {
@@ -314,31 +464,56 @@ impl AccountRequestProcessor {
                         .await
                         .as_ref()
                         .filter(|cached| cached.key == key)
-                        .map(|cached| cached.routing.clone()),
+                        .cloned(),
                 };
                 let routing = if let Some(cached) = cached {
                     cached
                 } else {
+                    let runtime = self
+                        .thread_manager
+                        .runtime_auth_for_config(&config)
+                        .map_err(|_| WorkspaceRoutingError::DiscoveryFailed)?;
                     let mut recovery = self.auth_manager.unauthorized_recovery();
                     let mut discovery_auth = auth.clone();
                     let mut discovery_generation = auth_state.generation;
                     let response = loop {
-                        let client = BackendClient::from_auth(
+                        let client = BackendClient::from_auth_with_runtime(
                             &config.chatgpt_base_url,
                             &discovery_auth,
                             config.http_client_factory(),
-                        );
+                            runtime.as_ref(),
+                            /*headers*/ &Default::default(),
+                        )
+                        .await
+                        .map_err(|_| WorkspaceRoutingError::DiscoveryFailed)?;
                         match client.get_accounts_check().await {
                             Ok(response) => break response,
                             Err(error) => {
                                 let unauthorized = error.is_unauthorized();
-                                if unauthorized
-                                    && recovery.has_next()
-                                    && recovery.next().await.is_ok()
-                                {
+                                if unauthorized && recovery.has_next() {
+                                    let result = recovery.next().await;
                                     let refreshed = *current_auth_changes.borrow();
                                     if refreshed.owner_generation != auth_state.owner_generation {
                                         return Err(WorkspaceRoutingError::AccountChanged.into());
+                                    }
+                                    if let Err(error) = result
+                                        && refreshed.generation == discovery_generation
+                                    {
+                                        let cached_failure = self
+                                            .auth_manager
+                                            .refresh_failure_for_auth(&discovery_auth);
+                                        if let RefreshTokenError::Permanent(failed) = error
+                                            && !self.auth_manager.has_external_auth()
+                                            && cached_failure.as_ref() == Some(&failed)
+                                        {
+                                            return Err(
+                                                WorkspaceRoutingError::RefreshTokenRejected(failed)
+                                                    .into(),
+                                            );
+                                        }
+                                        return Err(
+                                            WorkspaceRoutingError::DiscoveryUnauthorized.into()
+                                        );
                                     }
                                     discovery_generation = refreshed.generation;
                                     discovery_auth = self
@@ -360,15 +535,17 @@ impl AccountRequestProcessor {
                         .accounts
                         .into_iter()
                         .filter(|account| account.id == account_id);
-                    let entry = accounts
+                    let mut entry = accounts
                         .next()
                         .ok_or(WorkspaceRoutingError::MissingWorkspace)?;
                     if accounts.next().is_some() {
                         return Err(WorkspaceRoutingError::DuplicateWorkspace.into());
                     }
-                    let latest_config = load_config()
-                        .await
-                        .map_err(|_| WorkspaceRoutingError::RequirementsReload)?;
+                    let latest_config = load_config().await.map_err(|error| {
+                        WorkspaceRoutingError::RequirementsReload(workspace_config_load_reason(
+                            &error,
+                        ))
+                    })?;
                     if latest_config.chatgpt_base_url != config.chatgpt_base_url
                         || latest_config.model_provider != config.model_provider
                         || latest_config
@@ -379,6 +556,7 @@ impl AccountRequestProcessor {
                     {
                         return Err(WorkspaceRoutingError::ConfigurationChanged.into());
                     }
+                    let name = entry.name.take();
                     let routing = resolve_routing(
                         entry,
                         required_chatgpt_base_url.as_deref(),
@@ -389,15 +567,17 @@ impl AccountRequestProcessor {
                     {
                         return Err(WorkspaceRoutingError::AccountChanged.into());
                     }
+                    let routing = CachedWorkspaceRouting {
+                        key: WorkspaceRoutingKey {
+                            auth_generation: discovery_generation,
+                            ..key
+                        },
+                        routing,
+                        name,
+                    };
                     // Same-owner refresh can complete a newer discovery first.
                     if current_auth_changes.borrow().generation == discovery_generation {
-                        *cached = Some(CachedWorkspaceRouting {
-                            key: WorkspaceRoutingKey {
-                                auth_generation: discovery_generation,
-                                ..key
-                            },
-                            routing: routing.clone(),
-                        });
+                        *cached = Some(routing.clone());
                     }
                     routing
                 };
@@ -417,9 +597,9 @@ impl AccountRequestProcessor {
                 let session_bootstrap_origin = Url::parse(&request.chatgpt_base_url)
                     .map_err(|_| WorkspaceRoutingError::InvalidSessionBootstrapUrl)?
                     .origin();
-                let selected_backend = workspace_routing
-                    .as_ref()
-                    .is_some_and(|routing| routing.backend_origin == origin.ascii_serialization());
+                let selected_backend = workspace_routing.as_ref().is_some_and(|routing| {
+                    routing.routing.backend_origin == origin.ascii_serialization()
+                });
                 let workspace_bound = request.previously_routed
                     || request.provider_base_url == codex_model_provider::CHATGPT_CODEX_BASE_URL
                     || origin == session_bootstrap_origin
@@ -430,9 +610,14 @@ impl AccountRequestProcessor {
                     return Err(WorkspaceRoutingError::SessionBackendChanged.into());
                 }
             }
+            let (workspace_routing, workspace_name) = workspace_routing
+                .map(|workspace| (Some(workspace.routing), workspace.name))
+                .unwrap_or_default();
             Ok(AccountRead {
                 account_state,
+                user_id,
                 workspace_routing,
+                workspace_name,
             })
         });
         let result = tokio::select! {
@@ -480,19 +665,22 @@ fn resolve_routing(
         }
         Some(url)
     };
-    let origin = match (required, discovered) {
+    let selected = match (required, discovered) {
         (Some(required), Some(discovered)) => {
             if required.origin() != discovered.origin() {
                 return Err(WorkspaceRoutingError::BackendConflict.into());
             }
-            required.origin()
+            required
         }
-        (Some(url), None) | (None, Some(url)) => url.origin(),
-        (None, None) => parse_backend_url(effective_base_url)?.origin(),
+        (Some(url), None) | (None, Some(url)) => url,
+        (None, None) => parse_backend_url(effective_base_url)?,
     };
+    if backend == "NO_CONSTRAINT" && selected.host_str() == Some("gov.chatgpt.com") {
+        return Err(WorkspaceRoutingError::GovernmentWorkspaceRequired.into());
+    }
     Ok(WorkspaceRouting {
         chatgpt_account_id: entry.id,
-        backend_origin: origin.ascii_serialization(),
+        backend_origin: selected.origin().ascii_serialization(),
         account_routing_override,
     })
 }

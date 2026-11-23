@@ -16,6 +16,7 @@ use codex_extension_api::SkillInvocationContributor;
 use codex_extension_api::SkillInvocationInput;
 use codex_extension_api::ThreadLifecycleContributor;
 use codex_extension_api::ThreadStartInput;
+use codex_extension_api::ThreadStopInput;
 use codex_extension_api::ToolFinishInput;
 use codex_extension_api::ToolLifecycleContributor;
 use codex_extension_api::ToolLifecycleFuture;
@@ -27,8 +28,8 @@ use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::protocol::has_full_access;
 
 use super::config::GuardianV2Config;
+use super::conversation::ConversationBackend;
 use super::sampler::LunaSampler;
-use super::score::GuardianV2ScoreProgress;
 use super::trusted_skills::TrustedSkillRoots;
 
 #[derive(Clone)]
@@ -61,21 +62,12 @@ impl ThreadLifecycleContributor<Config> for GuardianV2Extension {
                     return;
                 }
             };
-            let mut policy = guardian_config.policy_for_model(model.as_deref());
-            if let Some(model) = model.as_ref() {
-                input
-                    .config
-                    .config_layer_stack
-                    .requirements()
-                    .constrain_guardian_policy(&mut policy, &model.slug);
-            }
+            let policy = guardian_config.policy_for_model(
+                model.as_deref(),
+                input.config.config_layer_stack.requirements(),
+            );
             let scoring_enabled = policy.scoring_enabled();
-            let sampler_config = super::startup::sampler_config(
-                &input,
-                Arc::clone(&self.auth_manager),
-                self.thread_manager.upgrade(),
-            )
-            .await;
+            let sampler_config = super::startup::sampler_config(&input).await;
 
             if scoring_enabled && guardian_config.transcript.include_images {
                 input
@@ -87,10 +79,28 @@ impl ThreadLifecycleContributor<Config> for GuardianV2Extension {
             let sampler = input
                 .thread_store
                 .get_or_init(|| LunaSampler::new(sampler_config));
+            ConversationBackend::install(
+                input.thread_store,
+                ConversationBackend::new(
+                    Arc::clone(&sampler),
+                    input.config.guardian_policy_revision,
+                    input.extension_metrics.clone(),
+                ),
+            );
+            input
+                .thread_store
+                .remove::<super::decisions::DecisionsSampler>();
+            if input
+                .config
+                .features
+                .enabled(Feature::GuardianV2DecisionsComparison)
+                && let Some(decisions_sampler) =
+                    super::startup::decisions_sampler(&input, &self.auth_manager)
+            {
+                input.thread_store.insert(decisions_sampler);
+            }
             input.thread_store.insert(guardian_config);
-            input.thread_store.insert(GuardianV2ScoreProgress::new(
-                input.extension_metrics.clone(),
-            ));
+
             // Preserve the answer path selected by the host for this thread.
             input
                 .thread_store
@@ -119,6 +129,11 @@ impl ThreadLifecycleContributor<Config> for GuardianV2Extension {
                     sampler.prewarm().await;
                 });
             }
+        })
+    }
+    fn on_thread_stop<'a>(&'a self, input: ThreadStopInput<'a>) -> ExtensionFuture<'a, ()> {
+        Box::pin(async move {
+            ConversationBackend::stop(input.thread_store);
         })
     }
 }
@@ -154,8 +169,8 @@ impl ToolLifecycleContributor for GuardianV2Extension {
 
     fn on_tool_finish<'a>(&'a self, input: ToolFinishInput<'a>) -> ToolLifecycleFuture<'a> {
         Box::pin(async move {
-            if let Some(progress) = input.thread_store.get::<GuardianV2ScoreProgress>() {
-                progress.finish(input.call_id);
+            if let Some(cache) = input.turn_store.get::<ConversationBackend>() {
+                cache.progress.finish(input.call_id);
             }
         })
     }

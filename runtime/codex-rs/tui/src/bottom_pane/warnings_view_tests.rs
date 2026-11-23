@@ -5,6 +5,7 @@ use crate::history_cell::WarningId;
 use crate::render::renderable::Renderable;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyModifiers;
+use crossterm::event::MouseEventKind;
 use pretty_assertions::assert_eq;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -39,7 +40,7 @@ fn draw(view: &WarningsView, width: u16, height: u16) -> String {
         .chunks(usize::from(width))
         .map(|row| {
             row.iter()
-                .map(ratatui::buffer::Cell::symbol)
+                .map(|cell| crate::terminal_hyperlinks::strip_osc8(cell.symbol()))
                 .collect::<String>()
                 .trim_end()
                 .to_string()
@@ -94,6 +95,38 @@ fn warning_pages_wrap_and_scroll_long_diagnostics() {
     assert!(draw(&view, /*width*/ 40, /*height*/ 9).contains("Unknown setting"));
     key(&mut view, KeyCode::Left);
     assert!(draw(&view, /*width*/ 40, /*height*/ 9).contains("Long diagnostic"));
+}
+
+#[test]
+fn scroll_hint_tracks_wheel_and_keys_across_wrapped_rows() {
+    let (tx, _) = unbounded_channel();
+    let mut data = entries();
+    data[0].details = "word ".repeat(/*n*/ 160);
+    let keymap =
+        RuntimeKeymap::from_config(&toml::from_str("[list]\nmove_down = 'z'").unwrap()).unwrap();
+    let mut view = WarningsView::new(data, Arc::default(), keymap, AppEventSender::new(tx));
+    let height = view.desired_height(/*width*/ 84);
+    let wheel = MouseEvent {
+        kind: MouseEventKind::ScrollDown,
+        column: 2,
+        row: 3,
+        modifiers: KeyModifiers::NONE,
+    };
+    assert!(draw(&view, /*width*/ 84, height).ends_with(" · z scroll"));
+    for row in [1, height - 1] {
+        assert!(!view.scroll_mouse(MouseEvent { row, ..wheel }));
+    }
+    key(&mut view, KeyCode::Char('z'));
+    assert!(draw(&view, /*width*/ 84, height).ends_with(" · ↑/z scroll"));
+    assert!(view.scroll_mouse(wheel));
+    assert!(draw(&view, /*width*/ 84, height).ends_with(" · ↑ scroll"));
+    assert!(view.scroll_mouse(MouseEvent {
+        kind: MouseEventKind::ScrollUp,
+        ..wheel
+    }));
+    assert!(draw(&view, /*width*/ 84, height).ends_with(" · z scroll"));
+    assert!(!draw(&view, /*width*/ 120, height).contains("scroll"));
+    assert!(!view.scroll_mouse(wheel));
 }
 
 #[test]
@@ -153,7 +186,7 @@ fn warnings_keep_current_and_next_without_dismissing_unvisited_pages() {
     assert!(!key(&mut view, KeyCode::Char('k')));
     let screen = draw(&view, /*width*/ 80, /*height*/ 12);
     assert!(screen.contains("2 of 3"));
-    assert!(screen.contains("ctrl+c dismiss & close"));
+    assert!(screen.contains("⌃c dismiss & close"));
     let repeat =
         KeyEvent::new_with_kind(KeyCode::Char('k'), KeyModifiers::NONE, KeyEventKind::Repeat);
     assert!(!view.handle_key(repeat));
@@ -168,4 +201,52 @@ fn warnings_keep_current_and_next_without_dismissing_unvisited_pages() {
         panic!("expected warning decisions");
     };
     assert_eq!((dismissed, kept), (expected, vec![entries()[0].clone()]));
+}
+
+#[test]
+fn warning_links_preserve_destinations_when_wrapped_and_scrolled() {
+    let url = "https://github.com/openai/codex/pull/12345?diff=split";
+    let (tx, _) = unbounded_channel();
+    let mut data = entries();
+    data[0].details = format!("Review {url} before continuing.");
+    let mut view = WarningsView::new(
+        data,
+        Arc::default(),
+        RuntimeKeymap::defaults(),
+        AppEventSender::new(tx),
+    );
+    let area = Rect::new(0, 0, 32, 9);
+    let mut buffer = Buffer::empty(area);
+    view.render(area, &mut buffer);
+    let linked = buffer
+        .content
+        .iter()
+        .filter(|cell| cell.symbol().contains("\x1b]8;;"))
+        .map(|cell| {
+            assert!(cell.symbol().starts_with(&format!("\x1b]8;;{url}\x07")));
+            crate::terminal_hyperlinks::strip_osc8(cell.symbol())
+        })
+        .collect::<String>();
+    assert_eq!(linked, url);
+    insta::assert_snapshot!(
+        "warnings_wrapped_url",
+        draw(&view, /*width*/ 32, /*height*/ 9)
+    );
+    key(&mut view, KeyCode::Down);
+    let area = Rect::new(0, 0, 32, 5);
+    let mut buffer = Buffer::empty(area);
+    view.render(area, &mut buffer);
+    key(&mut view, KeyCode::Down);
+    view.render(area, &mut buffer);
+    let linked = buffer
+        .content
+        .iter()
+        .filter(|cell| cell.symbol().contains("\x1b]8;;"))
+        .collect::<Vec<_>>();
+    assert!(!linked.is_empty());
+    assert!(
+        linked
+            .iter()
+            .all(|cell| cell.symbol().starts_with(&format!("\x1b]8;;{url}\x07")))
+    );
 }
