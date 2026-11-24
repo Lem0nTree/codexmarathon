@@ -251,3 +251,54 @@ and verify that only the systemd-managed daemon is running. Do not solve a
 stale socket by making it world-writable or by starting a second daemon. A
 manual stop should stop both units so the next start can recreate the
 owner-only endpoint.
+
+## Known issue to fix in the next release: connection-task memory retention
+
+Status: confirmed on 2026-11-24; unfixed in v0.171.0. The same missing
+task-reaping path is present in v0.160.5.
+
+In `runtime/codex-rs/codexmarathon-accountd/src/lib.rs`,
+`AccountDaemon::serve` spawns each accepted Unix-socket connection into a
+Tokio `JoinSet`, but calls `join_next()` only during shutdown. Completed
+connection tasks therefore remain tracked throughout the daemon's lifetime.
+Repeated short-lived client connections cause retained memory to accumulate.
+The observed growth is approximately linear per connection, not exponential.
+
+An isolated Linux ARM64 reproduction used the released v0.171.0 accountd
+binary, SHA-256
+`e5dd1bd6fd02a03068a272d387c49402168a4ed47eb672ee3b598f49280023b9`,
+with an empty disposable Codex home and a private Unix socket. It sent one
+newline-delimited version-1 `health` request on each connection, read its
+successful response, then closed the connection before opening the next.
+No real credentials, provider calls, or production services were involved.
+
+| Completed connections | Resident memory (RSS) |
+| --- | --- |
+| 0 | 8,448 KiB |
+| 5,000 | 36,992 KiB |
+| 10,000 | 65,280 KiB |
+| 20,000 | 121,472 KiB |
+| 30,000 | 176,896 KiB |
+| 30,000, after another 10 seconds idle | 176,896 KiB |
+
+The increase was 168,448 KiB across 30,000 connections, about 5.6 KiB per
+connection. These figures document this run; they are not portable memory
+thresholds. The reset executor showed no growth during a separate one-minute
+sample. A reported failure on another, offline Orange Pi could not be
+inspected, so its exact process and root cause remain unconfirmed.
+
+Required follow-up before the next release:
+
+- Drain completed tasks inside the accept loop, for example with a guarded
+  `connections.join_next()` branch in `tokio::select!`. Guard the empty set
+  to avoid a busy loop, and preserve request handling and shutdown behavior.
+- Add a regression test that repeatedly opens and closes connections and
+  verifies that tracked tasks return to a bounded/empty state after clients
+  finish. Include concurrent clients and timeout/error paths.
+- Repeat the isolated workload after warm-up and confirm that memory no
+  longer grows in proportion to completed connections; verify the existing
+  health/accounts protocol and clean shutdown still work.
+
+Tokio documents task collection and completion handling in
+[`JoinSet`](https://docs.rs/tokio/latest/tokio/task/struct.JoinSet.html).
+
